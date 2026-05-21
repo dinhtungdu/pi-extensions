@@ -1,0 +1,27 @@
+{
+	"name": "pi-extensions",
+	"version": "0.1.0",
+	"description": "Pi extensions, including configurable macOS auto dark/light theme switching.",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"extension",
+		"theme",
+		"dark-mode"
+	],
+	"pi": {
+		"extensions": ["./extensions/auto-dark-mode.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.74.1",
+		"typescript": "^5.8.3"
+	},
+	"scripts": {
+		"check": "tsc --noEmit"
+	}
+}
