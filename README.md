@@ -4,11 +4,29 @@ Pi extensions, including configurable macOS auto dark/light theme switching.
 
 ## Install
 
-From GitHub:
+All extensions from GitHub:
 
 ```bash
 pi install git:github.com/dinhtungdu/pi-extensions
 ```
+
+Selected extensions only:
+
+```json
+{
+	"packages": [
+		{
+			"source": "git:github.com/dinhtungdu/pi-extensions",
+			"extensions": ["extensions/auto-dark-mode.ts"],
+			"skills": [],
+			"prompts": [],
+			"themes": []
+		}
+	]
+}
+```
+
+Put that in `~/.pi/agent/settings.json` for global install, or `.pi/settings.json` for project-local install. If already installed, replace the plain package string with the object form.
 
 Local development:
 
