@@ -1,6 +1,9 @@
 # pi-extensions
 
-Pi extensions, including configurable macOS auto dark/light theme switching.
+Pi extensions:
+
+- `auto-dark-mode` — macOS dark/light theme switching
+- `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 
 ## Install
 
@@ -17,7 +20,7 @@ Selected extensions only:
 	"packages": [
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
-			"extensions": ["extensions/auto-dark-mode.ts"],
+			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts"],
 			"skills": [],
 			"prompts": [],
 			"themes": []
@@ -32,10 +35,32 @@ Local development:
 
 ```bash
 pi -e ./extensions/auto-dark-mode.ts
+pi -e ./extensions/code-mode.ts
 pi install /path/to/pi-extensions
 ```
 
-## Config
+## Codemode
+
+Registers tool: `codemode`.
+
+Use for multi-step logic over active built-in pi tools:
+
+```js
+async () => {
+	const files = await codemode.ls({ path: "." });
+	const matches = await codemode.grep({ pattern: "TODO", path: ".", limit: 20 });
+	return { files, matches };
+}
+```
+
+Notes:
+
+- Exposes only active built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
+- JavaScript only. No TypeScript syntax.
+- Local Node worker/vm isolation, not Cloudflare Workers security. Do not run hostile code. Tiny sandbox, not Fort Knox.
+- Output truncated to pi defaults; full output saved to temp when needed.
+
+## Auto dark mode config
 
 Global: `~/.pi/agent/auto-dark-mode.json`
 Project override: `<cwd>/.pi/auto-dark-mode.json`
