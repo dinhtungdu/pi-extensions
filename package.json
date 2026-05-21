@@ -4,6 +4,14 @@
 	"description": "Pi extensions, including configurable macOS auto dark/light theme switching.",
 	"type": "module",
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/dinhtungdu/pi-extensions.git"
+	},
+	"homepage": "https://github.com/dinhtungdu/pi-extensions#readme",
+	"bugs": {
+		"url": "https://github.com/dinhtungdu/pi-extensions/issues"
+	},
 	"keywords": [
 		"pi-package",
 		"pi",
