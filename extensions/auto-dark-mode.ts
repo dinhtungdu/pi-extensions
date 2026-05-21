@@ -116,30 +116,21 @@ function themeForAppearance(appearance: Appearance, config: Config): string {
 	return appearance === "dark" ? config.darkTheme : config.lightTheme;
 }
 
-function formatStatus(appearance: Appearance, themeName: string): string {
-	return `auto-theme:${appearance}->${themeName}`;
-}
-
 async function syncTheme(ctx: ExtensionContext, config: Config, state: { appearance?: Appearance; themeName?: string }): Promise<void> {
 	const appearance = await getMacAppearance();
-	if (!appearance) {
-		ctx.ui.setStatus("auto-dark-mode", "auto-theme:unsupported");
-		return;
-	}
+	if (!appearance) return;
 
 	const themeName = themeForAppearance(appearance, config);
 	if (appearance === state.appearance && themeName === state.themeName) return;
 
 	const result = ctx.ui.setTheme(themeName);
 	if (!result.success) {
-		ctx.ui.setStatus("auto-dark-mode", `auto-theme:error ${themeName}`);
 		ctx.ui.notify(`auto-dark-mode: failed to set theme '${themeName}': ${result.error ?? "unknown error"}`, "error");
 		return;
 	}
 
 	state.appearance = appearance;
 	state.themeName = themeName;
-	ctx.ui.setStatus("auto-dark-mode", formatStatus(appearance, themeName));
 
 	if (config.notify) {
 		ctx.ui.notify(`auto-dark-mode: ${appearance} -> ${themeName}`, "info");
