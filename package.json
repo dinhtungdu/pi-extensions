@@ -1,7 +1,7 @@
 {
 	"name": "pi-extensions",
 	"version": "0.1.1",
-	"description": "Pi extensions, including macOS auto theme switching and a Codemode-style tool.",
+	"description": "Pi extensions, including macOS auto theme switching, a Codemode-style tool, and Codex-style goals.",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -18,10 +18,11 @@
 		"extension",
 		"theme",
 		"dark-mode",
-		"codemode"
+		"codemode",
+		"goal"
 	],
 	"pi": {
-		"extensions": ["./extensions/auto-dark-mode.ts", "./extensions/code-mode.ts"]
+		"extensions": ["./extensions/auto-dark-mode.ts", "./extensions/code-mode.ts", "./extensions/goal.ts"]
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"

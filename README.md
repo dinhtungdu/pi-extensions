@@ -4,6 +4,7 @@ Pi extensions:
 
 - `auto-dark-mode` — macOS dark/light theme switching
 - `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
+- `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
 
 ## Install
 
@@ -20,7 +21,7 @@ Selected extensions only:
 	"packages": [
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
-			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts"],
+			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts"],
 			"skills": [],
 			"prompts": [],
 			"themes": []
@@ -36,6 +37,7 @@ Local development:
 ```bash
 pi -e ./extensions/auto-dark-mode.ts
 pi -e ./extensions/code-mode.ts
+pi -e ./extensions/goal.ts
 pi install /path/to/pi-extensions
 ```
 
@@ -59,6 +61,30 @@ Notes:
 - JavaScript only. No TypeScript syntax.
 - Local Node worker/vm isolation, not Cloudflare Workers security. Do not run hostile code. Tiny sandbox, not Fort Knox.
 - Output truncated to pi defaults; full output saved to temp when needed.
+
+## Goal
+
+Registers command: `/goal`.
+
+Commands:
+
+```text
+/goal <objective>
+/goal <objective> --budget 100000
+/goal status
+/goal pause
+/goal resume
+/goal clear
+```
+
+Registers tools: `get_goal`, `create_goal`, `update_goal`.
+
+Notes:
+
+- `/goal <objective>` persists the goal, then submits the objective so the agent starts immediately.
+- Active goals auto-continue with hidden continuation messages until `update_goal({ status: "complete" })`, `/goal pause`, `/goal clear`, budget exhaustion, or a no-tool continuation.
+- Goal state is stored in the pi session branch via custom entries; it survives reload/resume/fork.
+- Objectives should include scope, success criteria, constraints, and verification commands.
 
 ## Auto dark mode config
 
