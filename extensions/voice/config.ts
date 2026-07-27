@@ -45,7 +45,7 @@ export function defaultVoiceConfig(): VoiceConfig {
 		enabled: false,
 		announceReady: true,
 		inputMode: "always-on",
-		inputDevice: "0",
+		inputDevice: "default",
 		ffmpegPath: "ffmpeg",
 		ffplayPath: "ffplay",
 		sttWorkerPath: join(cache, "bin", "pi-voice-stt"),

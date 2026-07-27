@@ -82,14 +82,13 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		]);
 		const output = `${result.stdout}\n${result.stderr}`;
 		const audioSection = output.split("AVFoundation audio devices:")[1] ?? "";
-		const devices = [...audioSection.matchAll(/\[(\d+)]\s+([^\r\n]+)/g)].map((match) => ({
-			value: match[1]!,
-			label: `${match[1]}: ${match[2]!.trim()}`,
-		}));
-		if (!devices.length) {
-			ctx.ui.notify("voice: no AVFoundation microphones found", "error");
-			return;
-		}
+		const devices = [
+			{ value: "default", label: "System default microphone" },
+			...[...audioSection.matchAll(/\[(\d+)]\s+([^\r\n]+)/g)].map((match) => ({
+				value: match[2]!.trim(),
+				label: `${match[1]}: ${match[2]!.trim()}`,
+			})),
+		];
 		const selected = await ctx.ui.select(
 			"Voice microphone",
 			devices.map((device) => device.label),

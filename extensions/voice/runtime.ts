@@ -56,6 +56,7 @@ export class VoiceRuntime {
 	private pushToTalkArmed = false;
 	private pushToTalkPending = false;
 	private pushToTalkTimer?: ReturnType<typeof setTimeout>;
+	private microphoneAvailable?: boolean;
 
 	constructor(
 		private readonly pi: ExtensionAPI,
@@ -77,6 +78,7 @@ export class VoiceRuntime {
 			(pcm) => this.handleMicFrame(pcm),
 			() => this.handlePlaybackEnd(),
 			(message) => this.fail(message),
+			(available, message) => this.handleMicrophoneState(available, message),
 		);
 		this.stt = new SttClient(
 			config.sttWorkerPath,
@@ -160,7 +162,8 @@ export class VoiceRuntime {
 
 	status(): string {
 		const cleanup = this.config.transcriptCleanup ? this.config.cleanupModel : "off";
-		return `${this.phase}; mode=${this.config.inputMode}; input=${this.config.inputDevice}; voice=${this.config.ttsVoice}; cleanup=${cleanup}; STT=${this.config.sttModelPath}; TTS=${this.config.ttsModelPath}`;
+		const microphone = this.microphoneAvailable === undefined ? "connecting" : this.microphoneAvailable ? "available" : "unavailable";
+		return `${this.phase}; mode=${this.config.inputMode}; input=${this.config.inputDevice}; microphone=${microphone}; voice=${this.config.ttsVoice}; cleanup=${cleanup}; STT=${this.config.sttModelPath}; TTS=${this.config.ttsModelPath}`;
 	}
 
 	testOutput(text = "Voice output is working."): void {
@@ -474,6 +477,14 @@ export class VoiceRuntime {
 	private setPhase(phase: VoicePhase): void {
 		if (this.stopped) return;
 		this.phase = phase;
+		this.refreshStatus();
+	}
+
+	private refreshStatus(): void {
+		if (this.microphoneAvailable === false && this.phase !== "error") {
+			this.ctx.ui.setStatus(STATUS_KEY, "voice: microphone unavailable; retrying");
+			return;
+		}
 		const labels: Record<VoicePhase, string> = {
 			starting: "voice: loading",
 			muted: "voice: push-to-talk ready",
@@ -485,7 +496,19 @@ export class VoiceRuntime {
 			error: "voice: error",
 			off: "voice: off",
 		};
-		this.ctx.ui.setStatus(STATUS_KEY, labels[phase]);
+		this.ctx.ui.setStatus(STATUS_KEY, labels[this.phase]);
+	}
+
+	private handleMicrophoneState(available: boolean, message?: string): void {
+		const previous = this.microphoneAvailable;
+		this.microphoneAvailable = available;
+		this.refreshStatus();
+		if (!available && previous !== false) {
+			this.debug(`microphone unavailable; retrying: ${message ?? "unknown error"}`);
+			this.ctx.ui.notify("voice: microphone unavailable; retrying", "warning");
+		} else if (available && previous === false) {
+			this.ctx.ui.notify("voice: microphone reconnected", "info");
+		}
 	}
 
 	private fail(message: string): void {

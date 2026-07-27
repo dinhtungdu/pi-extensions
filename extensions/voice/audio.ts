@@ -4,6 +4,7 @@ import type { VoiceConfig } from "./config.js";
 const CAPTURE_SAMPLE_RATE = 16000;
 const FRAME_MS = 20;
 const FRAME_BYTES = (CAPTURE_SAMPLE_RATE * FRAME_MS * 2) / 1000;
+const CAPTURE_RETRY_MS = 1000;
 
 function errorCode(error: unknown): string | undefined {
 	return error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
@@ -12,6 +13,9 @@ function errorCode(error: unknown): string | undefined {
 export class AudioIO {
 	private capture?: ChildProcess;
 	private captureBuffer: Buffer = Buffer.alloc(0);
+	private captureRetry?: ReturnType<typeof setTimeout>;
+	private captureRequested = false;
+	private captureAvailable?: boolean;
 	private playback?: ChildProcess;
 	private playbackGeneration = 0;
 
@@ -20,10 +24,17 @@ export class AudioIO {
 		private readonly onMicFrame: (pcm: Buffer) => void,
 		private readonly onPlaybackEnd: () => void,
 		private readonly onError: (message: string) => void,
+		private readonly onCaptureState: (available: boolean, message?: string) => void,
 	) {}
 
 	startCapture(): void {
-		if (this.capture) return;
+		this.captureRequested = true;
+		if (this.capture || this.captureRetry) return;
+		this.spawnCapture();
+	}
+
+	private spawnCapture(): void {
+		if (!this.captureRequested || this.capture) return;
 		const input = `:${this.config.inputDevice}`;
 		const args = [
 			"-hide_banner",
@@ -46,16 +57,39 @@ export class AudioIO {
 		];
 		const child = spawn(this.config.ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 		this.capture = child;
-		child.stdout?.on("data", (chunk: Buffer) => this.handleCapture(chunk));
+		let stderr = "";
+		let spawnError: Error | undefined;
+		child.stdout?.on("data", (chunk: Buffer) => {
+			this.reportCaptureState(true);
+			this.handleCapture(chunk);
+		});
 		child.stderr?.on("data", (chunk: Buffer) => {
-			const message = chunk.toString("utf8").trim();
-			if (message) this.onError(`microphone: ${message}`);
+			stderr = `${stderr}${chunk.toString("utf8")}`.slice(-4096);
 		});
-		child.once("error", (error) => this.onError(`microphone: ${error.message}`));
-		child.once("exit", (code, signal) => {
-			if (this.capture === child) this.capture = undefined;
-			if (code !== 0 && signal !== "SIGTERM") this.onError(`microphone exited (${code ?? signal ?? "unknown"})`);
+		child.once("error", (error) => (spawnError = error));
+		child.once("close", (code, signal) => {
+			if (this.capture !== child) return;
+			this.capture = undefined;
+			this.captureBuffer = Buffer.alloc(0);
+			if (!this.captureRequested) return;
+			if (spawnError && errorCode(spawnError) === "ENOENT") {
+				this.captureRequested = false;
+				this.onError(`microphone: ${spawnError.message}`);
+				return;
+			}
+			const detail = spawnError?.message ?? (stderr.trim() || `capture exited (${code ?? signal ?? "unknown"})`);
+			this.reportCaptureState(false, detail);
+			this.captureRetry = setTimeout(() => {
+				this.captureRetry = undefined;
+				this.spawnCapture();
+			}, CAPTURE_RETRY_MS);
 		});
+	}
+
+	private reportCaptureState(available: boolean, message?: string): void {
+		if (this.captureAvailable === available) return;
+		this.captureAvailable = available;
+		this.onCaptureState(available, message);
 	}
 
 	startPlayback(sampleRate: number): void {
@@ -129,6 +163,10 @@ export class AudioIO {
 
 	stop(): void {
 		this.cancelPlayback();
+		this.captureRequested = false;
+		if (this.captureRetry) clearTimeout(this.captureRetry);
+		this.captureRetry = undefined;
+		this.captureAvailable = undefined;
 		this.capture?.kill("SIGTERM");
 		this.capture = undefined;
 		this.captureBuffer = Buffer.alloc(0);

@@ -135,7 +135,7 @@ Then, inside Pi:
 
 `Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture even if voice was off or always-on. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed.
 
-`Ctrl+Alt+S`, `/voice stop`, any typed follow-up, or—while always-on—saying “stop”/“Pi stop” interrupts playback immediately. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi.
+`Ctrl+Alt+S`, `/voice stop`, any typed follow-up, or—while always-on—saying “stop”/“Pi stop” interrupts playback immediately. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi. Voice uses the macOS default microphone unless you select a specific device with `/voice device`. If the microphone disappears, capture retries in the background and follows a newly available system default without putting voice mode into an error state.
 
 Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 
@@ -144,7 +144,7 @@ Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 	"enabled": true,
 	"announceReady": true,
 	"inputMode": "always-on",
-	"inputDevice": "0",
+	"inputDevice": "default",
 	"ttsVoice": "Aiden",
 	"ttsInstruction": "Speak naturally in a calm, conversational tone.",
 	"micThreshold": 0.006,
