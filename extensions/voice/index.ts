@@ -7,6 +7,7 @@ import {
 	voiceCacheDir,
 	type VoiceInputMode,
 } from "./config.js";
+import { VoiceFooterController } from "./footer.js";
 import { VoiceRuntime } from "./runtime.js";
 
 const SETUP_SCRIPT = fileURLToPath(new URL("../../scripts/setup-voice.mjs", import.meta.url));
@@ -14,10 +15,13 @@ const UNINSTALL_SCRIPT = fileURLToPath(new URL("../../scripts/uninstall-voice.mj
 
 export default function voiceExtension(pi: ExtensionAPI) {
 	let runtime: VoiceRuntime | undefined;
+	let unsubscribeTerminalInput: (() => void) | undefined;
+	const footer = new VoiceFooterController(pi);
 
 	function stopRuntime(): void {
 		runtime?.stop();
 		runtime = undefined;
+		footer.deactivate();
 	}
 
 	function startRuntime(ctx: ExtensionContext): boolean {
@@ -28,18 +32,30 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`voice setup incomplete; run /voice setup (missing ${missing[0]})`, "error");
 			return false;
 		}
-		runtime = new VoiceRuntime(pi, ctx, config);
+		footer.activate(ctx);
+		runtime = new VoiceRuntime(pi, ctx, config, (phase) => footer.setPhase(phase));
 		runtime.start();
 		return true;
 	}
 
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI) return;
+		if (ctx.mode === "tui") {
+			unsubscribeTerminalInput?.();
+			unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) => {
+				runtime?.onTerminalInput(data);
+				return undefined;
+			});
+		}
 		if (loadVoiceConfig().enabled) startRuntime(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
-		stopRuntime();
+		unsubscribeTerminalInput?.();
+		unsubscribeTerminalInput = undefined;
+		runtime?.stop();
+		runtime = undefined;
+		footer.dispose();
 	});
 
 	pi.on("input", (event, ctx) => {

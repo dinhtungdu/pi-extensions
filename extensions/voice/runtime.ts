@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { AudioIO } from "./audio.js";
 import type { VoiceConfig, VoiceInputMode } from "./config.js";
 import { SentenceChunker, SpeechSanitizer } from "./speech-text.js";
@@ -6,9 +7,8 @@ import { SttClient, type SttEvent } from "./stt-client.js";
 import { TranscriptCleanupCancelled, TranscriptPreprocessor } from "./transcript-preprocessor.js";
 import { TtsClient } from "./tts-client.js";
 
-type VoicePhase = "starting" | "muted" | "armed" | "listening" | "hearing" | "thinking" | "speaking" | "error" | "off";
+export type VoicePhase = "starting" | "muted" | "armed" | "listening" | "hearing" | "thinking" | "speaking" | "error" | "off";
 
-const STATUS_KEY = "voice";
 const TRANSCRIPT_WIDGET = "voice-transcript";
 const PLAYBACK_COOLDOWN_MS = 400;
 const PUSH_TO_TALK_WAIT_MS = 10_000;
@@ -45,6 +45,7 @@ export class VoiceRuntime {
 		private readonly pi: ExtensionAPI,
 		ctx: ExtensionContext,
 		private readonly config: VoiceConfig,
+		private readonly onPhaseChange?: (phase: VoicePhase) => void,
 	) {
 		this.ctx = ctx;
 		this.transcriptPreprocessor = new TranscriptPreprocessor(config, (message) =>
@@ -97,9 +98,9 @@ export class VoiceRuntime {
 		this.stt.stop();
 		this.tts.stop();
 		this.requestGenerations.clear();
-		this.ctx.ui.setStatus(STATUS_KEY, undefined);
 		this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
 		this.phase = "off";
+		this.onPhaseChange?.(this.phase);
 	}
 
 	setContext(ctx: ExtensionContext): void {
@@ -167,6 +168,15 @@ export class VoiceRuntime {
 		this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
 		if (abortAgent && !this.ctx.isIdle()) this.ctx.abort();
 		this.setPhase(this.inputRestPhase());
+	}
+
+	onTerminalInput(data: string): void {
+		if (
+			matchesKey(data, "escape") &&
+			(this.playbackActive || this.currentPendingRequests() > 0)
+		) {
+			this.interruptSpeech("Escape");
+		}
 	}
 
 	onUserInput(ctx: ExtensionContext, external = true): void {
@@ -437,32 +447,12 @@ export class VoiceRuntime {
 	private setPhase(phase: VoicePhase): void {
 		if (this.stopped) return;
 		this.phase = phase;
-		this.refreshStatus();
-	}
-
-	private refreshStatus(): void {
-		if (this.microphoneAvailable === false && this.phase !== "error") {
-			this.ctx.ui.setStatus(STATUS_KEY, "voice: microphone unavailable; retrying");
-			return;
-		}
-		const labels: Record<VoicePhase, string> = {
-			starting: "voice: loading",
-			muted: "voice: push-to-talk ready",
-			armed: "voice: speak now",
-			listening: "voice: listening",
-			hearing: "voice: hearing",
-			thinking: "voice: thinking",
-			speaking: "voice: speaking",
-			error: "voice: error",
-			off: "voice: off",
-		};
-		this.ctx.ui.setStatus(STATUS_KEY, labels[this.phase]);
+		this.onPhaseChange?.(phase);
 	}
 
 	private handleMicrophoneState(available: boolean, message?: string): void {
 		const previous = this.microphoneAvailable;
 		this.microphoneAvailable = available;
-		this.refreshStatus();
 		if (!available && previous !== false) {
 			this.debug(`microphone unavailable; retrying: ${message ?? "unknown error"}`);
 			this.ctx.ui.notify("voice: microphone unavailable; retrying", "warning");
