@@ -1,9 +1,10 @@
 import { fileURLToPath } from "node:url";
 import { BorderedLoader, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadVoiceConfig, missingRuntimeFiles, updateVoiceConfig } from "./config.js";
+import { loadVoiceConfig, missingRuntimeFiles, updateVoiceConfig, voiceCacheDir } from "./config.js";
 import { VoiceRuntime } from "./runtime.js";
 
 const SETUP_SCRIPT = fileURLToPath(new URL("../../scripts/setup-voice.mjs", import.meta.url));
+const UNINSTALL_SCRIPT = fileURLToPath(new URL("../../scripts/uninstall-voice.mjs", import.meta.url));
 
 export default function voiceExtension(pi: ExtensionAPI) {
 	let runtime: VoiceRuntime | undefined;
@@ -120,6 +121,25 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		if (loadVoiceConfig().enabled) startRuntime(ctx);
 	}
 
+	async function runUninstall(ctx: ExtensionContext): Promise<void> {
+		const confirmed = await ctx.ui.confirm(
+			"Uninstall local voice data?",
+			`Delete ${voiceCacheDir()}?\n\nThis removes downloaded models, workers, build files, and the Python environment. Voice configuration is preserved.`,
+		);
+		if (!confirmed) return;
+
+		stopRuntime();
+		updateVoiceConfig({ enabled: false });
+		ctx.ui.notify("removing local voice data…", "info");
+		const result = await pi.exec(process.execPath, [UNINSTALL_SCRIPT]);
+		if (result.code !== 0) {
+			const details = result.stderr.trim().split("\n").slice(-4).join("\n");
+			ctx.ui.notify(`voice uninstall failed: ${details || `exit ${result.code}`}`, "error");
+			return;
+		}
+		ctx.ui.notify("voice data uninstalled; configuration preserved", "info");
+	}
+
 	async function handleCommand(args: string, ctx: ExtensionContext): Promise<void> {
 		if (!ctx.hasUI) return;
 		const command = args.trim().toLowerCase() || "status";
@@ -148,6 +168,10 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			await runSetup(ctx);
 			return;
 		}
+		if (command === "uninstall") {
+			await runUninstall(ctx);
+			return;
+		}
 		if (command === "test") {
 			if (!runtime) {
 				ctx.ui.notify("voice is off; run /voice on first", "warning");
@@ -171,13 +195,13 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		ctx.ui.notify("Usage: /voice [on|off|stop|status|setup|device|test]", "warning");
+		ctx.ui.notify("Usage: /voice [on|off|stop|status|setup|uninstall|device|test]", "warning");
 	}
 
 	pi.registerCommand("voice", {
 		description: "Control local hands-free speech input and output",
 		getArgumentCompletions: (prefix) => {
-			const values = ["on", "off", "stop", "status", "setup", "device", "test"];
+			const values = ["on", "off", "stop", "status", "setup", "uninstall", "device", "test"];
 			const matches = values.filter((value) => value.startsWith(prefix));
 			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 		},

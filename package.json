@@ -45,6 +45,7 @@
 	"scripts": {
 		"check": "tsc --noEmit",
 		"setup:voice": "node ./scripts/setup-voice.mjs",
+		"uninstall:voice": "node ./scripts/uninstall-voice.mjs",
 		"test:voice": "node ./scripts/test-voice.mjs"
 	}
 }

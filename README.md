@@ -112,18 +112,23 @@ Build workers, create a default macOS reference voice, and download roughly 2.8 
 ```bash
 npm run setup:voice
 npm run test:voice # local TTS -> local STT self-test
+npm run uninstall:voice # remove models, workers, builds, and the voice Python environment
 ```
 
 Then, inside Pi:
 
 ```text
-/voice device  # choose microphone
+/voice setup      # build workers and download models
+/voice uninstall  # remove all generated local voice data
+/voice device     # choose microphone
 /voice on
 /voice test    # speak without calling the LLM
 /voice stop    # immediately stop playback and abort current work
 /voice status
 /voice off
 ```
+
+`/voice uninstall` asks for confirmation, disables voice, and removes `~/.pi/agent/cache/pi-voice` while preserving `~/.pi/agent/voice.json`. The npm command performs the same removal without an interactive confirmation.
 
 `Ctrl+Shift+V` toggles voice mode. `Ctrl+Alt+S`, `/voice stop`, any typed follow-up, or saying “stop”/“Pi stop” interrupts playback immediately. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi.
 
