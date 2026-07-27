@@ -78,13 +78,35 @@ try {
 	assert.equal(pushToTalk.pushedFrames, 1);
 	pushToTalk.runtime.stop();
 
+	const busyPushToTalk = harness("push-to-talk", false);
+	busyPushToTalk.runtime.armPushToTalk();
+	assert.equal(busyPushToTalk.aborts, 0);
+	busyPushToTalk.runtime.handleSttEvent({ type: "final", text: "intentional interruption" });
+	await busyPushToTalk.runtime.transcriptQueue;
+	assert.equal(busyPushToTalk.aborts, 1);
+	busyPushToTalk.runtime.stop();
+
 	const alwaysOn = harness("always-on", false);
 	alwaysOn.runtime.phase = "thinking";
+	alwaysOn.runtime.detector = {
+		observe: () => true,
+		preroll: () => Buffer.alloc(0),
+		reset: () => {},
+	};
+	alwaysOn.runtime.handleMicFrame(Buffer.alloc(640));
+	assert.equal(alwaysOn.runtime.phase, "thinking");
+	assert.equal(alwaysOn.aborts, 0);
 	alwaysOn.runtime.handleSttEvent({ type: "interim", text: "background conversation" });
 	alwaysOn.runtime.handleSttEvent({ type: "final", text: "background conversation" });
 	await alwaysOn.runtime.transcriptQueue;
 	assert.equal(alwaysOn.aborts, 0);
 	assert.deepEqual(alwaysOn.messages, []);
+
+	alwaysOn.runtime.handleBargeIn();
+	assert.equal(alwaysOn.aborts, 0);
+	alwaysOn.runtime.handleSttEvent({ type: "final", text: "confirmed interruption" });
+	await alwaysOn.runtime.transcriptQueue;
+	assert.equal(alwaysOn.aborts, 1);
 	alwaysOn.runtime.stop();
 
 	console.log("[voice input-mode test] passed");

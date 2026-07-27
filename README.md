@@ -133,7 +133,7 @@ Then, inside Pi:
 
 `/voice uninstall` asks for confirmation, disables voice, and removes `~/.pi/agent/cache/pi-voice` while preserving `~/.pi/agent/voice.json`. The npm command performs the same removal without an interactive confirmation.
 
-`Ctrl+Shift+V` toggles voice mode. In push-to-talk mode, press `Ctrl+Alt+V` once and speak; capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed.
+`Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture even if voice was off or always-on. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed.
 
 `Ctrl+Alt+S`, `/voice stop`, any typed follow-up, or—while always-on—saying “stop”/“Pi stop” interrupts playback immediately. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi.
 
@@ -167,7 +167,7 @@ Model cleanup receives only the transcript and cleanup instructions—no convers
 
 The setup pins and builds MIT-licensed `parakeet.cpp`, installs MIT-licensed `mlx-audio` in an isolated environment, and downloads model weights from Hugging Face. Parakeet GGUF weights are CC-BY-4.0; Qwen3-TTS has its own model license. No unlicensed `pibot` source is copied.
 
-Always-on speaker barge-in is room/device dependent and cannot identify who is speaking. Use push-to-talk in noisy or shared rooms. For always-on mode, if Pi interrupts itself, increase `bargeInFrames` or `residualThreshold`; if it misses you, lower `micThreshold` or `residualThreshold`.
+Always-on mode cannot identify who is speaking. While Pi is thinking or running tools, normal background speech is ignored; only a stop phrase or push-to-talk can interrupt that work. Speaker barge-in remains active during playback. Use push-to-talk in noisy or shared rooms. If playback interrupts itself, increase `bargeInFrames` or `residualThreshold`; if it misses you, lower `micThreshold` or `residualThreshold`.
 
 ## Auto dark mode config
 

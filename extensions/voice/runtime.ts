@@ -54,6 +54,7 @@ export class VoiceRuntime {
 	private speechLimitReached = false;
 	private stopped = false;
 	private pushToTalkArmed = false;
+	private pushToTalkPending = false;
 	private pushToTalkTimer?: ReturnType<typeof setTimeout>;
 
 	constructor(
@@ -137,17 +138,15 @@ export class VoiceRuntime {
 
 	armPushToTalk(): void {
 		if (this.stopped) return;
-		if (this.config.inputMode !== "push-to-talk") {
-			this.ctx.ui.notify("voice: switch to push-to-talk mode first (/voice mode push-to-talk)", "warning");
-			return;
-		}
+		if (this.config.inputMode !== "push-to-talk") this.setInputMode("push-to-talk");
 		if (!this.sttReady) {
-			this.ctx.ui.notify("voice: speech recognition is still loading", "warning");
+			this.pushToTalkPending = true;
+			this.ctx.ui.notify("voice: loading speech recognition; push-to-talk will arm when ready", "info");
 			return;
 		}
+		this.pushToTalkPending = false;
 		this.cancelTranscriptProcessing();
 		if (this.playbackActive || this.currentPendingRequests() > 0) this.cancelSpeech("push-to-talk");
-		if (!this.ctx.isIdle()) this.ctx.abort();
 		this.stt.reset();
 		this.pushToTalkArmed = true;
 		if (this.pushToTalkTimer) clearTimeout(this.pushToTalkTimer);
@@ -250,9 +249,11 @@ export class VoiceRuntime {
 		if (this.phase !== "thinking" && this.phase !== "speaking") return;
 
 		// Keep STT active while Pi works so spoken stop commands do not depend on
-		// the acoustic barge-in heuristic. Non-stop playback transcripts are ignored.
+		// the acoustic barge-in heuristic. Normal speech cannot interrupt thinking;
+		// use push-to-talk for an intentional interruption.
 		this.stt.pushPcm(pcm);
-		const detected = this.detector.observe(pcm, this.phase === "speaking");
+		if (this.phase === "thinking") return;
+		const detected = this.detector.observe(pcm, true);
 		if (this.phase === "speaking" && Date.now() - this.playbackStartedAt < PLAYBACK_DETECTION_DELAY_MS) return;
 		if (detected) this.handleBargeIn();
 	}
@@ -262,7 +263,8 @@ export class VoiceRuntime {
 		const preroll = this.detector.preroll();
 		this.cancelSpeech("barge-in");
 		this.stt.reset();
-		if (!this.ctx.isIdle()) this.ctx.abort();
+		// Acoustic energy only opens the recognition gate. Abort active work later,
+		// after STT confirms a non-empty utterance; noise alone must not cancel it.
 		this.setPhase("hearing");
 		if (preroll.length) this.stt.pushPcm(preroll);
 	}
@@ -271,6 +273,10 @@ export class VoiceRuntime {
 		if (event.type === "ready") {
 			this.sttReady = true;
 			this.setPhase(this.inputRestPhase());
+			if (this.pushToTalkPending) {
+				this.armPushToTalk();
+				return;
+			}
 			this.maybeAnnounceReady();
 			return;
 		}
@@ -318,6 +324,7 @@ export class VoiceRuntime {
 
 	private finishPushToTalk(updatePhase = true): void {
 		this.pushToTalkArmed = false;
+		this.pushToTalkPending = false;
 		if (this.pushToTalkTimer) clearTimeout(this.pushToTalkTimer);
 		this.pushToTalkTimer = undefined;
 		this.stt.reset();
@@ -387,6 +394,7 @@ export class VoiceRuntime {
 	}
 
 	private queueSpeech(raw: string): void {
+		if (this.phase === "armed" || this.phase === "hearing") return;
 		const text = this.sanitizer.clean(raw);
 		if (!text || this.speechLimitReached) return;
 		if (this.spokenCharacters + text.length > this.config.maxSpokenCharacters) {

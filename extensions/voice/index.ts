@@ -152,10 +152,22 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		runtime?.setInputMode(mode);
 		ctx.ui.notify(
 			mode === "push-to-talk"
-				? "voice: push-to-talk mode; press Ctrl+Alt+V, then speak"
+				? "voice: push-to-talk mode; press F8, then speak"
 				: "voice: always-on mode",
 			"info",
 		);
+	}
+
+	function startPushToTalk(ctx: ExtensionContext): void {
+		updateVoiceConfig({ enabled: true, inputMode: "push-to-talk" });
+		if (!runtime) {
+			if (!startRuntime(ctx)) return;
+		} else {
+			runtime.setContext(ctx);
+			runtime.setInputMode("push-to-talk");
+		}
+		runtime?.setContext(ctx);
+		runtime?.armPushToTalk();
 	}
 
 	async function handleCommand(args: string, ctx: ExtensionContext): Promise<void> {
@@ -183,12 +195,7 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			return;
 		}
 		if (command === "talk" || command === "push") {
-			if (!runtime) {
-				ctx.ui.notify("voice is off; run /voice on first", "warning");
-				return;
-			}
-			runtime.setContext(ctx);
-			runtime.armPushToTalk();
+			startPushToTalk(ctx);
 			return;
 		}
 		if (command === "mode" || command.startsWith("mode ")) {
@@ -268,17 +275,12 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerShortcut("ctrl+alt+v", {
+	const pushToTalkShortcut = {
 		description: "Capture one push-to-talk utterance",
-		handler: (ctx) => {
-			if (!runtime) {
-				ctx.ui.notify("voice is off; run /voice on first", "warning");
-				return;
-			}
-			runtime.setContext(ctx);
-			runtime.armPushToTalk();
-		},
-	});
+		handler: (ctx: ExtensionContext) => startPushToTalk(ctx),
+	};
+	pi.registerShortcut("f8", pushToTalkShortcut);
+	pi.registerShortcut("ctrl+alt+v", pushToTalkShortcut);
 
 	pi.registerShortcut("ctrl+alt+s", {
 		description: "Stop voice playback immediately",
