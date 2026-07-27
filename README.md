@@ -5,6 +5,7 @@ Pi extensions:
 - `auto-dark-mode` — macOS dark/light theme switching
 - `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 - `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
+- `voice` — local hands-free STT/TTS for Apple Silicon with streaming speech and speaker barge-in
 
 ## Install
 
@@ -21,7 +22,7 @@ Selected extensions only:
 	"packages": [
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
-			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts"],
+			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/voice/index.ts"],
 			"skills": [],
 			"prompts": [],
 			"themes": []
@@ -38,6 +39,7 @@ Local development:
 pi -e ./extensions/auto-dark-mode.ts
 pi -e ./extensions/code-mode.ts
 pi -e ./extensions/goal.ts
+pi -e ./extensions/voice/index.ts
 pi install /path/to/pi-extensions
 ```
 
@@ -85,6 +87,62 @@ Notes:
 - Active goals auto-continue with hidden continuation messages until `update_goal({ status: "complete" })`, `/goal pause`, `/goal clear`, budget exhaustion, or a no-tool continuation.
 - Goal state is stored in the pi session branch via custom entries; it survives reload/resume/fork.
 - Objectives should include scope, success criteria, constraints, and verification commands.
+
+## Voice
+
+Apple Silicon macOS only. Audio, STT, and TTS stay local; Pi's selected LLM provider remains independent.
+
+Stack:
+
+- microphone/playback: FFmpeg AVFoundation + ffplay
+- streaming STT/end-of-utterance: `parakeet.cpp` with `realtime_eou_120m-v1-q8_0`
+- streaming TTS: Qwen3-TTS 1.7B Base 6-bit through an isolated `mlx-audio`/MLX environment
+- speaker barge-in: microphone/playback correlation with one second of microphone preroll
+
+Requirements:
+
+```bash
+xcode-select --install # if Command Line Tools are missing
+brew install cmake ffmpeg
+# Install uv if missing: https://docs.astral.sh/uv/
+```
+
+Build workers, create a default macOS reference voice, and download roughly 2.8 GB of models:
+
+```bash
+npm run setup:voice
+npm run test:voice # local TTS -> local STT self-test
+```
+
+Then, inside Pi:
+
+```text
+/voice device  # choose microphone
+/voice on
+/voice test    # speak without calling the LLM
+/voice status
+/voice off
+```
+
+`Ctrl+Shift+V` toggles voice mode. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi.
+
+Configuration: `~/.pi/agent/voice.json`. Useful overrides:
+
+```json
+{
+	"enabled": true,
+	"announceReady": true,
+	"inputDevice": "0",
+	"micThreshold": 0.018,
+	"residualThreshold": 0.62,
+	"bargeInFrames": 5,
+	"maxEchoDelayMs": 2500
+}
+```
+
+The setup pins and builds MIT-licensed `parakeet.cpp`, installs MIT-licensed `mlx-audio` in an isolated environment, and downloads model weights from Hugging Face. Parakeet GGUF weights are CC-BY-4.0; Qwen3-TTS has its own model license. No unlicensed `pibot` source is copied.
+
+Speaker barge-in is room/device dependent. If Pi interrupts itself, increase `bargeInFrames` or `residualThreshold`. If it misses you, lower `micThreshold` or `residualThreshold`.
 
 ## Auto dark mode config
 
