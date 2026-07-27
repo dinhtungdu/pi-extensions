@@ -1,6 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AudioIO } from "./audio.js";
-import { BargeInDetector } from "./barge-in.js";
 import type { VoiceConfig, VoiceInputMode } from "./config.js";
 import { SentenceChunker, SpeechSanitizer } from "./speech-text.js";
 import { SttClient, type SttEvent } from "./stt-client.js";
@@ -11,22 +10,8 @@ type VoicePhase = "starting" | "muted" | "armed" | "listening" | "hearing" | "th
 
 const STATUS_KEY = "voice";
 const TRANSCRIPT_WIDGET = "voice-transcript";
-const PLAYBACK_DETECTION_DELAY_MS = 300;
 const PLAYBACK_COOLDOWN_MS = 400;
 const PUSH_TO_TALK_WAIT_MS = 10_000;
-const STOP_PHRASES = new Set(["stop", "pi stop", "stop talking", "be quiet", "quiet", "cancel speech"]);
-
-function isStopPhrase(text: string): boolean {
-	const normalized = text
-		.toLowerCase()
-		.replace(/[^a-z\s]/g, " ")
-		.replace(/\s+/g, " ")
-		.trim();
-	if (STOP_PHRASES.has(normalized)) return true;
-	return ["pi stop", "stop talking", "be quiet", "cancel speech"].some(
-		(phrase) => normalized.includes(phrase),
-	);
-}
 
 export class VoiceRuntime {
 	private ctx: ExtensionContext;
@@ -34,7 +19,6 @@ export class VoiceRuntime {
 	private readonly stt: SttClient;
 	private readonly tts: TtsClient;
 	private readonly audio: AudioIO;
-	private readonly detector: BargeInDetector;
 	private readonly chunker = new SentenceChunker();
 	private readonly sanitizer = new SpeechSanitizer();
 	private readonly transcriptPreprocessor: TranscriptPreprocessor;
@@ -42,7 +26,6 @@ export class VoiceRuntime {
 	private transcriptGeneration = 0;
 	private responseEnded = true;
 	private playbackActive = false;
-	private playbackStartedAt = 0;
 	private cooldownUntil = 0;
 	private generation = 0;
 	private readonly requestGenerations = new Map<number, number>();
@@ -67,12 +50,6 @@ export class VoiceRuntime {
 		this.transcriptPreprocessor = new TranscriptPreprocessor(config, (message) =>
 			this.debug(`cleanup fallback: ${message}`),
 		);
-		this.detector = new BargeInDetector({
-			micThreshold: config.micThreshold,
-			residualThreshold: config.residualThreshold,
-			triggerFrames: config.bargeInFrames,
-			maxEchoDelayMs: config.maxEchoDelayMs,
-		});
 		this.audio = new AudioIO(
 			config,
 			(pcm) => this.handleMicFrame(pcm),
@@ -138,17 +115,21 @@ export class VoiceRuntime {
 		}
 	}
 
-	armPushToTalk(): void {
-		if (this.stopped) return;
+	armPushToTalk(): boolean {
+		if (this.stopped) return false;
+		if (!this.ctx.isIdle() || this.playbackActive || this.currentPendingRequests() > 0) {
+			this.pushToTalkPending = false;
+			this.ctx.ui.notify("voice: wait for the response to finish, or press Escape to interrupt it", "info");
+			return false;
+		}
 		if (this.config.inputMode !== "push-to-talk") this.setInputMode("push-to-talk");
 		if (!this.sttReady) {
 			this.pushToTalkPending = true;
 			this.ctx.ui.notify("voice: loading speech recognition; push-to-talk will arm when ready", "info");
-			return;
+			return true;
 		}
 		this.pushToTalkPending = false;
 		this.cancelTranscriptProcessing();
-		if (this.playbackActive || this.currentPendingRequests() > 0) this.cancelSpeech("push-to-talk");
 		this.stt.reset();
 		this.pushToTalkArmed = true;
 		if (this.pushToTalkTimer) clearTimeout(this.pushToTalkTimer);
@@ -158,6 +139,7 @@ export class VoiceRuntime {
 		}, PUSH_TO_TALK_WAIT_MS);
 		this.setPhase("armed");
 		this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, [this.ctx.ui.theme.fg("accent", "Push-to-talk: speak now")]);
+		return true;
 	}
 
 	status(): string {
@@ -220,10 +202,23 @@ export class VoiceRuntime {
 		for (const chunk of this.chunker.push(delta)) this.queueSpeech(chunk);
 	}
 
-	onAssistantEnd(ctx: ExtensionContext): void {
+	onAssistantEnd(ctx: ExtensionContext, interrupted = false): void {
 		this.setContext(ctx);
+		if (interrupted) {
+			this.onAgentInterrupted(ctx);
+			return;
+		}
 		const tail = this.chunker.flush();
 		if (tail) this.queueSpeech(tail);
+	}
+
+	onAgentInterrupted(ctx: ExtensionContext): void {
+		this.setContext(ctx);
+		this.chunker.reset();
+		if (this.playbackActive || this.currentPendingRequests() > 0) {
+			this.cancelSpeech("agent interrupted");
+		}
+		this.setPhase(this.inputRestPhase());
 	}
 
 	onAgentSettled(ctx: ExtensionContext): void {
@@ -245,31 +240,7 @@ export class VoiceRuntime {
 			return;
 		}
 		if (Date.now() < this.cooldownUntil) return;
-		if (this.phase === "listening" || this.phase === "hearing") {
-			this.stt.pushPcm(pcm);
-			return;
-		}
-		if (this.phase !== "thinking" && this.phase !== "speaking") return;
-
-		// Keep STT active while Pi works so spoken stop commands do not depend on
-		// the acoustic barge-in heuristic. Normal speech cannot interrupt thinking;
-		// use push-to-talk for an intentional interruption.
-		this.stt.pushPcm(pcm);
-		if (this.phase === "thinking") return;
-		const detected = this.detector.observe(pcm, true);
-		if (this.phase === "speaking" && Date.now() - this.playbackStartedAt < PLAYBACK_DETECTION_DELAY_MS) return;
-		if (detected) this.handleBargeIn();
-	}
-
-	private handleBargeIn(): void {
-		this.debug("barge-in detected");
-		const preroll = this.detector.preroll();
-		this.cancelSpeech("barge-in");
-		this.stt.reset();
-		// Acoustic energy only opens the recognition gate. Abort active work later,
-		// after STT confirms a non-empty utterance; noise alone must not cancel it.
-		this.setPhase("hearing");
-		if (preroll.length) this.stt.pushPcm(preroll);
+		if (this.phase === "listening" || this.phase === "hearing") this.stt.pushPcm(pcm);
 	}
 
 	private handleSttEvent(event: SttEvent): void {
@@ -288,21 +259,15 @@ export class VoiceRuntime {
 			return;
 		}
 		if (this.config.inputMode === "push-to-talk" && !this.pushToTalkArmed) return;
+		if (this.phase === "speaking" || this.phase === "thinking") {
+			if (event.type === "final") this.stt.reset();
+			return;
+		}
 		if (event.type === "interim") {
 			if (this.config.inputMode === "push-to-talk") {
 				if (this.pushToTalkTimer) clearTimeout(this.pushToTalkTimer);
 				this.pushToTalkTimer = undefined;
-				this.setPhase("hearing");
-				this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, [this.ctx.ui.theme.fg("dim", `Heard: ${event.text}`)]);
-				return;
 			}
-			if ((this.phase === "speaking" || this.phase === "thinking") && isStopPhrase(event.text)) {
-				this.interruptSpeech("spoken stop command", true);
-				return;
-			}
-			// While Pi is working, only the acoustic detector may promote normal speech
-			// to "hearing". STT remains active solely so stop commands bypass that gate.
-			if (this.phase === "speaking" || this.phase === "thinking") return;
 			this.setPhase("hearing");
 			this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, [this.ctx.ui.theme.fg("dim", `Heard: ${event.text}`)]);
 			return;
@@ -312,11 +277,6 @@ export class VoiceRuntime {
 			if (pushToTalk) this.finishPushToTalk(false);
 			this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
 			const text = event.text.trim();
-			if (!pushToTalk && (this.phase === "speaking" || this.phase === "thinking")) {
-				if (isStopPhrase(text)) this.interruptSpeech("spoken stop command", true);
-				else this.stt.reset();
-				return;
-			}
 			if (!text) {
 				this.setPhase(this.inputRestPhase());
 				return;
@@ -373,13 +333,12 @@ export class VoiceRuntime {
 	}
 
 	private deliverTranscript(text: string): void {
-		if (this.ctx.isIdle()) {
+		if (this.ctx.isIdle() && !this.playbackActive && this.currentPendingRequests() === 0) {
 			this.setPhase("thinking");
 			this.pi.sendUserMessage(text);
 			return;
 		}
 		this.pendingTranscript = text;
-		this.ctx.abort();
 		this.setPhase("thinking");
 	}
 
@@ -390,7 +349,12 @@ export class VoiceRuntime {
 	}
 
 	private sendPendingTranscript(): void {
-		if (!this.pendingTranscript || !this.ctx.isIdle()) return;
+		if (
+			!this.pendingTranscript ||
+			!this.ctx.isIdle() ||
+			this.playbackActive ||
+			this.currentPendingRequests() > 0
+		) return;
 		const text = this.pendingTranscript;
 		this.pendingTranscript = undefined;
 		this.pi.sendUserMessage(text);
@@ -416,15 +380,12 @@ export class VoiceRuntime {
 		if (this.requestGenerations.get(id) !== this.generation) return;
 		this.stt.reset();
 		this.audio.startPlayback(sampleRate);
-		this.detector.startPlayback();
 		this.playbackActive = true;
-		this.playbackStartedAt = Date.now();
 		this.setPhase("speaking");
 	}
 
 	private handleTtsAudio(id: number, pcm: Buffer): void {
 		if (this.requestGenerations.get(id) !== this.generation) return;
-		this.detector.pushPlayback(pcm, 24000);
 		this.audio.writePlayback(pcm);
 	}
 
@@ -456,11 +417,11 @@ export class VoiceRuntime {
 	private handlePlaybackEnd(): void {
 		const hadPlayback = this.playbackActive;
 		this.playbackActive = false;
-		this.detector.reset();
 		this.stt.reset();
 		if (hadPlayback) this.cooldownUntil = Date.now() + PLAYBACK_COOLDOWN_MS;
 		if (this.stopped || this.phase === "hearing" || this.phase === "armed") return;
 		this.setPhase(this.inputRestPhase());
+		this.sendPendingTranscript();
 	}
 
 	private cancelSpeech(reason: string): void {
@@ -469,7 +430,6 @@ export class VoiceRuntime {
 		this.tts.cancelAll();
 		this.audio.cancelPlayback();
 		this.playbackActive = false;
-		this.detector.reset();
 		this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
 		this.responseEnded = true;
 	}

@@ -48,6 +48,12 @@ export default function voiceExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_start", (_event, ctx) => runtime?.onAgentStart(ctx));
+	pi.on("agent_end", (event, ctx) => {
+		const interrupted =
+			ctx.signal?.aborted ||
+			event.messages.some((message) => message.role === "assistant" && message.stopReason === "aborted");
+		if (interrupted) runtime?.onAgentInterrupted(ctx);
+	});
 	pi.on("agent_settled", (_event, ctx) => runtime?.onAgentSettled(ctx));
 	pi.on("tool_execution_start", (_event, ctx) => runtime?.onToolActivity(ctx));
 	pi.on("tool_execution_end", (_event, ctx) => runtime?.onToolActivity(ctx));
@@ -66,7 +72,9 @@ export default function voiceExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("message_end", (event, ctx) => {
-		if (event.message.role === "assistant") runtime?.onAssistantEnd(ctx);
+		if (event.message.role === "assistant") {
+			runtime?.onAssistantEnd(ctx, event.message.stopReason === "aborted");
+		}
 	});
 
 	async function configureDevice(ctx: ExtensionContext): Promise<void> {
@@ -158,15 +166,14 @@ export default function voiceExtension(pi: ExtensionAPI) {
 	}
 
 	function startPushToTalk(ctx: ExtensionContext): void {
-		updateVoiceConfig({ enabled: true, inputMode: "push-to-talk" });
 		if (!runtime) {
+			updateVoiceConfig({ enabled: true });
 			if (!startRuntime(ctx)) return;
-		} else {
-			runtime.setContext(ctx);
-			runtime.setInputMode("push-to-talk");
 		}
 		runtime?.setContext(ctx);
-		runtime?.armPushToTalk();
+		if (runtime?.armPushToTalk()) {
+			updateVoiceConfig({ enabled: true, inputMode: "push-to-talk" });
+		}
 	}
 
 	async function handleCommand(args: string, ctx: ExtensionContext): Promise<void> {

@@ -18,10 +18,6 @@ export interface VoiceConfig {
 	ttsVoice: string;
 	ttsInstruction: string;
 	language: string;
-	micThreshold: number;
-	residualThreshold: number;
-	bargeInFrames: number;
-	maxEchoDelayMs: number;
 	maxSpokenCharacters: number;
 	transcriptCleanup: boolean;
 	cleanupModel: string;
@@ -55,10 +51,6 @@ export function defaultVoiceConfig(): VoiceConfig {
 		ttsVoice: "Aiden",
 		ttsInstruction: "Speak naturally in a calm, conversational tone.",
 		language: "english",
-		micThreshold: 0.006,
-		residualThreshold: 0.62,
-		bargeInFrames: 5,
-		maxEchoDelayMs: 2500,
 		maxSpokenCharacters: 800,
 		transcriptCleanup: false,
 		cleanupModel: "current",

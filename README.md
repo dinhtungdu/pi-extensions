@@ -5,7 +5,7 @@ Pi extensions:
 - `auto-dark-mode` — macOS dark/light theme switching
 - `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 - `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
-- `voice` — local hands-free STT/TTS for Apple Silicon with streaming speech and speaker barge-in
+- `voice` — local hands-free STT/TTS for Apple Silicon with streaming speech and deterministic keyboard interruption
 
 ## Install
 
@@ -97,7 +97,6 @@ Stack:
 - microphone/playback: FFmpeg AVFoundation + ffplay
 - streaming STT/end-of-utterance: `parakeet.cpp` with `realtime_eou_120m-v1-q8_0`
 - streaming TTS: Qwen3-TTS 1.7B CustomVoice 6-bit with the Aiden preset through an isolated `mlx-audio`/MLX environment
-- speaker barge-in: microphone/playback correlation with one second of microphone preroll
 
 Requirements:
 
@@ -133,9 +132,9 @@ Then, inside Pi:
 
 `/voice uninstall` asks for confirmation, disables voice, and removes `~/.pi/agent/cache/pi-voice` while preserving `~/.pi/agent/voice.json`. The npm command performs the same removal without an interactive confirmation.
 
-`Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture even if voice was off or always-on. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed.
+`Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture when Pi is idle. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed. Push-to-talk refuses to arm during an active response or playback.
 
-`Ctrl+Alt+S`, `/voice stop`, any typed follow-up, or—while always-on—saying “stop”/“Pi stop” interrupts playback immediately. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi. Voice uses the macOS default microphone unless you select a specific device with `/voice device`. If the microphone disappears, capture retries in the background and follows a newly available system default without putting voice mode into an error state.
+Microphone audio cannot interrupt thinking or playback. Press `Escape` to abort an active agent response; aborted response audio is cancelled too. `Ctrl+Alt+S`, `/voice stop`, or a typed follow-up also interrupts playback explicitly. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi. Voice uses the macOS default microphone unless you select a specific device with `/voice device`. If the microphone disappears, capture retries in the background and follows a newly available system default without putting voice mode into an error state.
 
 Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 
@@ -147,10 +146,6 @@ Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 	"inputDevice": "default",
 	"ttsVoice": "Aiden",
 	"ttsInstruction": "Speak naturally in a calm, conversational tone.",
-	"micThreshold": 0.006,
-	"residualThreshold": 0.62,
-	"bargeInFrames": 5,
-	"maxEchoDelayMs": 2500,
 	"maxSpokenCharacters": 800,
 	"transcriptCleanup": false,
 	"cleanupModel": "current",
@@ -167,7 +162,7 @@ Model cleanup receives only the transcript and cleanup instructions—no convers
 
 The setup pins and builds MIT-licensed `parakeet.cpp`, installs MIT-licensed `mlx-audio` in an isolated environment, and downloads model weights from Hugging Face. Parakeet GGUF weights are CC-BY-4.0; Qwen3-TTS has its own model license. No unlicensed `pibot` source is copied.
 
-Always-on mode cannot identify who is speaking. While Pi is thinking or running tools, normal background speech is ignored; only a stop phrase or push-to-talk can interrupt that work. Speaker barge-in remains active during playback. Use push-to-talk in noisy or shared rooms. If playback interrupts itself, increase `bargeInFrames` or `residualThreshold`; if it misses you, lower `micThreshold` or `residualThreshold`.
+Always-on mode cannot identify who is speaking. While Pi is thinking, running tools, or speaking, all microphone audio is ignored. Listening resumes after playback and a short cooldown, so speaker echo cannot become user input. Use push-to-talk in noisy or shared rooms.
 
 ## Auto dark mode config
 

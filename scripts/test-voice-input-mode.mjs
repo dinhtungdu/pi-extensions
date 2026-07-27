@@ -52,6 +52,7 @@ try {
 		runtime.sttReady = true;
 		return {
 			runtime,
+			ctx,
 			messages,
 			get aborts() {
 				return aborts;
@@ -68,7 +69,7 @@ try {
 	assert.equal(pushToTalk.pushedFrames, 0);
 	assert.deepEqual(pushToTalk.messages, []);
 
-	pushToTalk.runtime.armPushToTalk();
+	assert.equal(pushToTalk.runtime.armPushToTalk(), true);
 	pushToTalk.runtime.handleMicFrame(Buffer.alloc(640));
 	assert.equal(pushToTalk.pushedFrames, 1);
 	pushToTalk.runtime.handleSttEvent({ type: "final", text: "intentional request" });
@@ -79,35 +80,54 @@ try {
 	pushToTalk.runtime.stop();
 
 	const busyPushToTalk = harness("push-to-talk", false);
-	busyPushToTalk.runtime.armPushToTalk();
-	assert.equal(busyPushToTalk.aborts, 0);
-	busyPushToTalk.runtime.handleSttEvent({ type: "final", text: "intentional interruption" });
+	assert.equal(busyPushToTalk.runtime.armPushToTalk(), false);
+	busyPushToTalk.runtime.handleMicFrame(Buffer.alloc(640));
+	busyPushToTalk.runtime.handleSttEvent({ type: "final", text: "voice interruption" });
 	await busyPushToTalk.runtime.transcriptQueue;
-	assert.equal(busyPushToTalk.aborts, 1);
+	assert.equal(busyPushToTalk.pushedFrames, 0);
+	assert.equal(busyPushToTalk.aborts, 0);
+	assert.deepEqual(busyPushToTalk.messages, []);
 	busyPushToTalk.runtime.stop();
 
 	const alwaysOn = harness("always-on", false);
 	alwaysOn.runtime.phase = "thinking";
-	alwaysOn.runtime.detector = {
-		observe: () => true,
-		preroll: () => Buffer.alloc(0),
-		reset: () => {},
-	};
 	alwaysOn.runtime.handleMicFrame(Buffer.alloc(640));
-	assert.equal(alwaysOn.runtime.phase, "thinking");
-	assert.equal(alwaysOn.aborts, 0);
-	alwaysOn.runtime.handleSttEvent({ type: "interim", text: "background conversation" });
-	alwaysOn.runtime.handleSttEvent({ type: "final", text: "background conversation" });
+	alwaysOn.runtime.handleSttEvent({ type: "interim", text: "pi stop" });
+	alwaysOn.runtime.handleSttEvent({ type: "final", text: "pi stop" });
 	await alwaysOn.runtime.transcriptQueue;
+	assert.equal(alwaysOn.pushedFrames, 0);
 	assert.equal(alwaysOn.aborts, 0);
 	assert.deepEqual(alwaysOn.messages, []);
 
-	alwaysOn.runtime.handleBargeIn();
-	assert.equal(alwaysOn.aborts, 0);
-	alwaysOn.runtime.handleSttEvent({ type: "final", text: "confirmed interruption" });
+	alwaysOn.runtime.phase = "speaking";
+	alwaysOn.runtime.handleMicFrame(Buffer.alloc(640));
+	alwaysOn.runtime.handleSttEvent({ type: "interim", text: "speaker echo" });
+	alwaysOn.runtime.handleSttEvent({ type: "final", text: "speaker echo" });
 	await alwaysOn.runtime.transcriptQueue;
+	assert.equal(alwaysOn.pushedFrames, 0);
+	assert.equal(alwaysOn.aborts, 0);
+	assert.deepEqual(alwaysOn.messages, []);
+
+	// Even a recognition result racing with active work is queued, never used to abort it.
+	alwaysOn.runtime.phase = "listening";
+	alwaysOn.runtime.handleSttEvent({ type: "final", text: "late transcript" });
+	await alwaysOn.runtime.transcriptQueue;
+	assert.equal(alwaysOn.aborts, 0);
+	assert.equal(alwaysOn.runtime.pendingTranscript, "late transcript");
+
+	// Explicit keyboard/command paths still stop speech and abort active work.
+	alwaysOn.runtime.interruptSpeech("keyboard interrupt", true);
 	assert.equal(alwaysOn.aborts, 1);
 	alwaysOn.runtime.stop();
+
+	const escaped = harness("always-on", false);
+	escaped.runtime.phase = "speaking";
+	escaped.runtime.playbackActive = true;
+	const generationBeforeEscape = escaped.runtime.generation;
+	escaped.runtime.onAssistantEnd(escaped.ctx, true);
+	assert.equal(escaped.runtime.generation, generationBeforeEscape + 1);
+	assert.equal(escaped.runtime.playbackActive, false);
+	escaped.runtime.stop();
 
 	console.log("[voice input-mode test] passed");
 } finally {
