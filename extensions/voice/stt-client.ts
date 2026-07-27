@@ -1,6 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { makeSimpleFrame } from "./protocol.js";
 
+function errorCode(error: unknown): string | undefined {
+	return error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+}
+
 export type SttEvent =
 	| { type: "ready"; sampleRate: number }
 	| { type: "reset" }
@@ -22,6 +26,9 @@ export class SttClient {
 		if (this.child) return;
 		const child = spawn(this.workerPath, [this.modelPath], { stdio: ["pipe", "pipe", "pipe"] });
 		this.child = child;
+		child.stdin.on("error", (error) => {
+			if (errorCode(error) !== "EPIPE") this.onEvent({ type: "error", message: `STT input: ${String(error)}` });
+		});
 		child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk));
 		child.stderr.on("data", (chunk: Buffer) => {
 			for (const line of chunk.toString("utf8").split(/\r?\n/)) {
@@ -51,7 +58,13 @@ export class SttClient {
 	}
 
 	private write(frame: Buffer): void {
-		if (this.child?.stdin.writable) this.child.stdin.write(frame);
+		const input = this.child?.stdin;
+		if (!input?.writable || input.destroyed || input.writableEnded) return;
+		try {
+			input.write(frame);
+		} catch (error) {
+			if (errorCode(error) !== "EPIPE") this.onEvent({ type: "error", message: `STT input: ${String(error)}` });
+		}
 	}
 
 	private handleStdout(chunk: Buffer): void {

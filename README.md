@@ -120,11 +120,12 @@ Then, inside Pi:
 /voice device  # choose microphone
 /voice on
 /voice test    # speak without calling the LLM
+/voice stop    # immediately stop playback and abort current work
 /voice status
 /voice off
 ```
 
-`Ctrl+Shift+V` toggles voice mode. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi.
+`Ctrl+Shift+V` toggles voice mode. `Ctrl+Alt+S`, `/voice stop`, any typed follow-up, or saying “stop”/“Pi stop” interrupts playback immediately. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi.
 
 Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 
@@ -133,10 +134,11 @@ Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 	"enabled": true,
 	"announceReady": true,
 	"inputDevice": "0",
-	"micThreshold": 0.018,
+	"micThreshold": 0.006,
 	"residualThreshold": 0.62,
 	"bargeInFrames": 5,
-	"maxEchoDelayMs": 2500
+	"maxEchoDelayMs": 2500,
+	"maxSpokenCharacters": 800
 }
 ```
 

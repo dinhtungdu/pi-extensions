@@ -19,6 +19,7 @@ export interface VoiceConfig {
 	residualThreshold: number;
 	bargeInFrames: number;
 	maxEchoDelayMs: number;
+	maxSpokenCharacters: number;
 }
 
 const CONFIG_FILE = "voice.json";
@@ -46,10 +47,11 @@ export function defaultVoiceConfig(): VoiceConfig {
 		referenceAudioPath: join(cache, "voice", "reference.wav"),
 		referenceTextPath: join(cache, "voice", "reference.txt"),
 		language: "english",
-		micThreshold: 0.018,
+		micThreshold: 0.006,
 		residualThreshold: 0.62,
 		bargeInFrames: 5,
 		maxEchoDelayMs: 2500,
+		maxSpokenCharacters: 800,
 	};
 }
 

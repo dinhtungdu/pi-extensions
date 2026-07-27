@@ -12,6 +12,19 @@ const STATUS_KEY = "voice";
 const TRANSCRIPT_WIDGET = "voice-transcript";
 const PLAYBACK_DETECTION_DELAY_MS = 300;
 const PLAYBACK_COOLDOWN_MS = 400;
+const STOP_PHRASES = new Set(["stop", "pi stop", "stop talking", "be quiet", "quiet", "cancel speech"]);
+
+function isStopPhrase(text: string): boolean {
+	const normalized = text
+		.toLowerCase()
+		.replace(/[^a-z\s]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (STOP_PHRASES.has(normalized)) return true;
+	return ["pi stop", "stop talking", "be quiet", "cancel speech"].some(
+		(phrase) => normalized.includes(phrase),
+	);
+}
 
 export class VoiceRuntime {
 	private ctx: ExtensionContext;
@@ -32,6 +45,8 @@ export class VoiceRuntime {
 	private sttReady = false;
 	private ttsReady = false;
 	private readyAnnounced = false;
+	private spokenCharacters = 0;
+	private speechLimitReached = false;
 	private stopped = false;
 
 	constructor(
@@ -106,15 +121,35 @@ export class VoiceRuntime {
 	testOutput(text = "Voice output is working."): void {
 		if (this.stopped) return;
 		this.cancelSpeech("voice output test");
+		this.spokenCharacters = 0;
+		this.speechLimitReached = false;
 		this.responseEnded = true;
 		this.setPhase("thinking");
 		this.queueSpeech(text);
+	}
+
+	interruptSpeech(reason = "user interrupt", abortAgent = false): void {
+		if (this.stopped) return;
+		this.cancelSpeech(reason);
+		this.stt.reset();
+		this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
+		if (abortAgent && !this.ctx.isIdle()) this.ctx.abort();
+		this.setPhase(this.ctx.isIdle() ? "listening" : "thinking");
+	}
+
+	onUserInput(ctx: ExtensionContext): void {
+		this.setContext(ctx);
+		if (this.playbackActive || this.currentPendingRequests() > 0) {
+			this.interruptSpeech("new user input");
+		}
 	}
 
 	onAgentStart(ctx: ExtensionContext): void {
 		this.setContext(ctx);
 		this.cancelSpeech("new agent response");
 		this.responseEnded = false;
+		this.spokenCharacters = 0;
+		this.speechLimitReached = false;
 		this.chunker.reset();
 		this.sanitizer.reset();
 		this.setPhase("thinking");
@@ -156,6 +191,10 @@ export class VoiceRuntime {
 			return;
 		}
 		if (this.phase !== "thinking" && this.phase !== "speaking") return;
+
+		// Keep STT active while Pi works so spoken stop commands do not depend on
+		// the acoustic barge-in heuristic. Non-stop playback transcripts are ignored.
+		this.stt.pushPcm(pcm);
 		const detected = this.detector.observe(pcm, this.phase === "speaking");
 		if (this.phase === "speaking" && Date.now() - this.playbackStartedAt < PLAYBACK_DETECTION_DELAY_MS) return;
 		if (detected) this.handleBargeIn();
@@ -183,6 +222,15 @@ export class VoiceRuntime {
 			return;
 		}
 		if (event.type === "interim") {
+			if ((this.phase === "speaking" || this.phase === "thinking") && isStopPhrase(event.text)) {
+				this.interruptSpeech("spoken stop command", true);
+				return;
+			}
+			if (this.phase === "speaking") return;
+			if (this.phase === "thinking") {
+				this.cancelSpeech("spoken barge-in");
+				if (!this.ctx.isIdle()) this.ctx.abort();
+			}
 			this.setPhase("hearing");
 			this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, [this.ctx.ui.theme.fg("dim", `Heard: ${event.text}`)]);
 			return;
@@ -190,6 +238,11 @@ export class VoiceRuntime {
 		if (event.type === "final") {
 			this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
 			const text = event.text.trim();
+			if (this.phase === "speaking") {
+				if (isStopPhrase(text)) this.interruptSpeech("spoken stop command", true);
+				else this.stt.reset();
+				return;
+			}
 			if (!text) {
 				this.setPhase(this.ctx.isIdle() ? "listening" : "thinking");
 				return;
@@ -225,13 +278,22 @@ export class VoiceRuntime {
 
 	private queueSpeech(raw: string): void {
 		const text = this.sanitizer.clean(raw);
-		if (!text) return;
+		if (!text || this.speechLimitReached) return;
+		if (this.spokenCharacters + text.length > this.config.maxSpokenCharacters) {
+			this.speechLimitReached = true;
+			const notice = "I put the rest of the answer on screen.";
+			const id = this.tts.speak(notice);
+			this.requestGenerations.set(id, this.generation);
+			return;
+		}
+		this.spokenCharacters += text.length;
 		const id = this.tts.speak(text);
 		this.requestGenerations.set(id, this.generation);
 	}
 
 	private handleTtsStart(id: number, sampleRate: number): void {
 		if (this.requestGenerations.get(id) !== this.generation) return;
+		this.stt.reset();
 		this.audio.startPlayback(sampleRate);
 		this.detector.startPlayback();
 		this.playbackActive = true;
@@ -287,6 +349,7 @@ export class VoiceRuntime {
 		this.audio.cancelPlayback();
 		this.playbackActive = false;
 		this.detector.reset();
+		this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
 		this.responseEnded = true;
 	}
 

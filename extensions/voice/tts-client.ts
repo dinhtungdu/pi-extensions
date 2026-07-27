@@ -11,6 +11,10 @@ const OUTPUT_AUDIO_CHUNK = 3;
 const OUTPUT_AUDIO_DONE = 4;
 const OUTPUT_ERROR = 5;
 
+function errorCode(error: unknown): string | undefined {
+	return error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+}
+
 export interface TtsCallbacks {
 	onReady: () => void;
 	onAudioStart: (requestId: number, sampleRate: number) => void;
@@ -54,6 +58,9 @@ export class TtsClient {
 		];
 		const child = spawn(this.config.ttsWorkerPath, args, { stdio: ["pipe", "pipe", "pipe"] });
 		this.child = child;
+		child.stdin.on("error", (error) => {
+			if (errorCode(error) !== "EPIPE") this.callbacks.onError(`TTS input: ${String(error)}`);
+		});
 		child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk));
 		child.stderr.on("data", (chunk: Buffer) => {
 			for (const line of chunk.toString("utf8").split(/\r?\n/)) {
@@ -63,14 +70,21 @@ export class TtsClient {
 		child.once("error", (error) => this.callbacks.onError(error.message));
 		child.once("exit", (code, signal) => {
 			if (this.child === child) this.child = undefined;
-			if (code !== 0) this.callbacks.onError(`TTS exited (${code ?? signal ?? "unknown"})`);
+			const message = `TTS exited (${code ?? signal ?? "unknown"})`;
+			const pending = [...this.active];
+			this.active.clear();
+			for (const id of pending) this.callbacks.onError(message, id);
+			if (code !== 0 && pending.length === 0) this.callbacks.onError(message);
 		});
 	}
 
 	speak(text: string): number {
 		const id = this.nextRequestId++;
 		this.active.add(id);
-		this.write(makeFrame(INPUT_SPEAK, id, Buffer.from(text, "utf8")));
+		if (!this.write(makeFrame(INPUT_SPEAK, id, Buffer.from(text, "utf8")))) {
+			this.active.delete(id);
+			queueMicrotask(() => this.callbacks.onError("TTS worker is unavailable", id));
+		}
 		return id;
 	}
 
@@ -90,8 +104,16 @@ export class TtsClient {
 		this.active.clear();
 	}
 
-	private write(frame: Buffer): void {
-		if (this.child?.stdin.writable) this.child.stdin.write(frame);
+	private write(frame: Buffer): boolean {
+		const input = this.child?.stdin;
+		if (!input?.writable || input.destroyed || input.writableEnded) return false;
+		try {
+			input.write(frame);
+			return true;
+		} catch (error) {
+			if (errorCode(error) !== "EPIPE") this.callbacks.onError(`TTS input: ${String(error)}`);
+			return false;
+		}
 	}
 
 	private handleStdout(chunk: Buffer): void {

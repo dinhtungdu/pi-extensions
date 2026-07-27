@@ -35,6 +35,11 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		stopRuntime();
 	});
 
+	pi.on("input", (_event, ctx) => {
+		runtime?.onUserInput(ctx);
+		return { action: "continue" };
+	});
+
 	pi.on("agent_start", (_event, ctx) => runtime?.onAgentStart(ctx));
 	pi.on("agent_settled", (_event, ctx) => runtime?.onAgentSettled(ctx));
 	pi.on("tool_execution_start", (_event, ctx) => runtime?.onToolActivity(ctx));
@@ -125,10 +130,18 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			}
 			return;
 		}
-		if (command === "off" || command === "stop") {
+		if (command === "off") {
 			stopRuntime();
 			updateVoiceConfig({ enabled: false });
 			ctx.ui.notify("voice disabled", "info");
+			return;
+		}
+		if (command === "stop" || command === "interrupt") {
+			if (!runtime) {
+				ctx.ui.notify("voice is off", "warning");
+				return;
+			}
+			runtime.interruptSpeech("voice stop command", true);
 			return;
 		}
 		if (command === "setup") {
@@ -158,13 +171,13 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		ctx.ui.notify("Usage: /voice [on|off|status|setup|device|test]", "warning");
+		ctx.ui.notify("Usage: /voice [on|off|stop|status|setup|device|test]", "warning");
 	}
 
 	pi.registerCommand("voice", {
 		description: "Control local hands-free speech input and output",
 		getArgumentCompletions: (prefix) => {
-			const values = ["on", "off", "status", "setup", "device", "test"];
+			const values = ["on", "off", "stop", "status", "setup", "device", "test"];
 			const matches = values.filter((value) => value.startsWith(prefix));
 			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 		},
@@ -175,6 +188,14 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		description: "Toggle local voice mode",
 		handler: async (ctx) => {
 			await handleCommand(runtime ? "off" : "on", ctx);
+		},
+	});
+
+	pi.registerShortcut("ctrl+alt+s", {
+		description: "Stop voice playback immediately",
+		handler: (ctx) => {
+			runtime?.setContext(ctx);
+			runtime?.interruptSpeech("voice stop shortcut", true);
 		},
 	});
 }

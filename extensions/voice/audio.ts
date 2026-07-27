@@ -5,6 +5,10 @@ const CAPTURE_SAMPLE_RATE = 16000;
 const FRAME_MS = 20;
 const FRAME_BYTES = (CAPTURE_SAMPLE_RATE * FRAME_MS * 2) / 1000;
 
+function errorCode(error: unknown): string | undefined {
+	return error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+}
+
 export class AudioIO {
 	private capture?: ChildProcess;
 	private captureBuffer: Buffer = Buffer.alloc(0);
@@ -74,6 +78,11 @@ export class AudioIO {
 		const child = spawn(this.config.ffplayPath, args, { stdio: ["pipe", "ignore", "pipe"] });
 		this.playback = child;
 		let playbackError = "";
+		child.stdin?.on("error", (error) => {
+			if (generation === this.playbackGeneration && errorCode(error) !== "EPIPE") {
+				this.onError(`speaker input: ${String(error)}`);
+			}
+		});
 		child.stderr?.on("data", (chunk: Buffer) => (playbackError += chunk.toString("utf8")));
 		child.once("error", (error) => this.onError(`speaker: ${error.message}`));
 		child.once("exit", (code, signal) => {
@@ -87,18 +96,35 @@ export class AudioIO {
 	}
 
 	writePlayback(pcm: Buffer): void {
-		if (this.playback?.stdin?.writable) this.playback.stdin.write(pcm);
+		const input = this.playback?.stdin;
+		if (!input?.writable || input.destroyed || input.writableEnded) return;
+		try {
+			input.write(pcm);
+		} catch (error) {
+			if (errorCode(error) !== "EPIPE") this.onError(`speaker input: ${String(error)}`);
+		}
 	}
 
 	finishPlayback(): void {
-		if (this.playback?.stdin?.writable) this.playback.stdin.end();
-		else this.onPlaybackEnd();
+		const input = this.playback?.stdin;
+		if (!input?.writable || input.destroyed || input.writableEnded) {
+			this.onPlaybackEnd();
+			return;
+		}
+		try {
+			input.end();
+		} catch (error) {
+			if (errorCode(error) !== "EPIPE") this.onError(`speaker input: ${String(error)}`);
+			this.onPlaybackEnd();
+		}
 	}
 
 	cancelPlayback(): void {
 		this.playbackGeneration++;
-		this.playback?.kill("SIGTERM");
+		const playback = this.playback;
 		this.playback = undefined;
+		playback?.stdin?.destroy();
+		playback?.kill("SIGKILL");
 	}
 
 	stop(): void {
