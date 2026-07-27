@@ -132,7 +132,7 @@ Then, inside Pi:
 
 `/voice uninstall` asks for confirmation, disables voice, and removes `~/.pi/agent/cache/pi-voice` while preserving `~/.pi/agent/voice.json`. The npm command performs the same removal without an interactive confirmation.
 
-When enabled, voice adds a colored `🎙` badge to the right side of Pi's second footer line. The footer remains two lines; other extension statuses are folded into the first line. If `@thebinaryguy/pi-fast-mode` is installed, its `fast` badge shares the same footer.
+When enabled, voice adds a colored `🎙` badge to the right side of Pi's second footer line. The footer remains two lines; other extension statuses are folded into the first line. If `@thebinaryguy/pi-fast-mode` is installed, its `fast` badge shares the same footer. Voice mode also asks the model for concise, conversational, listening-friendly responses; disabling voice automatically restores the normal written response style.
 
 `Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture when Pi is idle. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed. Push-to-talk refuses to arm during an active response or playback.
 

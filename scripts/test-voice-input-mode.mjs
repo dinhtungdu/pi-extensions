@@ -27,6 +27,16 @@ try {
 	const { renderTwoLineFooter } = await import(
 		pathToFileURL(join(output, "extensions", "voice", "footer.js"))
 	);
+	const { voiceResponseSystemPrompt } = await import(
+		pathToFileURL(join(output, "extensions", "voice", "response-style.js"))
+	);
+
+	const writtenPrompt = "Base coding-agent instructions.";
+	assert.equal(voiceResponseSystemPrompt(writtenPrompt, false), undefined);
+	const spokenPrompt = voiceResponseSystemPrompt(writtenPrompt, true);
+	assert.ok(spokenPrompt?.startsWith(writtenPrompt));
+	assert.match(spokenPrompt, /response will be read aloud/i);
+	assert.match(spokenPrompt, /concise, natural conversational sentences/i);
 
 	const footerLines = renderTwoLineFooter(
 		{

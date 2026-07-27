@@ -8,6 +8,7 @@ import {
 	type VoiceInputMode,
 } from "./config.js";
 import { VoiceFooterController } from "./footer.js";
+import { voiceResponseSystemPrompt } from "./response-style.js";
 import { VoiceRuntime } from "./runtime.js";
 
 const SETUP_SCRIPT = fileURLToPath(new URL("../../scripts/setup-voice.mjs", import.meta.url));
@@ -61,6 +62,11 @@ export default function voiceExtension(pi: ExtensionAPI) {
 	pi.on("input", (event, ctx) => {
 		runtime?.onUserInput(ctx, event.source !== "extension");
 		return { action: "continue" };
+	});
+
+	pi.on("before_agent_start", (event) => {
+		const systemPrompt = voiceResponseSystemPrompt(event.systemPrompt, runtime !== undefined);
+		if (systemPrompt) return { systemPrompt };
 	});
 
 	pi.on("agent_start", (_event, ctx) => runtime?.onAgentStart(ctx));
