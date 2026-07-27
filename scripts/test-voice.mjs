@@ -10,9 +10,7 @@ const agentDir = configuredAgentDir ? resolve(configuredAgentDir) : join(homedir
 const root = join(agentDir, "cache", "pi-voice");
 const paths = {
 	tts: join(root, "bin", "pi-voice-tts"),
-	ttsModel: join(root, "models", "qwen3-tts-1.7b-base-6bit"),
-	refAudio: join(root, "voice", "reference.wav"),
-	refText: join(root, "voice", "reference.txt"),
+	ttsModel: join(root, "models", "qwen3-tts-1.7b-custom-voice-6bit"),
 	stt: join(root, "bin", "pi-voice-stt"),
 	sttModel: join(root, "models", "parakeet", "realtime_eou_120m-v1-q8_0.gguf"),
 };
@@ -42,10 +40,10 @@ async function synthesize(text) {
 			"--serve",
 			"--model-name",
 			paths.ttsModel,
-			"--ref-audio",
-			paths.refAudio,
-			"--ref-text-file",
-			paths.refText,
+			"--voice",
+			"Aiden",
+			"--instruct",
+			"Speak naturally in a calm, conversational tone.",
 			"--language",
 			"english",
 		]);

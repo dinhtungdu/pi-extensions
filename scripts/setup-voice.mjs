@@ -14,7 +14,7 @@ const PARAKEET_COMMIT = "1da853421de9710cbe894a0110711de5a0516486";
 const MLX_AUDIO_VERSION = "0.4.6";
 const STT_MODEL_REPO = "mudler/parakeet-cpp-gguf";
 const STT_MODEL_FILE = "realtime_eou_120m-v1-q8_0.gguf";
-const TTS_MODEL_REPO = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-6bit";
+const TTS_MODEL_REPO = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit";
 const TTS_MODEL_FILES = [
 	"config.json",
 	"generation_config.json",
@@ -39,7 +39,6 @@ const sourceDir = join(cacheDir, "src");
 const buildDir = join(cacheDir, "build");
 const binDir = join(cacheDir, "bin");
 const modelDir = join(cacheDir, "models");
-const voiceDir = join(cacheDir, "voice");
 const args = new Set(process.argv.slice(2));
 const sttEnabled = !args.has("--tts-only");
 const ttsEnabled = !args.has("--stt-only");
@@ -102,15 +101,40 @@ function hfUrl(repo, file) {
 async function download(url, destination, label) {
 	if (await usableFile(destination)) return;
 	await mkdir(dirname(destination), { recursive: true });
-	const temporary = `${destination}.tmp-${process.pid}`;
-	await rm(temporary, { force: true });
-	log(`downloading ${label}`);
-	const response = await fetch(url, { redirect: "follow" });
-	if (!response.ok || !response.body) throw new Error(`download failed for ${label}: HTTP ${response.status}`);
-	await pipeline(Readable.fromWeb(response.body), createWriteStream(temporary, { flags: "wx" }));
-	await rename(temporary, destination);
-	const sizeMiB = (await stat(destination)).size / 1024 / 1024;
-	log(`downloaded ${label} (${sizeMiB.toFixed(1)} MiB)`);
+	const temporary = `${destination}.partial`;
+	for (let attempt = 1; attempt <= 5; attempt++) {
+		try {
+			const downloadedBytes = (await usableFile(temporary)) ? (await stat(temporary)).size : 0;
+			log(`${downloadedBytes ? "resuming" : "downloading"} ${label}`);
+			const response = await fetch(url, {
+				redirect: "follow",
+				headers: downloadedBytes ? { Range: `bytes=${downloadedBytes}-` } : {},
+			});
+			if (response.status === 416 && downloadedBytes) {
+				const total = Number(response.headers.get("content-range")?.match(/\*\/(\d+)/)?.[1]);
+				if (total === downloadedBytes) {
+					await rename(temporary, destination);
+					return;
+				}
+			}
+			if (!response.ok || !response.body) {
+				throw new Error(`HTTP ${response.status}`);
+			}
+			const append = downloadedBytes > 0 && response.status === 206;
+			await pipeline(
+				Readable.fromWeb(response.body),
+				createWriteStream(temporary, { flags: append ? "a" : "w" }),
+			);
+			await rename(temporary, destination);
+			const sizeMiB = (await stat(destination)).size / 1024 / 1024;
+			log(`downloaded ${label} (${sizeMiB.toFixed(1)} MiB)`);
+			return;
+		} catch (error) {
+			if (attempt === 5) throw new Error(`download failed for ${label}: ${String(error)}`);
+			log(`download interrupted; retrying ${label} (${attempt}/5)`);
+			await new Promise((resolvePromise) => setTimeout(resolvePromise, attempt * 1000));
+		}
+	}
 }
 
 async function findFile(root, name) {
@@ -190,26 +214,11 @@ async function buildTts() {
 	log(`installed ${worker}`);
 
 	if (downloadModels) {
-		const destination = join(modelDir, "qwen3-tts-1.7b-base-6bit");
+		const destination = join(modelDir, "qwen3-tts-1.7b-custom-voice-6bit");
 		for (const file of TTS_MODEL_FILES) {
 			await download(hfUrl(TTS_MODEL_REPO, file), join(destination, file), `${TTS_MODEL_REPO}/${file}`);
 		}
 	}
-}
-
-async function createReferenceVoice() {
-	const textPath = join(voiceDir, "reference.txt");
-	const wavPath = join(voiceDir, "reference.wav");
-	if ((await usableFile(textPath)) && (await usableFile(wavPath))) return;
-	const text =
-		"Hello. I am your local coding assistant. I can help inspect projects, explain changes, run tools, and work through difficult problems with you. Everything you hear is generated on this Mac.";
-	await mkdir(voiceDir, { recursive: true });
-	await writeFile(textPath, `${text}\n`, "utf8");
-	const aiffPath = join(voiceDir, "reference.aiff");
-	await run("say", ["-v", "Samantha", "-o", aiffPath, text]);
-	await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-i", aiffPath, "-ac", "1", "-ar", "24000", wavPath]);
-	await rm(aiffPath, { force: true });
-	log(`created default reference voice at ${wavPath}`);
 }
 
 async function main() {
@@ -226,10 +235,7 @@ async function main() {
 	}
 	if (ttsEnabled) await requireCommand("uv", "install uv from https://docs.astral.sh/uv/");
 	if (sttEnabled) await buildStt();
-	if (ttsEnabled) {
-		await buildTts();
-		await createReferenceVoice();
-	}
+	if (ttsEnabled) await buildTts();
 	log("complete. Run /voice device, then /voice on.");
 }
 

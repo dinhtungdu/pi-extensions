@@ -1,6 +1,12 @@
 import { fileURLToPath } from "node:url";
 import { BorderedLoader, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadVoiceConfig, missingRuntimeFiles, updateVoiceConfig, voiceCacheDir } from "./config.js";
+import {
+	loadVoiceConfig,
+	missingRuntimeFiles,
+	updateVoiceConfig,
+	voiceCacheDir,
+	type VoiceInputMode,
+} from "./config.js";
 import { VoiceRuntime } from "./runtime.js";
 
 const SETUP_SCRIPT = fileURLToPath(new URL("../../scripts/setup-voice.mjs", import.meta.url));
@@ -36,8 +42,8 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		stopRuntime();
 	});
 
-	pi.on("input", (_event, ctx) => {
-		runtime?.onUserInput(ctx);
+	pi.on("input", (event, ctx) => {
+		runtime?.onUserInput(ctx, event.source !== "extension");
 		return { action: "continue" };
 	});
 
@@ -140,6 +146,18 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		ctx.ui.notify("voice data uninstalled; configuration preserved", "info");
 	}
 
+	function setInputMode(mode: VoiceInputMode, ctx: ExtensionContext): void {
+		updateVoiceConfig({ inputMode: mode });
+		runtime?.setContext(ctx);
+		runtime?.setInputMode(mode);
+		ctx.ui.notify(
+			mode === "push-to-talk"
+				? "voice: push-to-talk mode; press Ctrl+Alt+V, then speak"
+				: "voice: always-on mode",
+			"info",
+		);
+	}
+
 	async function handleCommand(args: string, ctx: ExtensionContext): Promise<void> {
 		if (!ctx.hasUI) return;
 		const command = args.trim().toLowerCase() || "status";
@@ -162,6 +180,29 @@ export default function voiceExtension(pi: ExtensionAPI) {
 				return;
 			}
 			runtime.interruptSpeech("voice stop command", true);
+			return;
+		}
+		if (command === "talk" || command === "push") {
+			if (!runtime) {
+				ctx.ui.notify("voice is off; run /voice on first", "warning");
+				return;
+			}
+			runtime.setContext(ctx);
+			runtime.armPushToTalk();
+			return;
+		}
+		if (command === "mode" || command.startsWith("mode ")) {
+			let requested = command.slice(4).trim();
+			if (!requested) {
+				requested = (await ctx.ui.select("Voice input mode", ["push-to-talk", "always-on"])) ?? "";
+			}
+			if (requested === "push" || requested === "ptt") requested = "push-to-talk";
+			if (requested === "always" || requested === "hands-free") requested = "always-on";
+			if (requested !== "push-to-talk" && requested !== "always-on") {
+				ctx.ui.notify("Usage: /voice mode [push-to-talk|always-on]", "warning");
+				return;
+			}
+			setInputMode(requested, ctx);
 			return;
 		}
 		if (command === "setup") {
@@ -195,13 +236,25 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		ctx.ui.notify("Usage: /voice [on|off|stop|status|setup|uninstall|device|test]", "warning");
+		ctx.ui.notify("Usage: /voice [on|off|talk|stop|mode|status|setup|uninstall|device|test]", "warning");
 	}
 
 	pi.registerCommand("voice", {
 		description: "Control local hands-free speech input and output",
 		getArgumentCompletions: (prefix) => {
-			const values = ["on", "off", "stop", "status", "setup", "uninstall", "device", "test"];
+			const values = [
+				"on",
+				"off",
+				"talk",
+				"stop",
+				"mode push-to-talk",
+				"mode always-on",
+				"status",
+				"setup",
+				"uninstall",
+				"device",
+				"test",
+			];
 			const matches = values.filter((value) => value.startsWith(prefix));
 			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 		},
@@ -212,6 +265,18 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		description: "Toggle local voice mode",
 		handler: async (ctx) => {
 			await handleCommand(runtime ? "off" : "on", ctx);
+		},
+	});
+
+	pi.registerShortcut("ctrl+alt+v", {
+		description: "Capture one push-to-talk utterance",
+		handler: (ctx) => {
+			if (!runtime) {
+				ctx.ui.notify("voice is off; run /voice on first", "warning");
+				return;
+			}
+			runtime.setContext(ctx);
+			runtime.armPushToTalk();
 		},
 	});
 

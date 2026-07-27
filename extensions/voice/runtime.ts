@@ -1,17 +1,19 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AudioIO } from "./audio.js";
 import { BargeInDetector } from "./barge-in.js";
-import type { VoiceConfig } from "./config.js";
+import type { VoiceConfig, VoiceInputMode } from "./config.js";
 import { SentenceChunker, SpeechSanitizer } from "./speech-text.js";
 import { SttClient, type SttEvent } from "./stt-client.js";
+import { TranscriptCleanupCancelled, TranscriptPreprocessor } from "./transcript-preprocessor.js";
 import { TtsClient } from "./tts-client.js";
 
-type VoicePhase = "starting" | "listening" | "hearing" | "thinking" | "speaking" | "error" | "off";
+type VoicePhase = "starting" | "muted" | "armed" | "listening" | "hearing" | "thinking" | "speaking" | "error" | "off";
 
 const STATUS_KEY = "voice";
 const TRANSCRIPT_WIDGET = "voice-transcript";
 const PLAYBACK_DETECTION_DELAY_MS = 300;
 const PLAYBACK_COOLDOWN_MS = 400;
+const PUSH_TO_TALK_WAIT_MS = 10_000;
 const STOP_PHRASES = new Set(["stop", "pi stop", "stop talking", "be quiet", "quiet", "cancel speech"]);
 
 function isStopPhrase(text: string): boolean {
@@ -35,6 +37,9 @@ export class VoiceRuntime {
 	private readonly detector: BargeInDetector;
 	private readonly chunker = new SentenceChunker();
 	private readonly sanitizer = new SpeechSanitizer();
+	private readonly transcriptPreprocessor: TranscriptPreprocessor;
+	private transcriptQueue: Promise<void> = Promise.resolve();
+	private transcriptGeneration = 0;
 	private responseEnded = true;
 	private playbackActive = false;
 	private playbackStartedAt = 0;
@@ -48,6 +53,8 @@ export class VoiceRuntime {
 	private spokenCharacters = 0;
 	private speechLimitReached = false;
 	private stopped = false;
+	private pushToTalkArmed = false;
+	private pushToTalkTimer?: ReturnType<typeof setTimeout>;
 
 	constructor(
 		private readonly pi: ExtensionAPI,
@@ -55,6 +62,9 @@ export class VoiceRuntime {
 		private readonly config: VoiceConfig,
 	) {
 		this.ctx = ctx;
+		this.transcriptPreprocessor = new TranscriptPreprocessor(config, (message) =>
+			this.debug(`cleanup fallback: ${message}`),
+		);
 		this.detector = new BargeInDetector({
 			micThreshold: config.micThreshold,
 			residualThreshold: config.residualThreshold,
@@ -100,6 +110,8 @@ export class VoiceRuntime {
 	}
 
 	stop(): void {
+		this.cancelTranscriptProcessing();
+		this.finishPushToTalk(false);
 		this.stopped = true;
 		this.audio.stop();
 		this.stt.stop();
@@ -114,8 +126,42 @@ export class VoiceRuntime {
 		this.ctx = ctx;
 	}
 
+	setInputMode(mode: VoiceInputMode): void {
+		this.finishPushToTalk(false);
+		this.config.inputMode = mode;
+		this.stt.reset();
+		if (this.phase === "listening" || this.phase === "hearing" || this.phase === "armed" || this.phase === "muted") {
+			this.setPhase(this.inputRestPhase());
+		}
+	}
+
+	armPushToTalk(): void {
+		if (this.stopped) return;
+		if (this.config.inputMode !== "push-to-talk") {
+			this.ctx.ui.notify("voice: switch to push-to-talk mode first (/voice mode push-to-talk)", "warning");
+			return;
+		}
+		if (!this.sttReady) {
+			this.ctx.ui.notify("voice: speech recognition is still loading", "warning");
+			return;
+		}
+		this.cancelTranscriptProcessing();
+		if (this.playbackActive || this.currentPendingRequests() > 0) this.cancelSpeech("push-to-talk");
+		if (!this.ctx.isIdle()) this.ctx.abort();
+		this.stt.reset();
+		this.pushToTalkArmed = true;
+		if (this.pushToTalkTimer) clearTimeout(this.pushToTalkTimer);
+		this.pushToTalkTimer = setTimeout(() => {
+			this.debug("push-to-talk timed out before speech");
+			this.finishPushToTalk();
+		}, PUSH_TO_TALK_WAIT_MS);
+		this.setPhase("armed");
+		this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, [this.ctx.ui.theme.fg("accent", "Push-to-talk: speak now")]);
+	}
+
 	status(): string {
-		return `${this.phase}; input=${this.config.inputDevice}; STT=${this.config.sttModelPath}; TTS=${this.config.ttsModelPath}`;
+		const cleanup = this.config.transcriptCleanup ? this.config.cleanupModel : "off";
+		return `${this.phase}; mode=${this.config.inputMode}; input=${this.config.inputDevice}; voice=${this.config.ttsVoice}; cleanup=${cleanup}; STT=${this.config.sttModelPath}; TTS=${this.config.ttsModelPath}`;
 	}
 
 	testOutput(text = "Voice output is working."): void {
@@ -130,15 +176,21 @@ export class VoiceRuntime {
 
 	interruptSpeech(reason = "user interrupt", abortAgent = false): void {
 		if (this.stopped) return;
+		this.cancelTranscriptProcessing();
+		this.finishPushToTalk(false);
 		this.cancelSpeech(reason);
 		this.stt.reset();
 		this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
 		if (abortAgent && !this.ctx.isIdle()) this.ctx.abort();
-		this.setPhase(this.ctx.isIdle() ? "listening" : "thinking");
+		this.setPhase(this.inputRestPhase());
 	}
 
-	onUserInput(ctx: ExtensionContext): void {
+	onUserInput(ctx: ExtensionContext, external = true): void {
 		this.setContext(ctx);
+		if (external) {
+			this.cancelTranscriptProcessing();
+			this.finishPushToTalk(false);
+		}
 		if (this.playbackActive || this.currentPendingRequests() > 0) {
 			this.interruptSpeech("new user input");
 		}
@@ -181,11 +233,16 @@ export class VoiceRuntime {
 
 	onToolActivity(ctx: ExtensionContext): void {
 		this.setContext(ctx);
-		if (this.phase !== "speaking" && this.phase !== "hearing") this.setPhase("thinking");
+		if (this.phase !== "speaking" && this.phase !== "hearing" && this.phase !== "armed") this.setPhase("thinking");
 	}
 
 	private handleMicFrame(pcm: Buffer): void {
-		if (this.stopped || Date.now() < this.cooldownUntil) return;
+		if (this.stopped) return;
+		if (this.config.inputMode === "push-to-talk") {
+			if (this.pushToTalkArmed) this.stt.pushPcm(pcm);
+			return;
+		}
+		if (Date.now() < this.cooldownUntil) return;
 		if (this.phase === "listening" || this.phase === "hearing") {
 			this.stt.pushPcm(pcm);
 			return;
@@ -213,7 +270,7 @@ export class VoiceRuntime {
 	private handleSttEvent(event: SttEvent): void {
 		if (event.type === "ready") {
 			this.sttReady = true;
-			this.setPhase("listening");
+			this.setPhase(this.inputRestPhase());
 			this.maybeAnnounceReady();
 			return;
 		}
@@ -221,34 +278,58 @@ export class VoiceRuntime {
 			this.fail(event.message);
 			return;
 		}
+		if (this.config.inputMode === "push-to-talk" && !this.pushToTalkArmed) return;
 		if (event.type === "interim") {
+			if (this.config.inputMode === "push-to-talk") {
+				if (this.pushToTalkTimer) clearTimeout(this.pushToTalkTimer);
+				this.pushToTalkTimer = undefined;
+				this.setPhase("hearing");
+				this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, [this.ctx.ui.theme.fg("dim", `Heard: ${event.text}`)]);
+				return;
+			}
 			if ((this.phase === "speaking" || this.phase === "thinking") && isStopPhrase(event.text)) {
 				this.interruptSpeech("spoken stop command", true);
 				return;
 			}
-			if (this.phase === "speaking") return;
-			if (this.phase === "thinking") {
-				this.cancelSpeech("spoken barge-in");
-				if (!this.ctx.isIdle()) this.ctx.abort();
-			}
+			// While Pi is working, only the acoustic detector may promote normal speech
+			// to "hearing". STT remains active solely so stop commands bypass that gate.
+			if (this.phase === "speaking" || this.phase === "thinking") return;
 			this.setPhase("hearing");
 			this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, [this.ctx.ui.theme.fg("dim", `Heard: ${event.text}`)]);
 			return;
 		}
 		if (event.type === "final") {
+			const pushToTalk = this.config.inputMode === "push-to-talk";
+			if (pushToTalk) this.finishPushToTalk(false);
 			this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
 			const text = event.text.trim();
-			if (this.phase === "speaking") {
+			if (!pushToTalk && (this.phase === "speaking" || this.phase === "thinking")) {
 				if (isStopPhrase(text)) this.interruptSpeech("spoken stop command", true);
 				else this.stt.reset();
 				return;
 			}
 			if (!text) {
-				this.setPhase(this.ctx.isIdle() ? "listening" : "thinking");
+				this.setPhase(this.inputRestPhase());
 				return;
 			}
 			this.submitTranscript(text);
 		}
+	}
+
+	private finishPushToTalk(updatePhase = true): void {
+		this.pushToTalkArmed = false;
+		if (this.pushToTalkTimer) clearTimeout(this.pushToTalkTimer);
+		this.pushToTalkTimer = undefined;
+		this.stt.reset();
+		this.ctx.ui.setWidget(TRANSCRIPT_WIDGET, undefined);
+		if (updatePhase && !this.stopped && this.phase !== "speaking" && this.phase !== "error") {
+			this.setPhase(this.inputRestPhase());
+		}
+	}
+
+	private inputRestPhase(): VoicePhase {
+		if (!this.ctx.isIdle()) return "thinking";
+		return this.config.inputMode === "push-to-talk" ? "muted" : "listening";
 	}
 
 	private maybeAnnounceReady(): void {
@@ -257,8 +338,31 @@ export class VoiceRuntime {
 		if (this.config.announceReady) this.testOutput("Voice mode ready.");
 	}
 
-	private submitTranscript(text: string): void {
-		this.debug(`transcript: ${text}`);
+	private submitTranscript(raw: string): void {
+		const generation = this.transcriptGeneration;
+		const ctx = this.ctx;
+		this.debug(`raw transcript: ${raw}`);
+		this.setPhase("thinking");
+		this.transcriptQueue = this.transcriptQueue.then(async () => {
+			if (this.stopped || generation !== this.transcriptGeneration) return;
+			let text: string;
+			try {
+				text = await this.transcriptPreprocessor.process(raw, ctx);
+			} catch (error) {
+				if (error instanceof TranscriptCleanupCancelled) return;
+				this.debug(`cleanup fallback: ${String(error)}`);
+				text = raw;
+			}
+			if (this.stopped || generation !== this.transcriptGeneration) return;
+			this.debug(`transcript: ${text}`);
+			this.deliverTranscript(text);
+		}).catch((error) => {
+			if (!(error instanceof TranscriptCleanupCancelled)) this.debug(`transcript submission failed: ${String(error)}`);
+			if (!this.stopped && this.ctx.isIdle()) this.setPhase(this.inputRestPhase());
+		});
+	}
+
+	private deliverTranscript(text: string): void {
 		if (this.ctx.isIdle()) {
 			this.setPhase("thinking");
 			this.pi.sendUserMessage(text);
@@ -267,6 +371,12 @@ export class VoiceRuntime {
 		this.pendingTranscript = text;
 		this.ctx.abort();
 		this.setPhase("thinking");
+	}
+
+	private cancelTranscriptProcessing(): void {
+		this.transcriptGeneration++;
+		this.transcriptPreprocessor?.cancel();
+		this.pendingTranscript = undefined;
 	}
 
 	private sendPendingTranscript(): void {
@@ -320,7 +430,7 @@ export class VoiceRuntime {
 	}
 
 	private finishPlaybackWhenReady(): void {
-		if (this.phase === "hearing" || !this.responseEnded || this.currentPendingRequests() > 0) return;
+		if (this.phase === "hearing" || this.phase === "armed" || !this.responseEnded || this.currentPendingRequests() > 0) return;
 		this.audio.finishPlayback();
 	}
 
@@ -338,8 +448,8 @@ export class VoiceRuntime {
 		this.detector.reset();
 		this.stt.reset();
 		if (hadPlayback) this.cooldownUntil = Date.now() + PLAYBACK_COOLDOWN_MS;
-		if (this.stopped || this.phase === "hearing") return;
-		this.setPhase(this.ctx.isIdle() ? "listening" : "thinking");
+		if (this.stopped || this.phase === "hearing" || this.phase === "armed") return;
+		this.setPhase(this.inputRestPhase());
 	}
 
 	private cancelSpeech(reason: string): void {
@@ -358,6 +468,8 @@ export class VoiceRuntime {
 		this.phase = phase;
 		const labels: Record<VoicePhase, string> = {
 			starting: "voice: loading",
+			muted: "voice: push-to-talk ready",
+			armed: "voice: speak now",
 			listening: "voice: listening",
 			hearing: "voice: hearing",
 			thinking: "voice: thinking",

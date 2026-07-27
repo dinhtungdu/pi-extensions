@@ -9,7 +9,6 @@ import struct
 import sys
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 
 INPUT_SPEAK = 1
 INPUT_CANCEL = 2
@@ -34,8 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Persistent MLX Qwen3-TTS worker")
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--model-name", "--model-path", dest="model_path", required=True)
-    parser.add_argument("--ref-audio", required=True)
-    parser.add_argument("--ref-text-file", required=True)
+    parser.add_argument("--voice", default="Aiden")
+    parser.add_argument("--instruct", default="")
     parser.add_argument("--language", default="english")
     parser.add_argument("--output-sample-rate", type=int, default=24000)
     parser.add_argument("--blocksize", type=int, default=4800)
@@ -85,7 +84,6 @@ class Worker:
         self.args = args
         self.writer = writer
         self.model = load_model(args.model_path)
-        self.reference_text = Path(args.ref_text_file).read_text(encoding="utf-8").strip()
         self.frames = queue.Queue()
         self.cancelled = set()
         self.cancel_lock = threading.Lock()
@@ -114,8 +112,8 @@ class Worker:
         started = False
         for result in self.model.generate(
             text=text,
-            ref_audio=self.args.ref_audio,
-            ref_text=self.reference_text,
+            voice=self.args.voice,
+            instruct=self.args.instruct or None,
             lang_code=self.args.language,
             temperature=self.args.temperature,
             top_k=self.args.top_k,

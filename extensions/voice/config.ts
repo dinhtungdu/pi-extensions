@@ -2,9 +2,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
+export type VoiceInputMode = "always-on" | "push-to-talk";
+
 export interface VoiceConfig {
 	enabled: boolean;
 	announceReady: boolean;
+	inputMode: VoiceInputMode;
 	inputDevice: string;
 	ffmpegPath: string;
 	ffplayPath: string;
@@ -12,14 +15,18 @@ export interface VoiceConfig {
 	sttModelPath: string;
 	ttsWorkerPath: string;
 	ttsModelPath: string;
-	referenceAudioPath: string;
-	referenceTextPath: string;
+	ttsVoice: string;
+	ttsInstruction: string;
 	language: string;
 	micThreshold: number;
 	residualThreshold: number;
 	bargeInFrames: number;
 	maxEchoDelayMs: number;
 	maxSpokenCharacters: number;
+	transcriptCleanup: boolean;
+	cleanupModel: string;
+	cleanupMinChars: number;
+	cleanupTimeoutMs: number;
 }
 
 const CONFIG_FILE = "voice.json";
@@ -37,21 +44,26 @@ export function defaultVoiceConfig(): VoiceConfig {
 	return {
 		enabled: false,
 		announceReady: true,
+		inputMode: "always-on",
 		inputDevice: "0",
 		ffmpegPath: "ffmpeg",
 		ffplayPath: "ffplay",
 		sttWorkerPath: join(cache, "bin", "pi-voice-stt"),
 		sttModelPath: join(cache, "models", "parakeet", "realtime_eou_120m-v1-q8_0.gguf"),
 		ttsWorkerPath: join(cache, "bin", "pi-voice-tts"),
-		ttsModelPath: join(cache, "models", "qwen3-tts-1.7b-base-6bit"),
-		referenceAudioPath: join(cache, "voice", "reference.wav"),
-		referenceTextPath: join(cache, "voice", "reference.txt"),
+		ttsModelPath: join(cache, "models", "qwen3-tts-1.7b-custom-voice-6bit"),
+		ttsVoice: "Aiden",
+		ttsInstruction: "Speak naturally in a calm, conversational tone.",
 		language: "english",
 		micThreshold: 0.006,
 		residualThreshold: 0.62,
 		bargeInFrames: 5,
 		maxEchoDelayMs: 2500,
 		maxSpokenCharacters: 800,
+		transcriptCleanup: false,
+		cleanupModel: "current",
+		cleanupMinChars: 160,
+		cleanupTimeoutMs: 2500,
 	};
 }
 
@@ -80,6 +92,9 @@ export function loadVoiceConfig(): VoiceConfig {
 			(config as Record<string, unknown>)[key] = value;
 		}
 	}
+	if (config.inputMode !== "always-on" && config.inputMode !== "push-to-talk") {
+		config.inputMode = defaults.inputMode;
+	}
 	return config;
 }
 
@@ -99,7 +114,5 @@ export function missingRuntimeFiles(config: VoiceConfig): string[] {
 		join(config.ttsModelPath, "config.json"),
 		join(config.ttsModelPath, "model.safetensors"),
 		join(config.ttsModelPath, "speech_tokenizer", "model.safetensors"),
-		config.referenceAudioPath,
-		config.referenceTextPath,
 	].filter((path) => !existsSync(path));
 }
