@@ -40,6 +40,7 @@ export default function voiceExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		stopRuntime();
 		if (!ctx.hasUI) return;
 		if (ctx.mode === "tui") {
 			unsubscribeTerminalInput?.();
@@ -48,7 +49,6 @@ export default function voiceExtension(pi: ExtensionAPI) {
 				return undefined;
 			});
 		}
-		if (loadVoiceConfig().enabled) startRuntime(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -152,8 +152,7 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`voice setup failed: ${details || `exit ${result.code}`}`, "error");
 			return;
 		}
-		ctx.ui.notify("voice setup complete", "info");
-		if (loadVoiceConfig().enabled) startRuntime(ctx);
+		ctx.ui.notify("voice setup complete; run /voice on to start it", "info");
 	}
 
 	async function runUninstall(ctx: ExtensionContext): Promise<void> {
@@ -164,7 +163,6 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		if (!confirmed) return;
 
 		stopRuntime();
-		updateVoiceConfig({ enabled: false });
 		ctx.ui.notify("removing local voice data…", "info");
 		const result = await pi.exec(process.execPath, [UNINSTALL_SCRIPT]);
 		if (result.code !== 0) {
@@ -188,29 +186,20 @@ export default function voiceExtension(pi: ExtensionAPI) {
 	}
 
 	function startPushToTalk(ctx: ExtensionContext): void {
-		if (!runtime) {
-			updateVoiceConfig({ enabled: true });
-			if (!startRuntime(ctx)) return;
-		}
+		if (!runtime && !startRuntime(ctx)) return;
 		runtime?.setContext(ctx);
-		if (runtime?.armPushToTalk()) {
-			updateVoiceConfig({ enabled: true, inputMode: "push-to-talk" });
-		}
+		if (runtime?.armPushToTalk()) updateVoiceConfig({ inputMode: "push-to-talk" });
 	}
 
 	async function handleCommand(args: string, ctx: ExtensionContext): Promise<void> {
 		if (!ctx.hasUI) return;
 		const command = args.trim().toLowerCase() || "status";
 		if (command === "on" || command === "start") {
-			if (startRuntime(ctx)) {
-				const path = updateVoiceConfig({ enabled: true });
-				ctx.ui.notify(`voice enabled (${path})`, "info");
-			}
+			if (startRuntime(ctx)) ctx.ui.notify("voice enabled for this session", "info");
 			return;
 		}
 		if (command === "off") {
 			stopRuntime();
-			updateVoiceConfig({ enabled: false });
 			ctx.ui.notify("voice disabled", "info");
 			return;
 		}
@@ -266,7 +255,7 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				runtime
 					? `voice: ${runtime.status()}`
-					: `voice: off; configured=${config.enabled}; setup=${missing.length ? `missing ${missing.length} files` : "ready"}`,
+					: `voice: off; setup=${missing.length ? `missing ${missing.length} files` : "ready"}`,
 				missing.length ? "warning" : "info",
 			);
 			return;

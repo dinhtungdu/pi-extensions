@@ -130,7 +130,9 @@ Then, inside Pi:
 /voice off
 ```
 
-`/voice uninstall` asks for confirmation, disables voice, and removes `~/.pi/agent/cache/pi-voice` while preserving `~/.pi/agent/voice.json`. The npm command performs the same removal without an interactive confirmation.
+`/voice uninstall` asks for confirmation and removes `~/.pi/agent/cache/pi-voice` while preserving `~/.pi/agent/voice.json`. The npm command performs the same removal without an interactive confirmation.
+
+Voice starts off in every new session. `/voice on` and `/voice off` only affect the current session; that choice is not stored in configuration.
 
 When enabled, voice adds a colored `🎙` badge to the right side of Pi's second footer line. The footer remains two lines; other extension statuses are folded into the first line. If `@thebinaryguy/pi-fast-mode` is installed, its `fast` badge shares the same footer. Voice mode also asks the model for concise, conversational, listening-friendly responses; disabling voice automatically restores the normal written response style.
 
@@ -142,13 +144,12 @@ Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 
 ```json
 {
-	"enabled": true,
 	"announceReady": true,
 	"inputMode": "always-on",
 	"inputDevice": "default",
 	"ttsVoice": "Aiden",
 	"ttsInstruction": "Speak naturally in a calm, conversational tone.",
-	"maxSpokenCharacters": 800,
+	"maxSpokenCharacters": 400,
 	"transcriptCleanup": false,
 	"cleanupModel": "current",
 	"cleanupMinChars": 160,

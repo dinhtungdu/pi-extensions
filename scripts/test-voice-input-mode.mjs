@@ -31,6 +31,10 @@ try {
 		pathToFileURL(join(output, "extensions", "voice", "response-style.js"))
 	);
 
+	const defaults = defaultVoiceConfig();
+	assert.equal("enabled" in defaults, false, "voice activation must remain session-scoped");
+	assert.equal(defaults.maxSpokenCharacters, 400);
+
 	const writtenPrompt = "Base coding-agent instructions.";
 	assert.equal(voiceResponseSystemPrompt(writtenPrompt, false), undefined);
 	const spokenPrompt = voiceResponseSystemPrompt(writtenPrompt, true);

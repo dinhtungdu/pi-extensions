@@ -5,7 +5,6 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 export type VoiceInputMode = "always-on" | "push-to-talk";
 
 export interface VoiceConfig {
-	enabled: boolean;
 	announceReady: boolean;
 	inputMode: VoiceInputMode;
 	inputDevice: string;
@@ -38,7 +37,6 @@ export function voiceConfigPath(): string {
 export function defaultVoiceConfig(): VoiceConfig {
 	const cache = voiceCacheDir();
 	return {
-		enabled: false,
 		announceReady: true,
 		inputMode: "always-on",
 		inputDevice: "default",
@@ -51,7 +49,7 @@ export function defaultVoiceConfig(): VoiceConfig {
 		ttsVoice: "Aiden",
 		ttsInstruction: "Speak naturally in a calm, conversational tone.",
 		language: "english",
-		maxSpokenCharacters: 800,
+		maxSpokenCharacters: 400,
 		transcriptCleanup: false,
 		cleanupModel: "current",
 		cleanupMinChars: 160,
@@ -92,7 +90,7 @@ export function loadVoiceConfig(): VoiceConfig {
 
 export function updateVoiceConfig(patch: Partial<VoiceConfig>): string {
 	const path = voiceConfigPath();
-	const current = jsonObject(path);
+	const { enabled: _legacyEnabled, ...current } = jsonObject(path);
 	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, `${JSON.stringify({ ...current, ...patch }, null, "\t")}\n`, "utf8");
 	return path;
