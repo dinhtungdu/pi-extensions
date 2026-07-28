@@ -18,7 +18,7 @@ try {
 	);
 	if (compile.status !== 0) throw new Error(`${compile.stdout}\n${compile.stderr}`.trim());
 
-	const { defaultVoiceConfig } = await import(
+	const { defaultVoiceConfig, missingRuntimeFiles, requiredVoiceComponents } = await import(
 		pathToFileURL(join(output, "extensions", "voice", "config.js"))
 	);
 	const { VoiceRuntime } = await import(
@@ -34,6 +34,10 @@ try {
 	const defaults = defaultVoiceConfig();
 	assert.equal("enabled" in defaults, false, "voice activation must remain session-scoped");
 	assert.equal(defaults.maxSpokenCharacters, 400);
+	const externalConfig = { ...defaults, inputMode: "external" };
+	assert.deepEqual(requiredVoiceComponents(externalConfig), ["tts"]);
+	assert.equal(missingRuntimeFiles(externalConfig).includes(defaults.sttWorkerPath), false);
+	assert.deepEqual(requiredVoiceComponents(defaults), ["stt", "tts"]);
 
 	const writtenPrompt = "Base coding-agent instructions.";
 	assert.equal(voiceResponseSystemPrompt(writtenPrompt, false), undefined);
@@ -105,6 +109,45 @@ try {
 			},
 		};
 	}
+
+	const external = harness("external");
+	let externalSttStarts = 0;
+	let externalSttStops = 0;
+	let externalCaptureStarts = 0;
+	let externalCaptureStops = 0;
+	let externalTtsStarts = 0;
+	external.runtime.stt = {
+		start: () => externalSttStarts++,
+		reset: () => {},
+		pushPcm: () => {},
+		stop: () => externalSttStops++,
+	};
+	external.runtime.audio = {
+		startCapture: () => externalCaptureStarts++,
+		stopCapture: () => externalCaptureStops++,
+		cancelPlayback: () => {},
+		stop: () => {},
+	};
+	external.runtime.tts = {
+		start: () => externalTtsStarts++,
+		stop: () => {},
+		cancelAll: () => {},
+		pending: () => 0,
+	};
+	external.runtime.start();
+	assert.equal(externalSttStarts, 0);
+	assert.equal(externalCaptureStarts, 0);
+	assert.equal(externalTtsStarts, 1);
+	assert.match(external.runtime.status(), /microphone=disabled/);
+	assert.match(external.runtime.status(), /STT=external/);
+	assert.equal(external.runtime.armPushToTalk(), false);
+	external.runtime.setInputMode("push-to-talk");
+	assert.equal(externalSttStarts, 1);
+	assert.equal(externalCaptureStarts, 1);
+	external.runtime.setInputMode("external");
+	assert.equal(externalSttStops, 1);
+	assert.equal(externalCaptureStops, 1);
+	external.runtime.stop();
 
 	const pushToTalk = harness("push-to-talk");
 	pushToTalk.runtime.handleMicFrame(Buffer.alloc(640));

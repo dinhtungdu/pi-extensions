@@ -98,31 +98,39 @@ Stack:
 - streaming STT/end-of-utterance: `parakeet.cpp` with `realtime_eou_120m-v1-q8_0`
 - streaming TTS: Qwen3-TTS 1.7B CustomVoice 6-bit with the Aiden preset through an isolated `mlx-audio`/MLX environment
 
-Requirements:
+Requirements for the full stack:
 
 ```bash
-xcode-select --install # if Command Line Tools are missing
-brew install cmake ffmpeg
-# Install uv if missing: https://docs.astral.sh/uv/
+xcode-select --install # STT build only; if Command Line Tools are missing
+brew install cmake     # STT build only
+brew install ffmpeg    # ffmpeg for STT capture; ffplay for TTS playback
+# Install uv for TTS: https://docs.astral.sh/uv/
 ```
+
+TTS-only setup does not require Xcode, CMake, FFmpeg microphone capture, or microphone permission. It still requires `uv` and `ffplay`.
 
 Build workers and download roughly 2.8 GB of models:
 
 ```bash
-npm run setup:voice
-npm run test:voice # local TTS -> local STT self-test
-npm run uninstall:voice # remove models, workers, builds, and the voice Python environment
+npm run setup:voice                         # STT + TTS
+npm run setup:voice -- --tts-only           # TTS only; use an external dictation app
+npm run setup:voice -- --stt-only           # add or repair STT only
+npm run test:voice                           # local TTS -> local STT self-test
+npm run uninstall:voice -- stt               # remove only Parakeet/STT
+npm run uninstall:voice -- tts               # remove only Qwen/TTS
+npm run uninstall:voice                      # remove all generated voice data
 ```
 
 Then, inside Pi:
 
 ```text
-/voice setup      # build workers and download models
-/voice uninstall  # remove all generated local voice data
-/voice device              # choose microphone
-/voice mode push-to-talk   # ignore microphone until explicitly armed
-/voice talk                # capture one utterance
-/voice mode always-on      # restore hands-free listening
+/voice setup [stt|tts|all]      # choose or install specific components
+/voice uninstall [stt|tts|all]  # choose or remove specific components
+/voice device                   # choose microphone
+/voice mode push-to-talk        # ignore microphone until explicitly armed
+/voice talk                     # capture one utterance
+/voice mode always-on           # restore hands-free listening
+/voice mode external            # TTS only; use VoiceInk, macOS Dictation, etc.
 /voice on
 /voice test                # speak without calling the LLM
 /voice stop                # immediately stop playback and abort current work
@@ -130,15 +138,17 @@ Then, inside Pi:
 /voice off
 ```
 
-`/voice uninstall` asks for confirmation and removes `~/.pi/agent/cache/pi-voice` while preserving `~/.pi/agent/voice.json`. The npm command performs the same removal without an interactive confirmation.
+Bare `/voice setup` and `/voice uninstall` show a component selector. Removing STT automatically switches input mode to `external`; if voice was active, TTS restarts without microphone capture. Removing all generated data deletes `~/.pi/agent/cache/pi-voice`. Every uninstall variant preserves `~/.pi/agent/voice.json`.
 
 Voice starts off in every new session. `/voice on` and `/voice off` only affect the current session; that choice is not stored in configuration.
 
 When enabled, voice adds a colored `🎙` badge to the right side of Pi's second footer line. The footer remains two lines; other extension statuses are folded into the first line. If `@thebinaryguy/pi-fast-mode` is installed, its `fast` badge shares the same footer. Voice mode also asks the model for concise, conversational, listening-friendly responses; disabling voice automatically restores the normal written response style.
 
-`Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture when Pi is idle. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed. Push-to-talk refuses to arm during an active response or playback.
+`Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture when Pi is idle. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed. Push-to-talk refuses to arm during an active response or playback. In `external` mode these capture shortcuts remain disabled; the dictation app owns its shortcut and inserts text into Pi normally.
 
 Microphone audio cannot interrupt thinking or playback. Press `Escape` to stop voice playback; if an agent response is active, Pi aborts it too. `Ctrl+Alt+S`, `/voice stop`, or a typed follow-up also interrupts playback explicitly. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi. Voice uses the macOS default microphone unless you select a specific device with `/voice device`. If the microphone disappears, capture retries in the background and follows a newly available system default without putting voice mode into an error state.
+
+External mode starts only TTS: it does not launch the Parakeet worker, FFmpeg microphone capture, or request microphone permission. The Qwen TTS model is still required.
 
 Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 

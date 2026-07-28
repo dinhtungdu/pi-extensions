@@ -48,6 +48,7 @@
 		"uninstall:voice": "node ./scripts/uninstall-voice.mjs",
 		"test:voice": "node ./scripts/test-voice.mjs",
 		"test:voice-cleanup": "node ./scripts/test-voice-preprocessor.mjs",
-		"test:voice-input-mode": "node ./scripts/test-voice-input-mode.mjs"
+		"test:voice-input-mode": "node ./scripts/test-voice-input-mode.mjs",
+		"test:voice-components": "node ./scripts/test-voice-components.mjs"
 	}
 }

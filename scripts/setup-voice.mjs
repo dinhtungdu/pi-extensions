@@ -227,7 +227,8 @@ async function main() {
 	}
 	await mkdir(binDir, { recursive: true });
 	await mkdir(modelDir, { recursive: true });
-	for (const command of ["ffmpeg", "ffplay"]) await requireCommand(command, "run: brew install ffmpeg");
+	if (sttEnabled) await requireCommand("ffmpeg", "run: brew install ffmpeg");
+	if (ttsEnabled) await requireCommand("ffplay", "run: brew install ffmpeg");
 	if (sttEnabled) {
 		await requireCommand("git", "install Xcode command line tools");
 		await requireCommand("cmake", "run: brew install cmake");

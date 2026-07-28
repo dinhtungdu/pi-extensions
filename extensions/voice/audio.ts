@@ -161,8 +161,7 @@ export class AudioIO {
 		playback?.kill("SIGKILL");
 	}
 
-	stop(): void {
-		this.cancelPlayback();
+	stopCapture(): void {
 		this.captureRequested = false;
 		if (this.captureRetry) clearTimeout(this.captureRetry);
 		this.captureRetry = undefined;
@@ -170,6 +169,11 @@ export class AudioIO {
 		this.capture?.kill("SIGTERM");
 		this.capture = undefined;
 		this.captureBuffer = Buffer.alloc(0);
+	}
+
+	stop(): void {
+		this.cancelPlayback();
+		this.stopCapture();
 	}
 
 	private handleCapture(chunk: Buffer): void {
