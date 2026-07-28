@@ -22,7 +22,7 @@ try {
 		pathToFileURL(join(output, "extensions", "voice", "transcript-preprocessor.js"))
 	);
 	const { cleanTranscriptDeterministically, preservesTechnicalText } = cleanup;
-	const { TranscriptCleanupCancelled, TranscriptPreprocessor } = preprocessorModule;
+	const { TranscriptCleanupCancelled, TranscriptPreprocessor, transcriptCleanupUserMessage } = preprocessorModule;
 	const ctx = {};
 	const baseConfig = {
 		transcriptCleanup: true,
@@ -30,6 +30,11 @@ try {
 		cleanupMinChars: 160,
 		cleanupTimeoutMs: 2500,
 	};
+
+	assert.equal(
+		transcriptCleanupUserMessage("Um, inspect src/auth/login.ts."),
+		"<USER_MESSAGE>\nUm, inspect src/auth/login.ts.\n</USER_MESSAGE>",
+	);
 
 	const technical = 'Um, run `npm test` in ~/workspace/foo at version 1.2.3 and do not change "API_KEY" or WordPress.';
 	const technicalCleaned = cleanTranscriptDeterministically(technical);
