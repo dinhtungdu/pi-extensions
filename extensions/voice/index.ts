@@ -43,7 +43,8 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			return false;
 		}
 		footer.activate(ctx);
-		runtime = new VoiceRuntime(pi, ctx, config, (phase) => footer.setPhase(phase));
+		const sttEnabled = missingRuntimeFiles(config, ["stt"]).length === 0;
+		runtime = new VoiceRuntime(pi, ctx, config, (phase) => footer.setPhase(phase), sttEnabled);
 		runtime.start();
 		return true;
 	}
@@ -171,12 +172,7 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`voice setup failed: ${details || `exit ${result.code}`}`, "error");
 			return;
 		}
-		let config = loadVoiceConfig();
-		if (missingRuntimeFiles(config, ["stt"]).length && config.inputMode !== "external") {
-			updateVoiceConfig({ inputMode: "external" });
-			config = loadVoiceConfig();
-		}
-		const missing = missingRuntimeFiles(config);
+		const missing = missingRuntimeFiles(loadVoiceConfig());
 		ctx.ui.notify(
 			missing.length
 				? `voice ${label} setup complete; another required component is missing—run /voice status`
@@ -201,14 +197,13 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`voice uninstall failed: ${details || `exit ${result.code}`}`, "error");
 			return;
 		}
-		if (target === "stt" || target === "all") updateVoiceConfig({ inputMode: "external" });
 		if (restartOutput) startRuntime(ctx);
 		ctx.ui.notify(`voice ${target} data uninstalled; configuration preserved`, "info");
 	}
 
 	function setInputMode(mode: VoiceInputMode, ctx: ExtensionContext): void {
 		const config = loadVoiceConfig();
-		if (mode !== "external" && missingRuntimeFiles(config, ["stt"]).length) {
+		if (missingRuntimeFiles(config, ["stt"]).length) {
 			ctx.ui.notify("voice speech input is not installed; run /voice setup stt", "error");
 			return;
 		}
@@ -217,15 +212,13 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		runtime?.setInputMode(mode);
 		const message = mode === "push-to-talk"
 			? "voice: push-to-talk mode; press F8, then speak"
-			: mode === "always-on"
-				? "voice: always-on mode"
-				: "voice: external input mode; use your dictation app";
+			: "voice: always-on mode";
 		ctx.ui.notify(message, "info");
 	}
 
 	function startPushToTalk(ctx: ExtensionContext): void {
-		if (loadVoiceConfig().inputMode === "external") {
-			ctx.ui.notify("voice: internal speech input is disabled; use your dictation app", "info");
+		if (missingRuntimeFiles(loadVoiceConfig(), ["stt"]).length) {
+			ctx.ui.notify("voice: speech input is not installed; use your dictation app", "info");
 			return;
 		}
 		if (!runtime && !startRuntime(ctx)) return;
@@ -260,13 +253,12 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		if (command === "mode" || command.startsWith("mode ")) {
 			let requested = command.slice(4).trim();
 			if (!requested) {
-				requested = (await ctx.ui.select("Voice input mode", ["push-to-talk", "always-on", "external"])) ?? "";
+				requested = (await ctx.ui.select("Voice input mode", ["push-to-talk", "always-on"])) ?? "";
 			}
 			if (requested === "push" || requested === "ptt") requested = "push-to-talk";
 			if (requested === "always" || requested === "hands-free") requested = "always-on";
-			if (requested === "output" || requested === "tts" || requested === "dictation") requested = "external";
-			if (requested !== "push-to-talk" && requested !== "always-on" && requested !== "external") {
-				ctx.ui.notify("Usage: /voice mode [push-to-talk|always-on|external]", "warning");
+			if (requested !== "push-to-talk" && requested !== "always-on") {
+				ctx.ui.notify("Usage: /voice mode [push-to-talk|always-on]", "warning");
 				return;
 			}
 			setInputMode(requested, ctx);
@@ -332,7 +324,6 @@ export default function voiceExtension(pi: ExtensionAPI) {
 				"stop",
 				"mode push-to-talk",
 				"mode always-on",
-				"mode external",
 				"status",
 				"setup stt",
 				"setup tts",

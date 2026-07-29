@@ -18,7 +18,7 @@ try {
 	);
 	if (compile.status !== 0) throw new Error(`${compile.stdout}\n${compile.stderr}`.trim());
 
-	const { defaultVoiceConfig, missingRuntimeFiles, requiredVoiceComponents } = await import(
+	const { defaultVoiceConfig, missingRuntimeFiles } = await import(
 		pathToFileURL(join(output, "extensions", "voice", "config.js"))
 	);
 	const { VoiceRuntime } = await import(
@@ -34,10 +34,8 @@ try {
 	const defaults = defaultVoiceConfig();
 	assert.equal("enabled" in defaults, false, "voice activation must remain session-scoped");
 	assert.equal(defaults.maxSpokenCharacters, 400);
-	const externalConfig = { ...defaults, inputMode: "external" };
-	assert.deepEqual(requiredVoiceComponents(externalConfig), ["tts"]);
-	assert.equal(missingRuntimeFiles(externalConfig).includes(defaults.sttWorkerPath), false);
-	assert.deepEqual(requiredVoiceComponents(defaults), ["stt", "tts"]);
+	assert.equal(missingRuntimeFiles(defaults).includes(defaults.sttWorkerPath), false);
+	assert.equal(missingRuntimeFiles(defaults, ["stt"]).includes(defaults.sttWorkerPath), true);
 
 	const writtenPrompt = "Base coding-agent instructions.";
 	assert.equal(voiceResponseSystemPrompt(writtenPrompt, false), undefined);
@@ -69,7 +67,7 @@ try {
 	assert.equal(narrowFooterLines.length, 2);
 	assert.ok(narrowFooterLines.every((line) => visibleWidth(line) <= 8));
 
-	function harness(inputMode, idle = true) {
+	function harness(inputMode, idle = true, sttEnabled = true) {
 		const messages = [];
 		let aborts = 0;
 		let pushedFrames = 0;
@@ -89,6 +87,8 @@ try {
 			{ sendUserMessage: (text) => messages.push(text) },
 			ctx,
 			config,
+			undefined,
+			sttEnabled,
 		);
 		runtime.stt = {
 			reset: () => {},
@@ -110,44 +110,36 @@ try {
 		};
 	}
 
-	const external = harness("external");
-	let externalSttStarts = 0;
-	let externalSttStops = 0;
-	let externalCaptureStarts = 0;
-	let externalCaptureStops = 0;
-	let externalTtsStarts = 0;
-	external.runtime.stt = {
-		start: () => externalSttStarts++,
+	const ttsOnly = harness("always-on", true, false);
+	let ttsOnlySttStarts = 0;
+	let ttsOnlyCaptureStarts = 0;
+	let ttsOnlyTtsStarts = 0;
+	ttsOnly.runtime.stt = {
+		start: () => ttsOnlySttStarts++,
 		reset: () => {},
 		pushPcm: () => {},
-		stop: () => externalSttStops++,
+		stop: () => {},
 	};
-	external.runtime.audio = {
-		startCapture: () => externalCaptureStarts++,
-		stopCapture: () => externalCaptureStops++,
+	ttsOnly.runtime.audio = {
+		startCapture: () => ttsOnlyCaptureStarts++,
+		stopCapture: () => {},
 		cancelPlayback: () => {},
 		stop: () => {},
 	};
-	external.runtime.tts = {
-		start: () => externalTtsStarts++,
+	ttsOnly.runtime.tts = {
+		start: () => ttsOnlyTtsStarts++,
 		stop: () => {},
 		cancelAll: () => {},
 		pending: () => 0,
 	};
-	external.runtime.start();
-	assert.equal(externalSttStarts, 0);
-	assert.equal(externalCaptureStarts, 0);
-	assert.equal(externalTtsStarts, 1);
-	assert.match(external.runtime.status(), /microphone=disabled/);
-	assert.match(external.runtime.status(), /STT=external/);
-	assert.equal(external.runtime.armPushToTalk(), false);
-	external.runtime.setInputMode("push-to-talk");
-	assert.equal(externalSttStarts, 1);
-	assert.equal(externalCaptureStarts, 1);
-	external.runtime.setInputMode("external");
-	assert.equal(externalSttStops, 1);
-	assert.equal(externalCaptureStops, 1);
-	external.runtime.stop();
+	ttsOnly.runtime.start();
+	assert.equal(ttsOnlySttStarts, 0);
+	assert.equal(ttsOnlyCaptureStarts, 0);
+	assert.equal(ttsOnlyTtsStarts, 1);
+	assert.match(ttsOnly.runtime.status(), /microphone=disabled/);
+	assert.match(ttsOnly.runtime.status(), /STT=not installed/);
+	assert.equal(ttsOnly.runtime.armPushToTalk(), false);
+	ttsOnly.runtime.stop();
 
 	const pushToTalk = harness("push-to-talk");
 	pushToTalk.runtime.handleMicFrame(Buffer.alloc(640));

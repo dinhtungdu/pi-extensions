@@ -46,7 +46,7 @@ try {
 	uninstall("stt");
 	assert.ok(sttPaths.every((path) => !existsSync(path)));
 	assert.ok(ttsPaths.every((path) => existsSync(path)));
-	assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), { inputMode: "external", ttsVoice: "Aiden" });
+	assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), { inputMode: "always-on", ttsVoice: "Aiden" });
 
 	await create(sttPaths);
 	uninstall("tts");

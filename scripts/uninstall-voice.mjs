@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 const configuredAgentDir = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=\/)/, homedir());
 const agentDir = configuredAgentDir ? resolve(configuredAgentDir) : join(homedir(), ".pi", "agent");
 const cacheDir = join(agentDir, "cache", "pi-voice");
-const configPath = join(agentDir, "voice.json");
 const target = process.argv[2] ?? "all";
 
 function log(message) {
@@ -18,17 +17,6 @@ async function remove(paths) {
 	for (const path of paths) {
 		await rm(path, { recursive: true, force: true });
 		log(`removed ${path}`);
-	}
-}
-
-async function selectExternalInput() {
-	try {
-		const config = JSON.parse(await readFile(configPath, "utf8"));
-		if (!config || typeof config !== "object" || Array.isArray(config)) return;
-		await writeFile(configPath, `${JSON.stringify({ ...config, inputMode: "external" }, null, "\t")}\n`, "utf8");
-		log(`set input mode to external in ${configPath}`);
-	} catch (error) {
-		if (error?.code !== "ENOENT") log(`left unreadable configuration unchanged: ${String(error)}`);
 	}
 }
 
@@ -59,7 +47,6 @@ async function main() {
 	} else {
 		throw new Error("usage: uninstall-voice.mjs [stt|tts|all]");
 	}
-	if (target === "stt" || target === "all") await selectExternalInput();
 	log(`complete. Removed ${target}; configuration was preserved.`);
 }
 

@@ -130,7 +130,6 @@ Then, inside Pi:
 /voice mode push-to-talk        # ignore microphone until explicitly armed
 /voice talk                     # capture one utterance
 /voice mode always-on           # restore hands-free listening
-/voice mode external            # TTS only; use VoiceInk, macOS Dictation, etc.
 /voice on
 /voice test                # speak without calling the LLM
 /voice stop                # immediately stop playback and abort current work
@@ -138,17 +137,17 @@ Then, inside Pi:
 /voice off
 ```
 
-Bare `/voice setup` and `/voice uninstall` show a component selector. Removing STT automatically switches input mode to `external`; if voice was active, TTS restarts without microphone capture. Removing all generated data deletes `~/.pi/agent/cache/pi-voice`. Every uninstall variant preserves `~/.pi/agent/voice.json`.
+Bare `/voice setup` and `/voice uninstall` show a component selector. If STT is not installed, voice automatically runs TTS only without microphone capture; VoiceInk, macOS Dictation, or another input method can insert text normally. Removing STT while voice is active restarts TTS without microphone capture. Removing all generated data deletes `~/.pi/agent/cache/pi-voice`. Every uninstall variant preserves `~/.pi/agent/voice.json`.
 
 Voice starts off in every new session. `/voice on` and `/voice off` only affect the current session; that choice is not stored in configuration.
 
 When enabled, voice adds a colored `🎙` badge to the right side of Pi's second footer line. The footer remains two lines; other extension statuses are folded into the first line. If `@thebinaryguy/pi-fast-mode` is installed, its `fast` badge shares the same footer. Voice mode also asks the model for concise, conversational, listening-friendly responses; disabling voice automatically restores the normal written response style.
 
-`Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture when Pi is idle. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed. Push-to-talk refuses to arm during an active response or playback. In `external` mode these capture shortcuts remain disabled; the dictation app owns its shortcut and inserts text into Pi normally.
+`Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture when Pi is idle. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed. Push-to-talk refuses to arm during an active response or playback. When STT is not installed, these capture shortcuts remain disabled; the dictation app owns its shortcut and inserts text into Pi normally.
 
 Microphone audio cannot interrupt thinking or playback. Press `Escape` to stop voice playback; if an agent response is active, Pi aborts it too. `Ctrl+Alt+S`, `/voice stop`, or a typed follow-up also interrupts playback explicitly. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi. Voice uses the macOS default microphone unless you select a specific device with `/voice device`. If the microphone disappears, capture retries in the background and follows a newly available system default without putting voice mode into an error state.
 
-External mode starts only TTS: it does not launch the Parakeet worker, FFmpeg microphone capture, or request microphone permission. The Qwen TTS model is still required.
+A TTS-only installation does not launch the Parakeet worker, FFmpeg microphone capture, or request microphone permission. The Qwen TTS model is still required.
 
 Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 

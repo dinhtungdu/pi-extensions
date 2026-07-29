@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
-export type VoiceInputMode = "always-on" | "push-to-talk" | "external";
+export type VoiceInputMode = "always-on" | "push-to-talk";
 export type VoiceComponent = "stt" | "tts";
 
 export interface VoiceConfig {
@@ -83,7 +83,7 @@ export function loadVoiceConfig(): VoiceConfig {
 			(config as Record<string, unknown>)[key] = value;
 		}
 	}
-	if (config.inputMode !== "always-on" && config.inputMode !== "push-to-talk" && config.inputMode !== "external") {
+	if (config.inputMode !== "always-on" && config.inputMode !== "push-to-talk") {
 		config.inputMode = defaults.inputMode;
 	}
 	return config;
@@ -97,13 +97,9 @@ export function updateVoiceConfig(patch: Partial<VoiceConfig>): string {
 	return path;
 }
 
-export function requiredVoiceComponents(config: VoiceConfig): VoiceComponent[] {
-	return config.inputMode === "external" ? ["tts"] : ["stt", "tts"];
-}
-
 export function missingRuntimeFiles(
 	config: VoiceConfig,
-	components: readonly VoiceComponent[] = requiredVoiceComponents(config),
+	components: readonly VoiceComponent[] = ["tts"],
 ): string[] {
 	const paths: string[] = [];
 	if (components.includes("stt")) paths.push(config.sttWorkerPath, config.sttModelPath);

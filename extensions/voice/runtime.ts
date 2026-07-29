@@ -46,6 +46,7 @@ export class VoiceRuntime {
 		ctx: ExtensionContext,
 		private readonly config: VoiceConfig,
 		private readonly onPhaseChange?: (phase: VoicePhase) => void,
+		private readonly sttEnabled = true,
 	) {
 		this.ctx = ctx;
 		this.transcriptPreprocessor = new TranscriptPreprocessor(config, (message) =>
@@ -85,10 +86,8 @@ export class VoiceRuntime {
 		}
 		this.stopped = false;
 		this.setPhase("starting");
-		if (this.config.inputMode === "external") {
-			this.sttReady = true;
-		} else {
-			this.sttReady = false;
+		this.sttReady = !this.sttEnabled;
+		if (this.sttEnabled) {
 			this.stt.start();
 			this.audio.startCapture();
 		}
@@ -113,21 +112,13 @@ export class VoiceRuntime {
 	}
 
 	setInputMode(mode: VoiceInputMode): void {
-		const previousMode = this.config.inputMode;
+		if (!this.sttEnabled) {
+			this.ctx.ui.notify("voice: speech input is not installed", "info");
+			return;
+		}
 		this.finishPushToTalk(false);
 		this.config.inputMode = mode;
-		if (previousMode !== "external" && mode === "external") {
-			this.audio.stopCapture();
-			this.stt.stop();
-			this.sttReady = true;
-			this.microphoneAvailable = undefined;
-		} else if (previousMode === "external" && mode !== "external") {
-			this.sttReady = false;
-			this.stt.start();
-			this.audio.startCapture();
-		} else if (mode !== "external") {
-			this.stt.reset();
-		}
+		this.stt.reset();
 		if (this.phase === "listening" || this.phase === "hearing" || this.phase === "armed" || this.phase === "muted") {
 			this.setPhase(this.inputRestPhase());
 		}
@@ -135,8 +126,8 @@ export class VoiceRuntime {
 
 	armPushToTalk(): boolean {
 		if (this.stopped) return false;
-		if (this.config.inputMode === "external") {
-			this.ctx.ui.notify("voice: internal speech input is disabled; use your dictation app", "info");
+		if (!this.sttEnabled) {
+			this.ctx.ui.notify("voice: speech input is not installed; use your dictation app", "info");
 			return false;
 		}
 		if (!this.ctx.isIdle() || this.playbackActive || this.currentPendingRequests() > 0) {
@@ -166,15 +157,14 @@ export class VoiceRuntime {
 
 	status(): string {
 		const cleanup = this.config.transcriptCleanup ? this.config.cleanupModel : "off";
-		const external = this.config.inputMode === "external";
-		const microphone = external
+		const microphone = !this.sttEnabled
 			? "disabled"
 			: this.microphoneAvailable === undefined
 				? "connecting"
 				: this.microphoneAvailable
 					? "available"
 					: "unavailable";
-		const stt = external ? "external" : this.config.sttModelPath;
+		const stt = this.sttEnabled ? this.config.sttModelPath : "not installed";
 		return `${this.phase}; mode=${this.config.inputMode}; input=${this.config.inputDevice}; microphone=${microphone}; voice=${this.config.ttsVoice}; cleanup=${cleanup}; STT=${stt}; TTS=${this.config.ttsModelPath}`;
 	}
 
@@ -208,9 +198,9 @@ export class VoiceRuntime {
 		}
 	}
 
-	onUserInput(ctx: ExtensionContext, external = true): void {
+	onUserInput(ctx: ExtensionContext, userOriginated = true): void {
 		this.setContext(ctx);
-		if (external) {
+		if (userOriginated) {
 			this.cancelTranscriptProcessing();
 			this.finishPushToTalk(false);
 		}
@@ -338,7 +328,7 @@ export class VoiceRuntime {
 
 	private inputRestPhase(): VoicePhase {
 		if (!this.ctx.isIdle()) return "thinking";
-		return this.config.inputMode === "always-on" ? "listening" : "muted";
+		return this.sttEnabled && this.config.inputMode === "always-on" ? "listening" : "muted";
 	}
 
 	private maybeAnnounceReady(): void {
