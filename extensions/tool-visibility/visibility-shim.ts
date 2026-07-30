@@ -5,12 +5,19 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 /**
- * Pi has no public API for hiding every tool row or collapsed thinking-only
- * placeholder. Keep the unsupported prototype patches in this file so a future
- * Pi upgrade has one obvious failure point. The wrappers only change rendering;
- * component state keeps updating.
+ * Pi has no public API for hiding every tool row or removing collapsed thinking
+ * labels without reserved rows. Keep the unsupported prototype patches in this
+ * file so a future Pi upgrade has one obvious failure point. The wrappers only
+ * change rendering; component state keeps updating.
  */
 export const MINIMUM_PI_VERSION = "0.82.1";
+
+/**
+ * Applied through the public setHiddenThinkingLabel API while compact mode is
+ * active. The assistant render wrapper removes only rows carrying this marker,
+ * avoiding any dependency on AssistantMessageComponent's private fields.
+ */
+export const COMPACT_HIDDEN_THINKING_LABEL = "\u2063pi-tool-visibility:hidden-thinking\u2063";
 
 const PATCH_KEY = Symbol.for("pi-extensions.tool-visibility.v1");
 const THINKING_PATCH_KEY = Symbol.for("pi-extensions.tool-visibility.thinking.v1");
@@ -22,11 +29,8 @@ type ToolExecutionPrototype = {
 	[PATCH_KEY]?: PatchRecord;
 };
 type ToolExecutionClass = { prototype: ToolExecutionPrototype };
-type AssistantContent = { type?: string; text?: string; thinking?: string };
 type AssistantMessagePrototype = {
 	render: Render;
-	hideThinkingBlock?: boolean;
-	lastMessage?: { content?: AssistantContent[]; stopReason?: string };
 	[THINKING_PATCH_KEY]?: ThinkingPatchRecord;
 };
 type AssistantMessageClass = { prototype: AssistantMessagePrototype };
@@ -117,26 +121,37 @@ function patchableDescriptor(prototype: object, componentName: string): Property
 			`tool-visibility compatibility error: ${componentName}.render cannot be patched safely. Compact rendering was left unchanged.`,
 		);
 	}
+	if (!Object.isExtensible(prototype)) {
+		throw new Error(
+			`tool-visibility compatibility error: ${componentName}.prototype cannot store patch metadata. Compact rendering was left unchanged.`,
+		);
+	}
 	return descriptor;
 }
 
-function isCollapsedThinkingOnly(component: AssistantMessagePrototype): boolean {
-	if (!component.hideThinkingBlock) return false;
-	const message = component.lastMessage;
-	if (!message || ["length", "aborted", "error"].includes(message.stopReason ?? "")) return false;
-	const content = message.content ?? [];
-	const hasThinking = content.some(
-		(item) => item.type === "thinking" && typeof item.thinking === "string" && item.thinking.trim(),
-	);
-	const hasText = content.some(
-		(item) => item.type === "text" && typeof item.text === "string" && item.text.trim(),
-	);
-	return hasThinking && !hasText;
+function isCompact(owners: Set<Owner>): boolean {
+	for (const owner of owners) {
+		if (!owner.visible) return true;
+	}
+	return false;
+}
+
+function hasVisibleTerminalContent(line: string): boolean {
+	return line
+		.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+		.trim().length > 0;
+}
+
+function deleteOwn(prototype: object, key: symbol): void {
+	if (!Reflect.deleteProperty(prototype, key)) {
+		throw new Error(`could not remove ${String(key)}`);
+	}
 }
 
 /**
- * Install one shared render wrapper. Multiple extension instances become owners
- * of that wrapper, preventing nested patches during reload or duplicate loading.
+ * Install shared render wrappers. All target checks happen before mutation, and
+ * an unexpected defineProperty failure rolls every completed mutation back.
  */
 export function installToolVisibilityShim(options: InstallOptions = {}): ToolVisibilityController {
 	const piVersion = options.piVersion ?? VERSION;
@@ -167,6 +182,8 @@ export function installToolVisibilityShim(options: InstallOptions = {}): ToolVis
 				"tool-visibility compatibility error: an orphaned thinking patch is already installed. Compact rendering was left unchanged.",
 			);
 		}
+
+		// Full preflight: neither prototype is mutated until both targets pass.
 		const descriptor = patchableDescriptor(prototype, "ToolExecutionComponent");
 		const thinkingDescriptor = patchableDescriptor(assistantPrototype, "AssistantMessageComponent");
 		const owners = new Set<Owner>();
@@ -182,10 +199,10 @@ export function installToolVisibilityShim(options: InstallOptions = {}): ToolVis
 			width: number,
 			...args: unknown[]
 		): string[] {
-			for (const owner of thinkingPatch.owners) {
-				if (!owner.visible && isCollapsedThinkingOnly(this)) return [];
-			}
-			return thinkingPatch.originalRender.call(this, width, ...args);
+			const lines = thinkingPatch.originalRender.call(this, width, ...args);
+			if (!isCompact(thinkingPatch.owners)) return lines;
+			const filtered = lines.filter((line) => !line.includes(COMPACT_HIDDEN_THINKING_LABEL));
+			return filtered.some(hasVisibleTerminalContent) ? filtered : [];
 		};
 
 		record = {
@@ -198,26 +215,58 @@ export function installToolVisibilityShim(options: InstallOptions = {}): ToolVis
 		};
 		const sharedRecord = record;
 		record.wrapper = function (this: ToolExecutionPrototype, width: number, ...args: unknown[]): string[] {
-			for (const owner of sharedRecord.owners) {
-				if (!owner.visible) return [];
-			}
-			return sharedRecord.originalRender.call(this, width, ...args);
+			return isCompact(sharedRecord.owners)
+				? []
+				: sharedRecord.originalRender.call(this, width, ...args);
 		};
-		Object.defineProperty(prototype, "render", { ...descriptor, value: record.wrapper });
-		Object.defineProperty(prototype, PATCH_KEY, {
-			configurable: true,
-			value: record,
-			writable: false,
-		});
-		Object.defineProperty(assistantPrototype, "render", {
-			...thinkingDescriptor,
-			value: thinkingPatch.wrapper,
-		});
-		Object.defineProperty(assistantPrototype, THINKING_PATCH_KEY, {
-			configurable: true,
-			value: thinkingPatch,
-			writable: false,
-		});
+
+		try {
+			Object.defineProperty(prototype, "render", { ...descriptor, value: record.wrapper });
+			Object.defineProperty(prototype, PATCH_KEY, {
+				configurable: true,
+				value: record,
+				writable: false,
+			});
+			Object.defineProperty(assistantPrototype, "render", {
+				...thinkingDescriptor,
+				value: thinkingPatch.wrapper,
+			});
+			Object.defineProperty(assistantPrototype, THINKING_PATCH_KEY, {
+				configurable: true,
+				value: thinkingPatch,
+				writable: false,
+			});
+		} catch (error) {
+			try {
+				// Check actual values rather than completed-call flags: a Proxy trap
+				// can apply a descriptor and still throw from defineProperty.
+				if (assistantPrototype[THINKING_PATCH_KEY] === thinkingPatch) {
+					deleteOwn(assistantPrototype, THINKING_PATCH_KEY);
+				}
+				if (assistantPrototype.render === thinkingPatch.wrapper) {
+					Object.defineProperty(assistantPrototype, "render", thinkingDescriptor);
+				}
+				if (prototype[PATCH_KEY] === record) deleteOwn(prototype, PATCH_KEY);
+				if (prototype.render === record.wrapper) Object.defineProperty(prototype, "render", descriptor);
+				if (
+					prototype.render !== descriptor.value ||
+					assistantPrototype.render !== thinkingDescriptor.value ||
+					prototype[PATCH_KEY] !== undefined ||
+					assistantPrototype[THINKING_PATCH_KEY] !== undefined
+				) {
+					throw new Error("original render identities or patch metadata were not restored");
+				}
+			} catch (rollbackError) {
+				throw new Error(
+					`tool-visibility compatibility error: compact rendering installation failed and rollback failed: ${String(rollbackError)}`,
+					{ cause: error },
+				);
+			}
+			throw new Error(
+				`tool-visibility compatibility error: compact rendering installation failed and was rolled back: ${String(error)}`,
+				{ cause: error },
+			);
+		}
 	}
 
 	const owner: Owner = { visible: true };
