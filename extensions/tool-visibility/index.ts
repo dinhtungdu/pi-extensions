@@ -26,6 +26,14 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 		);
 	}
 
+	function syncThinkingLabel(ctx: ExtensionContext, activeController: ToolVisibilityController): void {
+		if (activeController.isCompact()) {
+			ctx.ui.setHiddenThinkingLabel(COMPACT_HIDDEN_THINKING_LABEL);
+		} else {
+			ctx.ui.setHiddenThinkingLabel();
+		}
+	}
+
 	function install(ctx: ExtensionContext): void {
 		controller?.dispose();
 		controller = undefined;
@@ -59,11 +67,7 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 		if (!activeController) return;
 		const visible = action === "show" || (action === "toggle" && !activeController.isVisible());
 		activeController.setVisible(visible);
-		if (visible) {
-			ctx.ui.setHiddenThinkingLabel();
-		} else {
-			ctx.ui.setHiddenThinkingLabel(COMPACT_HIDDEN_THINKING_LABEL);
-		}
+		syncThinkingLabel(ctx, activeController);
 		// Both UI setters request a render, so existing rows update immediately.
 		updateStatus(ctx);
 		ctx.ui.notify(`TOOLS: ${visible ? "shown" : "hidden"}`, "info");
@@ -117,12 +121,21 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
-		if (controller?.isVisible() === false) ctx.ui.setHiddenThinkingLabel();
-		if (controller && !controller.dispose()) {
-			ctx.ui.notify(
-				"tool visibility could not safely restore compact rendering because another patch replaced it",
-				"error",
-			);
+		const activeController = controller;
+		if (activeController) {
+			const wasCompact = activeController.isCompact();
+			const restored = activeController.dispose();
+			// Disposal removes only this owner. Keep the marker while any duplicate
+			// owner remains hidden; restore it after the last hidden owner leaves.
+			if (wasCompact || activeController.isCompact()) {
+				syncThinkingLabel(ctx, activeController);
+			}
+			if (!restored) {
+				ctx.ui.notify(
+					"tool visibility could not safely restore compact rendering because another patch replaced it",
+					"error",
+				);
+			}
 		}
 		controller = undefined;
 	});

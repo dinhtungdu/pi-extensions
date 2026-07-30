@@ -14,10 +14,10 @@ export const MINIMUM_PI_VERSION = "0.82.1";
 
 /**
  * Applied through the public setHiddenThinkingLabel API while compact mode is
- * active. The assistant render wrapper removes only rows carrying this marker,
- * avoiding any dependency on AssistantMessageComponent's private fields.
+ * active. The zero-width marker cannot wrap into visible fragments; the assistant
+ * render wrapper removes rows carrying it without reading component private fields.
  */
-export const COMPACT_HIDDEN_THINKING_LABEL = "\u2063pi-tool-visibility:hidden-thinking\u2063";
+export const COMPACT_HIDDEN_THINKING_LABEL = "\u2063\u2064\u2063";
 
 const PATCH_KEY = Symbol.for("pi-extensions.tool-visibility.v1");
 const THINKING_PATCH_KEY = Symbol.for("pi-extensions.tool-visibility.thinking.v1");
@@ -60,6 +60,7 @@ export type ToolVisibilityDiagnostics = {
 
 export type ToolVisibilityController = {
 	isVisible(): boolean;
+	isCompact(): boolean;
 	setVisible(visible: boolean): void;
 	diagnostics(): ToolVisibilityDiagnostics;
 	dispose(): boolean;
@@ -275,6 +276,7 @@ export function installToolVisibilityShim(options: InstallOptions = {}): ToolVis
 
 	return {
 		isVisible: () => owner.visible,
+		isCompact: () => isCompact(record.owners),
 		setVisible(visible) {
 			if (disposed) throw new Error("tool-visibility controller is disposed");
 			owner.visible = visible;

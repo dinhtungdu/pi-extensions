@@ -156,6 +156,19 @@ try {
 		[],
 		"compact mode must remove collapsed thinking-only placeholders without reserving rows",
 	);
+	for (let width = 10; width <= 35; width++) {
+		const narrowRows = thinkingOnly.render(width);
+		assert.deepEqual(
+			narrowRows,
+			[],
+			`collapsed thinking must emit no rows or marker fragments at width ${width}`,
+		);
+		assert.equal(
+			narrowRows.join("").includes(COMPACT_HIDDEN_THINKING_LABEL),
+			false,
+			`compact marker must not leak at width ${width}`,
+		);
+	}
 	const mixedRows = mixedAssistant.render(100);
 	assert.ok(
 		mixedRows.some((line) => line.includes("Visible answer")),
@@ -202,9 +215,20 @@ try {
 	assert.equal(prototype.render, firstWrapper, "reload/duplicate installation must not wrap render twice");
 	assert.equal(second.diagnostics().ownerCount, 2);
 	first.setVisible(false);
-	assert.deepEqual(existing.render(100), [], "any active hidden owner must hide rows");
+	second.setVisible(false);
+	thinkingOnly.setHiddenThinkingLabel(COMPACT_HIDDEN_THINKING_LABEL);
+	assert.equal(first.isCompact(), true);
+	assert.equal(second.isCompact(), true);
+	assert.deepEqual(existing.render(100), [], "any active hidden owner must hide tool rows");
+	assert.deepEqual(thinkingOnly.render(20), [], "duplicate hidden owners must suppress thinking rows");
 	assert.equal(first.dispose(), true);
-	assert.deepEqual(existing.render(100), expectedCompletedRows, "disposing the hidden owner must reveal rows");
+	assert.equal(second.isCompact(), true, "disposing one hidden owner must preserve shared compact state");
+	assert.deepEqual(existing.render(100), [], "remaining hidden owner must keep tool rows hidden");
+	assert.deepEqual(thinkingOnly.render(20), [], "remaining hidden owner must keep thinking suppressed");
+	second.setVisible(true);
+	assert.equal(second.isCompact(), false, "showing the last hidden owner must leave compact state");
+	thinkingOnly.setHiddenThinkingLabel("Thinking...");
+	assert.deepEqual(existing.render(100), expectedCompletedRows, "last hidden owner showing must reveal rows");
 	assert.equal(second.dispose(), true);
 	assert.equal(prototype.render, originalRender, "last dispose must restore Pi's tool renderer");
 	assert.equal(
@@ -401,6 +425,41 @@ try {
 		originalAssistantRender,
 		"reloaded instance must clean up thinking patches",
 	);
+
+	const duplicateA = createExtensionHarness(extensionModule.default);
+	const duplicateB = createExtensionHarness(extensionModule.default);
+	await duplicateA.emit("session_start", { reason: "startup" });
+	await duplicateB.emit("session_start", { reason: "startup" });
+	await duplicateA.command("tools", "hide");
+	await duplicateB.command("tools", "hide");
+	await duplicateA.command("tools", "show");
+	assert.deepEqual(
+		duplicateA.thinkingLabelCalls.at(-1),
+		[COMPACT_HIDDEN_THINKING_LABEL],
+		"showing one owner must preserve suppression while another owner remains hidden",
+	);
+	await duplicateA.command("tools", "hide");
+	await duplicateA.emit("session_shutdown", { reason: "reload" });
+	assert.deepEqual(
+		duplicateA.thinkingLabelCalls.at(-1),
+		[COMPACT_HIDDEN_THINKING_LABEL],
+		"duplicate shutdown must preserve suppression while another hidden owner remains",
+	);
+	await duplicateB.command("tools", "show");
+	assert.deepEqual(
+		duplicateB.thinkingLabelCalls.at(-1),
+		[],
+		"showing the last hidden owner must restore Pi's thinking label",
+	);
+	await duplicateB.command("tools", "hide");
+	await duplicateB.emit("session_shutdown", { reason: "quit" });
+	assert.deepEqual(
+		duplicateB.thinkingLabelCalls.at(-1),
+		[],
+		"disposing the last hidden owner must restore Pi's thinking label",
+	);
+	assert.equal(prototype.render, originalRender, "duplicate owners must clean up tool patches");
+	assert.equal(assistantPrototype.render, originalAssistantRender, "duplicate owners must clean up thinking patches");
 
 	console.log("[tool-visibility test] passed");
 } finally {
