@@ -102,7 +102,7 @@ Tool rows are visible by default. The extension changes only TUI rendering: tool
 /tools diagnostics      # report shim/version state
 ```
 
-The normal footer keeps `TOOLS: shown`. When tool rows are put away, narrow/mobile terminals get the compact `🧰` status instead. Toggle notifications and `/tools status` provide the verbose state. Pi's working indicator and Escape cancellation remain untouched.
+The footer stays clear while tool rows are shown. When tool rows are put away, narrow/mobile terminals get the compact `🧰` status. Toggle notifications and `/tools status` provide the verbose state. Pi's working indicator and Escape cancellation remain untouched.
 
 Pi has no public global tool-row visibility API, and its hidden-thinking label still reserves transcript rows. `extensions/tool-visibility/visibility-shim.ts` contains isolated compatibility patches for Pi 0.82.1 and newer. Thinking suppression marks collapsed labels through Pi's public UI API and filters that marker from rendered rows; it does not inspect assistant private state. Patch installation fully preflights both renderers and rolls back partial installation failures. The shim forwards all render arguments, shares patches across duplicate/reloaded instances, and restores the original methods on shutdown when safe. A version below 0.82.1 or incompatible runtime shape leaves compact rendering unchanged and raises a visible compatibility error; use `/tools diagnostics` to inspect it.
 

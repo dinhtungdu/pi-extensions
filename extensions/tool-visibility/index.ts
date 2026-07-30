@@ -22,7 +22,7 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 	function updateStatus(ctx: ExtensionContext): void {
 		ctx.ui.setStatus(
 			STATUS_KEY,
-			stateLabel() === "hidden" ? HIDDEN_STATUS_ICON : "TOOLS: shown",
+			stateLabel() === "hidden" ? HIDDEN_STATUS_ICON : undefined,
 		);
 	}
 

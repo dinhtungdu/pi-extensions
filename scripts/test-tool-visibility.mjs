@@ -367,10 +367,10 @@ try {
 		["hide", "show", "status", "diagnostics"],
 		"/tools must expose only the approved arguments",
 	);
-	assert.equal(
-		harness.statuses.at(-1)[1],
-		"TOOLS: shown",
-		"default footer status must preserve the normal verbose rendering",
+	assert.deepEqual(
+		harness.statuses.at(-1),
+		["tool-visibility", undefined],
+		"startup must leave the footer clear while tools are shown",
 	);
 	assert.deepEqual(harness.thinkingLabelCalls, [], "default mode must not alter Pi's thinking label");
 	assert.deepEqual(harness.workingCalls, [], "tool visibility must not alter Pi's working indicator");
@@ -388,7 +388,11 @@ try {
 
 	await harness.command("tools");
 	assert.ok(newRow.render(80).length > 0, "bare /tools must toggle hidden rows back to shown");
-	assert.equal(harness.statuses.at(-1)[1], "TOOLS: shown", "shown mode must restore the normal footer");
+	assert.deepEqual(
+		harness.statuses.at(-1),
+		["tool-visibility", undefined],
+		"toggle-to-shown must clear the footer status",
+	);
 	assert.deepEqual(harness.thinkingLabelCalls.at(-1), [], "shown mode must restore Pi's thinking label");
 	for (const removedAlias of ["toggle", "on", "off", "visible", "hidden", "diagnostic", "diag"]) {
 		await harness.command("tools", removedAlias);
@@ -397,8 +401,18 @@ try {
 	}
 	await harness.command("tools", "hide");
 	assert.deepEqual(newRow.render(80), [], "/tools hide must hide rows");
+	assert.deepEqual(
+		harness.statuses.at(-1),
+		["tool-visibility", "🧰"],
+		"/tools hide must retain only the compact hidden status",
+	);
 	await harness.command("tools", "show");
 	assert.ok(newRow.render(80).length > 0, "/tools show must restore rows");
+	assert.deepEqual(
+		harness.statuses.at(-1),
+		["tool-visibility", undefined],
+		"/tools show must clear the footer status",
+	);
 	await harness.command("tools", "status");
 	assert.deepEqual(harness.notifications.at(-1), ["TOOLS: shown", "info"]);
 	await harness.command("tools", "diagnostics");
