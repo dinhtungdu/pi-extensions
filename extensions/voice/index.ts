@@ -6,7 +6,6 @@ import {
 	updateVoiceConfig,
 	voiceCacheDir,
 	type VoiceComponent,
-	type VoiceInputMode,
 } from "./config.js";
 import { voiceResponseSystemPrompt } from "./response-style.js";
 import { VoiceRuntime } from "./runtime.js";
@@ -199,31 +198,6 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		ctx.ui.notify(`voice ${target} data uninstalled; configuration preserved`, "info");
 	}
 
-	function setInputMode(mode: VoiceInputMode, ctx: ExtensionContext): void {
-		const config = loadVoiceConfig();
-		if (missingRuntimeFiles(config, ["stt"]).length) {
-			ctx.ui.notify("voice speech input is not installed; run /voice setup stt", "error");
-			return;
-		}
-		updateVoiceConfig({ inputMode: mode });
-		runtime?.setContext(ctx);
-		runtime?.setInputMode(mode);
-		const message = mode === "push-to-talk"
-			? "voice: push-to-talk mode; press F8, then speak"
-			: "voice: always-on mode";
-		ctx.ui.notify(message, "info");
-	}
-
-	function startPushToTalk(ctx: ExtensionContext): void {
-		if (missingRuntimeFiles(loadVoiceConfig(), ["stt"]).length) {
-			ctx.ui.notify("voice: speech input is not installed; use your dictation app", "info");
-			return;
-		}
-		if (!runtime && !startRuntime(ctx)) return;
-		runtime?.setContext(ctx);
-		if (runtime?.armPushToTalk()) updateVoiceConfig({ inputMode: "push-to-talk" });
-	}
-
 	async function handleCommand(args: string, ctx: ExtensionContext): Promise<void> {
 		if (!ctx.hasUI) return;
 		const command = args.trim().toLowerCase() || "status";
@@ -242,24 +216,6 @@ export default function voiceExtension(pi: ExtensionAPI) {
 				return;
 			}
 			runtime.interruptSpeech("voice stop command", true);
-			return;
-		}
-		if (command === "talk" || command === "push") {
-			startPushToTalk(ctx);
-			return;
-		}
-		if (command === "mode" || command.startsWith("mode ")) {
-			let requested = command.slice(4).trim();
-			if (!requested) {
-				requested = (await ctx.ui.select("Voice input mode", ["push-to-talk", "always-on"])) ?? "";
-			}
-			if (requested === "push" || requested === "ptt") requested = "push-to-talk";
-			if (requested === "always" || requested === "hands-free") requested = "always-on";
-			if (requested !== "push-to-talk" && requested !== "always-on") {
-				ctx.ui.notify("Usage: /voice mode [push-to-talk|always-on]", "warning");
-				return;
-			}
-			setInputMode(requested, ctx);
 			return;
 		}
 		if (command === "setup" || command.startsWith("setup ")) {
@@ -304,12 +260,12 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				runtime
 					? `voice: ${runtime.status()}`
-					: `voice: off; mode=${config.inputMode}; STT=${stt}; TTS=${tts}; setup=${missing.length ? "incomplete" : "ready"}`,
+					: `voice: off; STT=${stt}; TTS=${tts}; setup=${missing.length ? "incomplete" : "ready"}`,
 				missing.length ? "warning" : "info",
 			);
 			return;
 		}
-		ctx.ui.notify("Usage: /voice [on|off|talk|stop|mode|status|setup|uninstall|device|test]", "warning");
+		ctx.ui.notify("Usage: /voice [on|off|stop|status|setup|uninstall|device|test]", "warning");
 	}
 
 	pi.registerCommand("voice", {
@@ -318,10 +274,7 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			const values = [
 				"on",
 				"off",
-				"talk",
 				"stop",
-				"mode push-to-talk",
-				"mode always-on",
 				"status",
 				"setup stt",
 				"setup tts",
@@ -344,13 +297,6 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			await handleCommand(runtime ? "off" : "on", ctx);
 		},
 	});
-
-	const pushToTalkShortcut = {
-		description: "Capture one push-to-talk utterance",
-		handler: (ctx: ExtensionContext) => startPushToTalk(ctx),
-	};
-	pi.registerShortcut("f8", pushToTalkShortcut);
-	pi.registerShortcut("ctrl+alt+v", pushToTalkShortcut);
 
 	pi.registerShortcut("ctrl+alt+s", {
 		description: "Stop voice playback immediately",

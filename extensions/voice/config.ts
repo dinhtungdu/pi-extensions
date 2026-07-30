@@ -2,12 +2,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
-export type VoiceInputMode = "always-on" | "push-to-talk";
 export type VoiceComponent = "stt" | "tts";
 
 export interface VoiceConfig {
 	announceReady: boolean;
-	inputMode: VoiceInputMode;
 	inputDevice: string;
 	ffmpegPath: string;
 	ffplayPath: string;
@@ -39,7 +37,6 @@ export function defaultVoiceConfig(): VoiceConfig {
 	const cache = voiceCacheDir();
 	return {
 		announceReady: true,
-		inputMode: "always-on",
 		inputDevice: "default",
 		ffmpegPath: "ffmpeg",
 		ffplayPath: "ffplay",
@@ -83,15 +80,12 @@ export function loadVoiceConfig(): VoiceConfig {
 			(config as Record<string, unknown>)[key] = value;
 		}
 	}
-	if (config.inputMode !== "always-on" && config.inputMode !== "push-to-talk") {
-		config.inputMode = defaults.inputMode;
-	}
 	return config;
 }
 
 export function updateVoiceConfig(patch: Partial<VoiceConfig>): string {
 	const path = voiceConfigPath();
-	const { enabled: _legacyEnabled, ...current } = jsonObject(path);
+	const { enabled: _legacyEnabled, inputMode: _legacyInputMode, ...current } = jsonObject(path);
 	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, `${JSON.stringify({ ...current, ...patch }, null, "\t")}\n`, "utf8");
 	return path;

@@ -145,12 +145,9 @@ Then, inside Pi:
 /voice setup [stt|tts|all]      # choose or install specific components
 /voice uninstall [stt|tts|all]  # choose or remove specific components
 /voice device                   # choose microphone
-/voice mode push-to-talk        # ignore microphone until explicitly armed
-/voice talk                     # capture one utterance
-/voice mode always-on           # restore hands-free listening
 /voice on
-/voice test                # speak without calling the LLM
-/voice stop                # immediately stop playback and abort current work
+/voice test                     # speak without calling the LLM
+/voice stop                     # immediately stop playback and abort current work
 /voice status
 /voice off
 ```
@@ -161,7 +158,7 @@ Voice starts off in every new session. `/voice on` and `/voice off` only affect 
 
 When enabled, voice adds a compact colored `🎙` to Pi's extension-status footer row. Pi owns placement and truncation, so the status stays readable alongside other extensions on narrow/mobile terminals. Voice mode also asks the model for concise, conversational, listening-friendly responses; disabling voice automatically restores the normal written response style.
 
-`Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture when Pi is idle. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed. Push-to-talk refuses to arm during an active response or playback. When STT is not installed, these capture shortcuts remain disabled; the dictation app owns its shortcut and inserts text into Pi normally.
+`Ctrl+Shift+V` toggles voice mode. When STT is not installed, VoiceInk, macOS Dictation, or another input method owns speech input and inserts text into Pi normally.
 
 Microphone audio cannot interrupt thinking or playback. Press `Escape` to stop voice playback; if an agent response is active, Pi aborts it too. `Ctrl+Alt+S`, `/voice stop`, or a typed follow-up also interrupts playback explicitly. The first microphone launch triggers the macOS microphone permission prompt. Grant access to the terminal application running Pi. Voice uses the macOS default microphone unless you select a specific device with `/voice device`. If the microphone disappears, capture retries in the background and follows a newly available system default without putting voice mode into an error state.
 
@@ -172,7 +169,6 @@ Configuration: `~/.pi/agent/voice.json`. Useful overrides:
 ```json
 {
 	"announceReady": true,
-	"inputMode": "always-on",
 	"inputDevice": "default",
 	"ttsVoice": "Aiden",
 	"ttsInstruction": "Speak naturally in a calm, conversational tone.",
@@ -192,7 +188,7 @@ Model cleanup receives only the transcript and cleanup instructions—no convers
 
 The setup pins and builds MIT-licensed `parakeet.cpp`, installs MIT-licensed `mlx-audio` in an isolated environment, and downloads model weights from Hugging Face. Parakeet GGUF weights are CC-BY-4.0; Qwen3-TTS has its own model license. No unlicensed `pibot` source is copied.
 
-Always-on mode cannot identify who is speaking. While Pi is thinking, running tools, or speaking, all microphone audio is ignored. Listening resumes after playback and a short cooldown, so speaker echo cannot become user input. Use push-to-talk in noisy or shared rooms.
+Hands-free input cannot identify who is speaking. While Pi is thinking, running tools, or speaking, all microphone audio is ignored. Listening resumes after playback and a short cooldown, so speaker echo cannot become user input. In noisy or shared rooms, use VoiceInk or another explicit dictation input instead.
 
 ## Auto dark mode config
 

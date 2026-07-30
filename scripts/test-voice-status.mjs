@@ -52,7 +52,6 @@ try {
 	const config = {
 		...defaultVoiceConfig(),
 		announceReady: false,
-		inputMode: "always-on",
 		transcriptCleanup: false,
 	};
 	const stopped = { audio: 0, stt: 0, tts: 0 };
@@ -84,18 +83,13 @@ try {
 	assert.deepEqual(statuses.at(-1), [VOICE_STATUS_KEY, styled("success")], "idle listening must use the compact success mic");
 	assert.ok(visibleWidth(statuses.at(-1)[1]) <= 2, "voice status must remain compact on narrow terminals");
 
-	runtime.setInputMode("push-to-talk");
-	assert.deepEqual(statuses.at(-1), [VOICE_STATUS_KEY, styled("dim")], "idle push-to-talk must remain visible but subdued");
-	assert.equal(runtime.armPushToTalk(), true);
-	assert.deepEqual(statuses.at(-1), [VOICE_STATUS_KEY, styled("accent")], "armed capture must become active");
 	runtime.handleSttEvent({ type: "interim", text: "hello" });
-	assert.deepEqual(statuses.at(-1), [VOICE_STATUS_KEY, styled("accent")], "live transcription must remain active");
+	assert.deepEqual(statuses.at(-1), [VOICE_STATUS_KEY, styled("accent")], "live transcription must become active");
 	runtime.handleSttEvent({ type: "final", text: "hello pi" });
 	await runtime.transcriptQueue;
 	assert.deepEqual(sentMessages, ["hello pi"]);
 	assert.deepEqual(statuses.at(-1), [VOICE_STATUS_KEY, styled("dim")], "submitted transcription must enter thinking state");
 
-	runtime.setInputMode("always-on");
 	runtime.setPhase("speaking");
 	assert.deepEqual(statuses.at(-1), [VOICE_STATUS_KEY, styled("accent")], "speech playback must be active");
 	runtime.playbackActive = true;

@@ -8,7 +8,6 @@ function voiceColor(phase: VoicePhase): "dim" | "accent" | "success" | "error" {
 	switch (phase) {
 		case "listening":
 			return "success";
-		case "armed":
 		case "hearing":
 		case "speaking":
 			return "accent";

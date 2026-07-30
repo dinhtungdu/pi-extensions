@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const root = resolve(import.meta.dirname, "..");
-const output = await mkdtemp(join(root, ".voice-input-mode-test-"));
+const output = await mkdtemp(join(root, ".voice-input-test-"));
 
 try {
 	const compile = spawnSync(
@@ -29,9 +29,15 @@ try {
 
 	const defaults = defaultVoiceConfig();
 	assert.equal("enabled" in defaults, false, "voice activation must remain session-scoped");
+	assert.equal("inputMode" in defaults, false, "voice input must remain hands-free when STT is installed");
 	assert.equal(defaults.maxSpokenCharacters, 400);
-	assert.equal(missingRuntimeFiles(defaults).includes(defaults.sttWorkerPath), false);
-	assert.equal(missingRuntimeFiles(defaults, ["stt"]).includes(defaults.sttWorkerPath), true);
+	const unavailableStt = {
+		...defaults,
+		sttWorkerPath: join(output, "missing-stt-worker"),
+		sttModelPath: join(output, "missing-stt-model"),
+	};
+	assert.equal(missingRuntimeFiles(unavailableStt).includes(unavailableStt.sttWorkerPath), false);
+	assert.equal(missingRuntimeFiles(unavailableStt, ["stt"]).includes(unavailableStt.sttWorkerPath), true);
 
 	const writtenPrompt = "Base coding-agent instructions.";
 	assert.equal(voiceResponseSystemPrompt(writtenPrompt, false), undefined);
@@ -40,12 +46,12 @@ try {
 	assert.match(spokenPrompt, /response will be read aloud/i);
 	assert.match(spokenPrompt, /concise, natural conversational sentences/i);
 
-	function harness(inputMode, idle = true, sttEnabled = true) {
+	function harness(idle = true, sttEnabled = true) {
 		const messages = [];
 		let aborts = 0;
 		let pushedFrames = 0;
 		const statuses = [];
-		const config = { ...defaultVoiceConfig(), inputMode, transcriptCleanup: false };
+		const config = { ...defaultVoiceConfig(), transcriptCleanup: false };
 		const ctx = {
 			isIdle: () => idle,
 			abort: () => aborts++,
@@ -83,7 +89,7 @@ try {
 		};
 	}
 
-	const ttsOnly = harness("always-on", true, false);
+	const ttsOnly = harness(true, false);
 	let ttsOnlySttStarts = 0;
 	let ttsOnlyCaptureStarts = 0;
 	let ttsOnlyTtsStarts = 0;
@@ -111,37 +117,20 @@ try {
 	assert.equal(ttsOnlyTtsStarts, 1);
 	assert.match(ttsOnly.runtime.status(), /microphone=disabled/);
 	assert.match(ttsOnly.runtime.status(), /STT=not installed/);
-	assert.equal(ttsOnly.runtime.armPushToTalk(), false);
 	ttsOnly.runtime.stop();
 
-	const pushToTalk = harness("push-to-talk");
-	pushToTalk.runtime.handleMicFrame(Buffer.alloc(640));
-	pushToTalk.runtime.handleSttEvent({ type: "interim", text: "background speech" });
-	assert.equal(pushToTalk.pushedFrames, 0);
-	assert.deepEqual(pushToTalk.messages, []);
+	const listening = harness();
+	listening.runtime.phase = "listening";
+	listening.runtime.handleMicFrame(Buffer.alloc(640));
+	assert.equal(listening.pushedFrames, 1);
+	listening.runtime.handleSttEvent({ type: "interim", text: "intentional request" });
+	listening.runtime.handleSttEvent({ type: "final", text: "intentional request" });
+	await listening.runtime.transcriptQueue;
+	assert.deepEqual(listening.messages, ["intentional request"]);
+	listening.runtime.stop();
+	assert.deepEqual(listening.statuses, [], "runtime status rendering remains delegated to its phase callback");
 
-	assert.equal(pushToTalk.runtime.armPushToTalk(), true);
-	pushToTalk.runtime.handleMicFrame(Buffer.alloc(640));
-	assert.equal(pushToTalk.pushedFrames, 1);
-	pushToTalk.runtime.handleSttEvent({ type: "final", text: "intentional request" });
-	await pushToTalk.runtime.transcriptQueue;
-	assert.deepEqual(pushToTalk.messages, ["intentional request"]);
-	pushToTalk.runtime.handleMicFrame(Buffer.alloc(640));
-	assert.equal(pushToTalk.pushedFrames, 1);
-	pushToTalk.runtime.stop();
-	assert.deepEqual(pushToTalk.statuses, [], "runtime status rendering remains delegated to its phase callback");
-
-	const busyPushToTalk = harness("push-to-talk", false);
-	assert.equal(busyPushToTalk.runtime.armPushToTalk(), false);
-	busyPushToTalk.runtime.handleMicFrame(Buffer.alloc(640));
-	busyPushToTalk.runtime.handleSttEvent({ type: "final", text: "voice interruption" });
-	await busyPushToTalk.runtime.transcriptQueue;
-	assert.equal(busyPushToTalk.pushedFrames, 0);
-	assert.equal(busyPushToTalk.aborts, 0);
-	assert.deepEqual(busyPushToTalk.messages, []);
-	busyPushToTalk.runtime.stop();
-
-	const alwaysOn = harness("always-on", false);
+	const alwaysOn = harness(false);
 	alwaysOn.runtime.phase = "thinking";
 	alwaysOn.runtime.handleMicFrame(Buffer.alloc(640));
 	alwaysOn.runtime.handleSttEvent({ type: "interim", text: "pi stop" });
@@ -172,7 +161,7 @@ try {
 	assert.equal(alwaysOn.aborts, 1);
 	alwaysOn.runtime.stop();
 
-	const escaped = harness("always-on", true);
+	const escaped = harness(true);
 	escaped.runtime.phase = "speaking";
 	escaped.runtime.playbackActive = true;
 	const generationBeforeEscape = escaped.runtime.generation;
@@ -185,7 +174,7 @@ try {
 	assert.equal(escaped.aborts, 0, "Pi's non-consuming Escape handler remains responsible for agent aborts");
 	escaped.runtime.stop();
 
-	console.log("[voice input-mode test] passed");
+	console.log("[voice input test] passed");
 } finally {
 	await rm(output, { recursive: true, force: true });
 }

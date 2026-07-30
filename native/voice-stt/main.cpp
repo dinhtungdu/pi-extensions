@@ -133,8 +133,8 @@ public:
 			emit("interim", "\"text\":\"" + jsonEscape(trim(transcript_)) + "\"");
 		}
 
-		// Audio reaches STT only while Pi is listening or push-to-talk is armed,
-		// so an EOB acknowledgement is still the user taking this conversation turn.
+		// Audio reaches STT only while Pi is listening, so an EOB
+		// acknowledgement is still the user taking this conversation turn.
 		if ((events & (kEventEou | kEventEob)) != 0) {
 			emit("final", "\"text\":\"" + jsonEscape(trim(transcript_)) + "\"");
 			transcript_.clear();

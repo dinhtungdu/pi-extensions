@@ -41,12 +41,12 @@ function uninstall(target) {
 }
 
 try {
-	await writeFile(configPath, '{"inputMode":"always-on","ttsVoice":"Aiden"}\n');
+	await writeFile(configPath, '{"ttsVoice":"Aiden"}\n');
 	await create([...sttPaths, ...ttsPaths]);
 	uninstall("stt");
 	assert.ok(sttPaths.every((path) => !existsSync(path)));
 	assert.ok(ttsPaths.every((path) => existsSync(path)));
-	assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), { inputMode: "always-on", ttsVoice: "Aiden" });
+	assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), { ttsVoice: "Aiden" });
 
 	await create(sttPaths);
 	uninstall("tts");
