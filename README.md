@@ -92,7 +92,7 @@ Notes:
 
 ## Tool visibility
 
-Tool rows are visible by default. The extension changes only TUI rendering: tools still execute, stream, complete, and remain unchanged in messages, results, and session history. Existing and future rows—including custom tools and image results—return immediately when shown.
+Tool rows are visible by default. The extension changes only TUI rendering: tools still execute, stream, complete, and remain unchanged in messages, results, and session history. Existing and future rows—including custom tools and image results—return immediately when shown. While tool rows are hidden, the compact presentation also removes collapsed thinking-only placeholders; expanded thinking and assistant text stay visible.
 
 ```text
 /tools                  # toggle
@@ -102,9 +102,9 @@ Tool rows are visible by default. The extension changes only TUI rendering: tool
 /tools diagnostics      # report shim/version state
 ```
 
-The persistent `TOOLS: shown|hidden` footer status and each toggle notification expose the current state on narrow/mobile terminals. Pi's working indicator and Escape cancellation remain untouched.
+The footer uses compact state icons on narrow/mobile terminals: `🛠️` while tool rows are shown and `🧰` when they are put away. Toggle notifications and `/tools status` provide the verbose state. Pi's working indicator and Escape cancellation remain untouched.
 
-Pi has no public global tool-row visibility API. `extensions/tool-visibility/visibility-shim.ts` contains an isolated compatibility patch for Pi 0.82.1 and newer. At runtime it verifies that `ToolExecutionComponent.render` is available and safely patchable, wraps only that method, forwards all render arguments, shares one patch across duplicate/reloaded instances, and restores the original method on shutdown when safe. A version below 0.82.1 or incompatible runtime shape leaves rows visible and raises a visible compatibility error; use `/tools diagnostics` to inspect it.
+Pi has no public global tool-row visibility API, and its hidden-thinking label still reserves transcript rows. `extensions/tool-visibility/visibility-shim.ts` contains isolated compatibility patches for Pi 0.82.1 and newer. At runtime it verifies that the tool and assistant renderers are safely patchable, forwards all render arguments, shares patches across duplicate/reloaded instances, and restores the original methods on shutdown when safe. A version below 0.82.1 or incompatible runtime shape leaves compact rendering unchanged and raises a visible compatibility error; use `/tools diagnostics` to inspect it.
 
 ## Voice
 
