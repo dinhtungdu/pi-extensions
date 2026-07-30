@@ -6,6 +6,7 @@ import {
 } from "./visibility-shim.js";
 
 const STATUS_KEY = "tool-visibility";
+const STATUS_ICONS = { shown: "🛠️", hidden: "🧰" } as const;
 
 type VisibilityAction = "toggle" | "show" | "hide";
 
@@ -18,7 +19,7 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
-		ctx.ui.setStatus(STATUS_KEY, `TOOLS: ${stateLabel()}`);
+		ctx.ui.setStatus(STATUS_KEY, STATUS_ICONS[stateLabel()]);
 	}
 
 	function install(ctx: ExtensionContext): void {
@@ -109,7 +110,7 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		if (controller && !controller.dispose()) {
 			ctx.ui.notify(
-				"tool visibility could not safely restore ToolExecutionComponent.render because another patch replaced it",
+				"tool visibility could not safely restore compact rendering because another patch replaced it",
 				"error",
 			);
 		}
