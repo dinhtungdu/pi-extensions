@@ -8,9 +8,9 @@ import {
 	type VoiceComponent,
 	type VoiceInputMode,
 } from "./config.js";
-import { VoiceFooterController } from "./footer.js";
 import { voiceResponseSystemPrompt } from "./response-style.js";
 import { VoiceRuntime } from "./runtime.js";
+import { syncVoiceStatus, VOICE_STATUS_KEY } from "./status.js";
 
 const SETUP_SCRIPT = fileURLToPath(new URL("../../scripts/setup-voice.mjs", import.meta.url));
 const UNINSTALL_SCRIPT = fileURLToPath(new URL("../../scripts/uninstall-voice.mjs", import.meta.url));
@@ -26,12 +26,10 @@ const COMPONENT_OPTIONS: Array<{ label: string; value: VoiceComponentTarget }> =
 export default function voiceExtension(pi: ExtensionAPI) {
 	let runtime: VoiceRuntime | undefined;
 	let unsubscribeTerminalInput: (() => void) | undefined;
-	const footer = new VoiceFooterController(pi);
 
 	function stopRuntime(): void {
 		runtime?.stop();
 		runtime = undefined;
-		footer.deactivate();
 	}
 
 	function startRuntime(ctx: ExtensionContext): boolean {
@@ -42,15 +40,15 @@ export default function voiceExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`voice setup incomplete; run /voice setup (missing ${missing[0]})`, "error");
 			return false;
 		}
-		footer.activate(ctx);
 		const sttEnabled = missingRuntimeFiles(config, ["stt"]).length === 0;
-		runtime = new VoiceRuntime(pi, ctx, config, (phase) => footer.setPhase(phase), sttEnabled);
+		runtime = new VoiceRuntime(pi, ctx, config, (phase) => syncVoiceStatus(ctx, phase), sttEnabled);
 		runtime.start();
 		return true;
 	}
 
 	pi.on("session_start", (_event, ctx) => {
 		stopRuntime();
+		ctx.ui.setStatus(VOICE_STATUS_KEY, undefined);
 		if (!ctx.hasUI) return;
 		if (ctx.mode === "tui") {
 			unsubscribeTerminalInput?.();
@@ -61,12 +59,12 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		unsubscribeTerminalInput?.();
 		unsubscribeTerminalInput = undefined;
 		runtime?.stop();
 		runtime = undefined;
-		footer.dispose();
+		ctx.ui.setStatus(VOICE_STATUS_KEY, undefined);
 	});
 
 	pi.on("input", (event, ctx) => {

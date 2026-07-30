@@ -159,7 +159,7 @@ Bare `/voice setup` and `/voice uninstall` show a component selector. If STT is 
 
 Voice starts off in every new session. `/voice on` and `/voice off` only affect the current session; that choice is not stored in configuration.
 
-When enabled, voice adds a colored `🎙` badge to the right side of Pi's second footer line. The footer remains two lines; other extension statuses are folded into the first line. If `@thebinaryguy/pi-fast-mode` is installed, its `fast` badge shares the same footer. Voice mode also asks the model for concise, conversational, listening-friendly responses; disabling voice automatically restores the normal written response style.
+When enabled, voice adds a compact colored `🎙` to Pi's extension-status footer row. Pi owns placement and truncation, so the status stays readable alongside other extensions on narrow/mobile terminals. Voice mode also asks the model for concise, conversational, listening-friendly responses; disabling voice automatically restores the normal written response style.
 
 `Ctrl+Shift+V` toggles voice mode. Press `F8` once and speak for push-to-talk (`Ctrl+Alt+V` and `/voice talk` are aliases). This enables voice, switches input mode, and arms capture when Pi is idle. Capture closes automatically at end-of-utterance. Terminals do not expose reliable key-release events, so this is one-shot rather than hold-to-talk. If speech does not begin within 10 seconds, capture disarms. Background audio is ignored while disarmed. Push-to-talk refuses to arm during an active response or playback. When STT is not installed, these capture shortcuts remain disabled; the dictation app owns its shortcut and inserts text into Pi normally.
 

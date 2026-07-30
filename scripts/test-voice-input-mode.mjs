@@ -5,7 +5,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { visibleWidth } from "@earendil-works/pi-tui";
 
 const root = resolve(import.meta.dirname, "..");
 const output = await mkdtemp(join(root, ".voice-input-mode-test-"));
@@ -24,9 +23,6 @@ try {
 	const { VoiceRuntime } = await import(
 		pathToFileURL(join(output, "extensions", "voice", "runtime.js"))
 	);
-	const { renderTwoLineFooter } = await import(
-		pathToFileURL(join(output, "extensions", "voice", "footer.js"))
-	);
 	const { voiceResponseSystemPrompt } = await import(
 		pathToFileURL(join(output, "extensions", "voice", "response-style.js"))
 	);
@@ -43,29 +39,6 @@ try {
 	assert.ok(spokenPrompt?.startsWith(writtenPrompt));
 	assert.match(spokenPrompt, /response will be read aloud/i);
 	assert.match(spokenPrompt, /concise, natural conversational sentences/i);
-
-	const footerLines = renderTwoLineFooter(
-		{
-			render: (width) => [
-				"~/workspace/pi-extensions".slice(0, width),
-				"usage                 model".slice(0, width),
-				"goal active",
-			],
-		},
-		32,
-		" • fast • mic",
-	);
-	assert.equal(footerLines.length, 2, "voice footer must stay two lines");
-	assert.match(footerLines[0], /goal active$/);
-	assert.match(footerLines[1], / • fast • mic$/);
-	assert.ok(footerLines.every((line) => visibleWidth(line) <= 32));
-	const narrowFooterLines = renderTwoLineFooter(
-		{ render: () => ["project", "model", "long status"] },
-		8,
-		" • mic",
-	);
-	assert.equal(narrowFooterLines.length, 2);
-	assert.ok(narrowFooterLines.every((line) => visibleWidth(line) <= 8));
 
 	function harness(inputMode, idle = true, sttEnabled = true) {
 		const messages = [];
@@ -156,7 +129,7 @@ try {
 	pushToTalk.runtime.handleMicFrame(Buffer.alloc(640));
 	assert.equal(pushToTalk.pushedFrames, 1);
 	pushToTalk.runtime.stop();
-	assert.deepEqual(pushToTalk.statuses, [], "voice must not add a third footer line");
+	assert.deepEqual(pushToTalk.statuses, [], "runtime status rendering remains delegated to its phase callback");
 
 	const busyPushToTalk = harness("push-to-talk", false);
 	assert.equal(busyPushToTalk.runtime.armPushToTalk(), false);
