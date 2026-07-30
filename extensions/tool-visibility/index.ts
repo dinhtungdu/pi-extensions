@@ -5,11 +5,11 @@ import {
 	type ToolVisibilityController,
 } from "./visibility-shim.js";
 
-const STATUS_KEY = "chat-only";
+const STATUS_KEY = "tool-visibility";
 
 type VisibilityAction = "toggle" | "show" | "hide";
 
-export default function chatOnlyExtension(pi: ExtensionAPI) {
+export default function toolVisibilityExtension(pi: ExtensionAPI) {
 	let controller: ToolVisibilityController | undefined;
 	let compatibilityError: string | undefined;
 
@@ -18,8 +18,7 @@ export default function chatOnlyExtension(pi: ExtensionAPI) {
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
-		const warning = compatibilityError ? " ⚠" : "";
-		ctx.ui.setStatus(STATUS_KEY, `CHAT tools: ${stateLabel()}${warning}`);
+		ctx.ui.setStatus(STATUS_KEY, `TOOLS: ${stateLabel()}`);
 	}
 
 	function install(ctx: ExtensionContext): void {
@@ -37,12 +36,12 @@ export default function chatOnlyExtension(pi: ExtensionAPI) {
 
 	function requireTui(ctx: ExtensionContext): ToolVisibilityController | undefined {
 		if (ctx.mode !== "tui") {
-			ctx.ui.notify("chat-only controls tool rows only in interactive TUI mode", "warning");
+			ctx.ui.notify("tool visibility controls tool rows only in interactive TUI mode", "warning");
 			return undefined;
 		}
 		if (!controller) {
 			ctx.ui.notify(
-				compatibilityError ?? "chat-only visibility shim is not active; run /chat-only diagnostics",
+				compatibilityError ?? "tool visibility shim is not active; run /tools diagnostics",
 				"error",
 			);
 			return undefined;
@@ -57,24 +56,24 @@ export default function chatOnlyExtension(pi: ExtensionAPI) {
 		activeController.setVisible(visible);
 		// setStatus requests a TUI render, so existing rows disappear or return immediately.
 		updateStatus(ctx);
-		ctx.ui.notify(`CHAT tools ${visible ? "shown" : "hidden"}`, "info");
+		ctx.ui.notify(`TOOLS: ${visible ? "shown" : "hidden"}`, "info");
 	}
 
 	function reportStatus(ctx: ExtensionContext): void {
-		ctx.ui.notify(`CHAT tools: ${stateLabel()}${compatibilityError ? " (compatibility error)" : ""}`, compatibilityError ? "error" : "info");
+		ctx.ui.notify(`TOOLS: ${stateLabel()}${compatibilityError ? " (compatibility error)" : ""}`, compatibilityError ? "error" : "info");
 	}
 
 	function reportDiagnostics(ctx: ExtensionContext): void {
 		if (!controller) {
 			ctx.ui.notify(
-				`CHAT diagnostics: Pi compatibility target ${SUPPORTED_PI_VERSION}; shim inactive; ${compatibilityError ?? `mode=${ctx.mode}`}`,
+				`TOOLS diagnostics: Pi compatibility target ${SUPPORTED_PI_VERSION}; shim inactive; ${compatibilityError ?? `mode=${ctx.mode}`}`,
 				compatibilityError ? "error" : "warning",
 			);
 			return;
 		}
 		const diagnostics = controller.diagnostics();
 		ctx.ui.notify(
-			`CHAT diagnostics: Pi ${diagnostics.piVersion}; target ${diagnostics.supportedVersion}; tools=${diagnostics.visible ? "shown" : "hidden"}; patched=${diagnostics.patched}; owners=${diagnostics.ownerCount}`,
+			`TOOLS diagnostics: Pi ${diagnostics.piVersion}; target ${diagnostics.supportedVersion}; tools=${diagnostics.visible ? "shown" : "hidden"}; patched=${diagnostics.patched}; owners=${diagnostics.ownerCount}`,
 			diagnostics.patched ? "info" : "error",
 		);
 	}
@@ -83,31 +82,22 @@ export default function chatOnlyExtension(pi: ExtensionAPI) {
 		const action = args.trim().toLowerCase();
 		switch (action) {
 			case "":
-			case "toggle":
 				setVisibility("toggle", ctx);
 				return;
 			case "show":
-			case "visible":
-			case "off":
-			case "disable":
 				setVisibility("show", ctx);
 				return;
 			case "hide":
-			case "hidden":
-			case "on":
-			case "enable":
 				setVisibility("hide", ctx);
 				return;
 			case "status":
 				reportStatus(ctx);
 				return;
 			case "diagnostics":
-			case "diagnostic":
-			case "diag":
 				reportDiagnostics(ctx);
 				return;
 			default:
-				ctx.ui.notify("Usage: /chat-only [toggle|show|hide|status|diagnostics]", "warning");
+				ctx.ui.notify("Usage: /tools [hide|show|status|diagnostics]", "warning");
 		}
 	}
 
@@ -119,35 +109,20 @@ export default function chatOnlyExtension(pi: ExtensionAPI) {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		if (controller && !controller.dispose()) {
 			ctx.ui.notify(
-				"chat-only could not safely restore ToolExecutionComponent.render because another patch replaced it",
+				"tool visibility could not safely restore ToolExecutionComponent.render because another patch replaced it",
 				"error",
 			);
 		}
 		controller = undefined;
 	});
 
-	pi.registerCommand("chat-only", {
+	pi.registerCommand("tools", {
 		description: "Toggle, show, or hide tool rows in chat",
 		getArgumentCompletions: (prefix) => {
-			const values = ["toggle", "show", "hide", "status", "diagnostics"];
+			const values = ["hide", "show", "status", "diagnostics"];
 			const matches = values.filter((value) => value.startsWith(prefix));
 			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 		},
 		handler: handleCommand,
-	});
-
-	pi.registerCommand("chat-tools", {
-		description: "Alias for /chat-only",
-		handler: handleCommand,
-	});
-
-	pi.registerCommand("show-tools", {
-		description: "Show all tool rows in chat",
-		handler: async (_args, ctx) => setVisibility("show", ctx),
-	});
-
-	pi.registerCommand("hide-tools", {
-		description: "Hide all tool rows from chat",
-		handler: async (_args, ctx) => setVisibility("hide", ctx),
 	});
 }

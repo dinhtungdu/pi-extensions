@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 
 const root = resolve(import.meta.dirname, "..");
-const output = await mkdtemp(join(root, ".chat-only-test-"));
+const output = await mkdtemp(join(root, ".tool-visibility-test-"));
 
 function compileExtensions() {
 	const compile = spawnSync(
@@ -77,10 +77,10 @@ try {
 	initTheme("dark");
 	compileExtensions();
 	const shimModule = await import(
-		pathToFileURL(join(output, "extensions", "chat-only", "visibility-shim.js"))
+		pathToFileURL(join(output, "extensions", "tool-visibility", "visibility-shim.js"))
 	);
 	const extensionModule = await import(
-		pathToFileURL(join(output, "extensions", "chat-only", "index.js"))
+		pathToFileURL(join(output, "extensions", "tool-visibility", "index.js"))
 	);
 	const { installToolVisibilityShim, SUPPORTED_PI_VERSION } = shimModule;
 
@@ -136,49 +136,61 @@ try {
 
 	const harness = createExtensionHarness(extensionModule.default);
 	await harness.emit("session_start", { reason: "startup" });
-	assert.match(harness.statuses.at(-1)[1], /^CHAT tools: shown$/, "default status must be persistent and visible");
-	assert.deepEqual(harness.workingCalls, [], "chat-only must not alter Pi's working indicator");
+	assert.deepEqual([...harness.commands.keys()], ["tools"], "the extension must expose only /tools");
+	assert.deepEqual(
+		harness.commands.get("tools").getArgumentCompletions("").map(({ value }) => value),
+		["hide", "show", "status", "diagnostics"],
+		"/tools must expose only the approved arguments",
+	);
+	assert.match(harness.statuses.at(-1)[1], /^TOOLS: shown$/, "default status must be persistent and visible");
+	assert.deepEqual(harness.workingCalls, [], "tool visibility must not alter Pi's working indicator");
 
 	const newRow = createToolRow("new_custom_tool");
-	await harness.command("chat-only");
-	assert.deepEqual(newRow.render(80), [], "toggle must hide newly-created arbitrary tool rows");
-	assert.deepEqual(harness.notifications.at(-1), ["CHAT tools hidden", "info"]);
-	assert.match(harness.statuses.at(-1)[1], /hidden$/);
+	await harness.command("tools");
+	assert.deepEqual(newRow.render(80), [], "bare /tools must hide newly-created arbitrary tool rows");
+	assert.deepEqual(harness.notifications.at(-1), ["TOOLS: hidden", "info"]);
+	assert.equal(harness.statuses.at(-1)[1], "TOOLS: hidden");
 
-	await harness.command("show-tools");
-	assert.ok(newRow.render(80).length > 0, "explicit show alias must restore rows immediately");
-	await harness.command("hide-tools");
-	assert.deepEqual(newRow.render(80), [], "explicit hide alias must hide rows");
-	await harness.command("chat-tools", "show");
-	assert.ok(newRow.render(80).length > 0, "chat-tools show alias must restore rows");
-	await harness.command("chat-only", "status");
-	assert.deepEqual(harness.notifications.at(-1), ["CHAT tools: shown", "info"]);
-	await harness.command("chat-only", "diagnostics");
+	await harness.command("tools");
+	assert.ok(newRow.render(80).length > 0, "bare /tools must toggle hidden rows back to shown");
+	for (const removedAlias of ["toggle", "on", "off", "visible", "hidden", "diagnostic", "diag"]) {
+		await harness.command("tools", removedAlias);
+		assert.deepEqual(harness.notifications.at(-1), ["Usage: /tools [hide|show|status|diagnostics]", "warning"]);
+		assert.ok(newRow.render(80).length > 0, `removed ${removedAlias} alias must not change visibility`);
+	}
+	await harness.command("tools", "hide");
+	assert.deepEqual(newRow.render(80), [], "/tools hide must hide rows");
+	await harness.command("tools", "show");
+	assert.ok(newRow.render(80).length > 0, "/tools show must restore rows");
+	await harness.command("tools", "status");
+	assert.deepEqual(harness.notifications.at(-1), ["TOOLS: shown", "info"]);
+	await harness.command("tools", "diagnostics");
 	assert.match(harness.notifications.at(-1)[0], new RegExp(`target ${SUPPORTED_PI_VERSION.replaceAll(".", "\\.")}`));
 	assert.match(harness.notifications.at(-1)[0], /patched=true; owners=1$/);
 
 	await harness.emit("session_shutdown", { reason: "reload" });
 	assert.equal(prototype.render, originalRender, "reload shutdown must restore Pi before the next extension instance");
-	assert.deepEqual(harness.statuses.at(-1), ["chat-only", undefined]);
+	assert.deepEqual(harness.statuses.at(-1), ["tool-visibility", undefined]);
 
 	const reloaded = createExtensionHarness(extensionModule.default);
 	await reloaded.emit("session_start", { reason: "reload" });
 	assert.equal(prototype.render === originalRender, false, "reloaded instance must install one fresh wrapper");
-	await reloaded.command("chat-only", "diagnostics");
+	assert.deepEqual([...reloaded.commands.keys()], ["tools"]);
+	await reloaded.command("tools", "diagnostics");
 	assert.match(reloaded.notifications.at(-1)[0], /owners=1$/);
 	await reloaded.emit("session_shutdown", { reason: "quit" });
 	assert.equal(prototype.render, originalRender, "reloaded instance must clean up without stacked patches");
 
-	console.log("[chat-only test] passed");
+	console.log("[tool-visibility test] passed");
 } finally {
 	if (ToolExecutionComponent.prototype.render !== undefined) {
 		// Failed assertions should not leave the test process's shared class patched.
 		const record = ToolExecutionComponent.prototype[
-			Symbol.for("pi-extensions.chat-only.tool-visibility.v1")
+			Symbol.for("pi-extensions.tool-visibility.v1")
 		];
 		if (record?.originalDescriptor) {
 			Object.defineProperty(ToolExecutionComponent.prototype, "render", record.originalDescriptor);
-			delete ToolExecutionComponent.prototype[Symbol.for("pi-extensions.chat-only.tool-visibility.v1")];
+			delete ToolExecutionComponent.prototype[Symbol.for("pi-extensions.tool-visibility.v1")];
 		}
 	}
 	await rm(output, { recursive: true, force: true });

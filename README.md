@@ -5,7 +5,7 @@ Pi extensions:
 - `auto-dark-mode` — macOS dark/light theme switching
 - `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 - `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
-- `chat-only` — hide/show all tool execution rows without changing tools, messages, or session history
+- `tool-visibility` — hide/show all tool execution rows without changing tools, messages, or session history
 - `voice` — local hands-free STT/TTS for Apple Silicon with streaming speech and deterministic keyboard interruption
 
 ## Install
@@ -23,7 +23,7 @@ Selected extensions only:
 	"packages": [
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
-			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/chat-only/index.ts", "extensions/voice/index.ts"],
+			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
 			"skills": [],
 			"prompts": [],
 			"themes": []
@@ -40,7 +40,7 @@ Local development:
 pi -e ./extensions/auto-dark-mode.ts
 pi -e ./extensions/code-mode.ts
 pi -e ./extensions/goal.ts
-pi -e ./extensions/chat-only/index.ts
+pi -e ./extensions/tool-visibility/index.ts
 pi -e ./extensions/voice/index.ts
 pi install /path/to/pi-extensions
 ```
@@ -90,24 +90,21 @@ Notes:
 - Goal state is stored in the pi session branch via custom entries; it survives reload/resume/fork.
 - Objectives should include scope, success criteria, constraints, and verification commands.
 
-## Chat-only tool rows
+## Tool visibility
 
-Tool rows are visible by default. Chat-only mode changes only TUI rendering: tools still execute, stream, complete, and remain unchanged in messages, results, and session history. Existing and future rows—including custom tools and image results—return immediately when shown.
+Tool rows are visible by default. The extension changes only TUI rendering: tools still execute, stream, complete, and remain unchanged in messages, results, and session history. Existing and future rows—including custom tools and image results—return immediately when shown.
 
 ```text
-/chat-only                  # toggle
-/chat-only show             # show tool rows
-/chat-only hide             # hide tool rows
-/chat-only status
-/chat-only diagnostics      # report shim/version state
-/show-tools                 # explicit show alias
-/hide-tools                 # explicit hide alias
-/chat-tools [show|hide]     # alias
+/tools                  # toggle
+/tools hide             # hide tool rows
+/tools show             # show tool rows
+/tools status
+/tools diagnostics      # report shim/version state
 ```
 
-The persistent `CHAT tools: shown|hidden` footer status and each toggle notification expose the current state on narrow/mobile terminals. Pi's working indicator and Escape cancellation remain untouched.
+The persistent `TOOLS: shown|hidden` footer status and each toggle notification expose the current state on narrow/mobile terminals. Pi's working indicator and Escape cancellation remain untouched.
 
-Pi has no public global tool-row visibility API. `extensions/chat-only/visibility-shim.ts` contains the isolated Pi 0.82.1 compatibility patch. It wraps only `ToolExecutionComponent.render`, shares one patch across duplicate/reloaded instances, and restores the original method on shutdown when safe. A changed Pi version or component shape leaves rows visible and raises a visible compatibility error; use `/chat-only diagnostics` to inspect it. Upgrade this shim before widening the pinned Pi `0.82.1` peer dependency.
+Pi has no public global tool-row visibility API. `extensions/tool-visibility/visibility-shim.ts` contains the isolated Pi 0.82.1 compatibility patch. It wraps only `ToolExecutionComponent.render`, shares one patch across duplicate/reloaded instances, and restores the original method on shutdown when safe. A changed Pi version or component shape leaves rows visible and raises a visible compatibility error; use `/tools diagnostics` to inspect it.
 
 ## Voice
 

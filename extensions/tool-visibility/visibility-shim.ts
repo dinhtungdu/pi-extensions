@@ -7,7 +7,7 @@ import { ToolExecutionComponent, VERSION } from "@earendil-works/pi-coding-agent
  */
 export const SUPPORTED_PI_VERSION = "0.82.1";
 
-const PATCH_KEY = Symbol.for("pi-extensions.chat-only.tool-visibility.v1");
+const PATCH_KEY = Symbol.for("pi-extensions.tool-visibility.v1");
 
 type Render = (width: number) => string[];
 type ToolExecutionPrototype = {
@@ -20,7 +20,7 @@ type ToolExecutionPrototype = {
 type ToolExecutionClass = { prototype: ToolExecutionPrototype };
 type Owner = { visible: boolean };
 type PatchRecord = {
-	kind: "pi-extensions.chat-only.tool-visibility.v1";
+	kind: "pi-extensions.tool-visibility.v1";
 	originalDescriptor: PropertyDescriptor;
 	originalRender: Render;
 	wrapper: Render;
@@ -50,7 +50,7 @@ type InstallOptions = {
 function assertCompatible(piVersion: string, prototype: ToolExecutionPrototype): void {
 	if (piVersion !== SUPPORTED_PI_VERSION) {
 		throw new Error(
-			`chat-only compatibility error: Pi ${SUPPORTED_PI_VERSION} is required; found ${piVersion}. Tool rows were left visible.`,
+			`tool-visibility compatibility error: Pi ${SUPPORTED_PI_VERSION} is required; found ${piVersion}. Tool rows were left visible.`,
 		);
 	}
 	if (
@@ -60,7 +60,7 @@ function assertCompatible(piVersion: string, prototype: ToolExecutionPrototype):
 		typeof prototype.setShowImages !== "function"
 	) {
 		throw new Error(
-			"chat-only compatibility error: ToolExecutionComponent no longer has the expected Pi 0.82.1 rendering methods. Tool rows were left visible.",
+			"tool-visibility compatibility error: ToolExecutionComponent no longer has the expected Pi 0.82.1 rendering methods. Tool rows were left visible.",
 		);
 	}
 }
@@ -77,21 +77,21 @@ export function installToolVisibilityShim(options: InstallOptions = {}): ToolVis
 
 	let record = prototype[PATCH_KEY];
 	if (record) {
-		if (record.kind !== "pi-extensions.chat-only.tool-visibility.v1" || prototype.render !== record.wrapper) {
+		if (record.kind !== "pi-extensions.tool-visibility.v1" || prototype.render !== record.wrapper) {
 			throw new Error(
-				"chat-only compatibility error: ToolExecutionComponent.render changed after the visibility shim was installed. Tool visibility was not changed.",
+				"tool-visibility compatibility error: ToolExecutionComponent.render changed after the visibility shim was installed. Tool visibility was not changed.",
 			);
 		}
 	} else {
 		const descriptor = Object.getOwnPropertyDescriptor(prototype, "render");
 		if (!descriptor || typeof descriptor.value !== "function" || descriptor.writable !== true) {
 			throw new Error(
-				"chat-only compatibility error: ToolExecutionComponent.render cannot be patched safely. Tool rows were left visible.",
+				"tool-visibility compatibility error: ToolExecutionComponent.render cannot be patched safely. Tool rows were left visible.",
 			);
 		}
 
 		record = {
-			kind: "pi-extensions.chat-only.tool-visibility.v1",
+			kind: "pi-extensions.tool-visibility.v1",
 			originalDescriptor: descriptor,
 			originalRender: descriptor.value as Render,
 			wrapper: undefined as unknown as Render,
@@ -119,7 +119,7 @@ export function installToolVisibilityShim(options: InstallOptions = {}): ToolVis
 	return {
 		isVisible: () => owner.visible,
 		setVisible(visible) {
-			if (disposed) throw new Error("chat-only visibility controller is disposed");
+			if (disposed) throw new Error("tool-visibility controller is disposed");
 			owner.visible = visible;
 		},
 		diagnostics() {
