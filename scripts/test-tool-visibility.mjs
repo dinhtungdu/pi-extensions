@@ -64,6 +64,7 @@ function createExtensionHarness(extension) {
 	const statuses = [];
 	const notifications = [];
 	const workingCalls = [];
+	const thinkingLabelCalls = [];
 	const pi = {
 		on(name, handler) {
 			const handlers = events.get(name) ?? [];
@@ -82,6 +83,7 @@ function createExtensionHarness(extension) {
 			notify: (...args) => notifications.push(args),
 			setWorkingVisible: (...args) => workingCalls.push(["visible", ...args]),
 			setWorkingIndicator: (...args) => workingCalls.push(["indicator", ...args]),
+			setHiddenThinkingLabel: (...args) => thinkingLabelCalls.push(args),
 		},
 	};
 	extension(pi);
@@ -90,6 +92,7 @@ function createExtensionHarness(extension) {
 		statuses,
 		notifications,
 		workingCalls,
+		thinkingLabelCalls,
 		async emit(name, event = {}) {
 			for (const handler of events.get(name) ?? []) await handler(event, ctx);
 		},
@@ -108,7 +111,11 @@ try {
 	const extensionModule = await import(
 		pathToFileURL(join(output, "extensions", "tool-visibility", "index.js"))
 	);
-	const { installToolVisibilityShim, MINIMUM_PI_VERSION } = shimModule;
+	const {
+		COMPACT_HIDDEN_THINKING_LABEL,
+		installToolVisibilityShim,
+		MINIMUM_PI_VERSION,
+	} = shimModule;
 
 	const prototype = ToolExecutionComponent.prototype;
 	const assistantPrototype = AssistantMessageComponent.prototype;
@@ -140,15 +147,23 @@ try {
 	assert.deepEqual(existing.render(100), initialRows, "installing must not alter visible rows");
 
 	first.setVisible(false);
+	thinkingOnly.setHiddenThinkingLabel(COMPACT_HIDDEN_THINKING_LABEL);
+	mixedAssistant.setHiddenThinkingLabel(COMPACT_HIDDEN_THINKING_LABEL);
+	expandedThinking.setHiddenThinkingLabel(COMPACT_HIDDEN_THINKING_LABEL);
 	assert.deepEqual(existing.render(100), [], "existing tool rows must hide immediately");
 	assert.deepEqual(
 		thinkingOnly.render(100),
 		[],
 		"compact mode must remove collapsed thinking-only placeholders without reserving rows",
 	);
+	const mixedRows = mixedAssistant.render(100);
 	assert.ok(
-		mixedAssistant.render(100).some((line) => line.includes("Visible answer")),
+		mixedRows.some((line) => line.includes("Visible answer")),
 		"compact mode must preserve assistant responses that also contain thinking",
+	);
+	assert.ok(
+		mixedRows.every((line) => !line.includes(COMPACT_HIDDEN_THINKING_LABEL)),
+		"compact mode must remove collapsed thinking labels from mixed responses",
 	);
 	assert.ok(
 		expandedThinking.render(100).some((line) => line.includes("Visible reasoning")),
@@ -168,6 +183,9 @@ try {
 	assert.deepEqual(existing.render(100), [], "tool completion and image results must remain hidden");
 	const expectedCompletedRows = originalRender.call(existing, 100);
 	first.setVisible(true);
+	thinkingOnly.setHiddenThinkingLabel("Thinking...");
+	mixedAssistant.setHiddenThinkingLabel("Thinking...");
+	expandedThinking.setHiddenThinkingLabel("Thinking...");
 	assert.deepEqual(
 		existing.render(100),
 		expectedCompletedRows,
@@ -203,9 +221,15 @@ try {
 		}
 	}
 	class FutureAssistantRow {
-		hideThinkingBlock = false;
+		// Deliberately malformed/renamed relative to Pi's private implementation.
+		collapsedReasoningState = true;
+		renamedMessageField = { content: [{ type: "thinking" }] };
 		render(width, ...args) {
-			return [`assistant:${width}:${args.join(":")}`];
+			return [
+				`assistant:${width}:${args.join(":")}`,
+				` ${COMPACT_HIDDEN_THINKING_LABEL} `,
+				"assistant answer",
+			];
 		}
 	}
 	const future = installToolVisibilityShim({
@@ -214,12 +238,66 @@ try {
 		AssistantMessageClass: FutureAssistantRow,
 	});
 	const futureRow = new FutureToolRow();
+	const futureAssistant = new FutureAssistantRow();
+	assert.equal(future.diagnostics().patched, true, "renamed private fields must not affect compatibility");
 	assert.deepEqual(futureRow.render(42, "extra"), ["42:extra"], "compatible future renders must pass through");
 	assert.deepEqual(futureRow.calls, [[42, "extra"]], "the shim must forward every render argument");
+	assert.equal("hideThinkingBlock" in futureAssistant, false, "fixture must not expose Pi's private field names");
+	assert.equal(futureAssistant.render(42, "extra").length, 3);
 	future.setVisible(false);
 	assert.deepEqual(futureRow.render(42, "hidden"), [], "compatible future rows must hide");
 	assert.deepEqual(futureRow.calls, [[42, "extra"]], "hidden renders must not invoke Pi's renderer");
+	assert.deepEqual(
+		futureAssistant.render(42, "hidden"),
+		["assistant:42:hidden", "assistant answer"],
+		"thinking suppression must use the public marker rather than assistant private state",
+	);
 	assert.equal(future.dispose(), true);
+
+	class AtomicToolRow {
+		render() {
+			return ["tool"];
+		}
+	}
+	const atomicToolRender = AtomicToolRow.prototype.render;
+	const atomicAssistantTarget = { render: () => ["assistant"] };
+	const atomicAssistantRender = atomicAssistantTarget.render;
+	let failAssistantPatch = true;
+	const atomicAssistantPrototype = new Proxy(atomicAssistantTarget, {
+		defineProperty(target, key, descriptor) {
+			if (key === "render" && descriptor.value !== atomicAssistantRender && failAssistantPatch) {
+				failAssistantPatch = false;
+				Reflect.defineProperty(target, key, descriptor);
+				throw new Error("injected assistant patch failure after mutation");
+			}
+			return Reflect.defineProperty(target, key, descriptor);
+		},
+	});
+	const atomicOptions = {
+		piVersion: MINIMUM_PI_VERSION,
+		ToolExecutionClass: AtomicToolRow,
+		AssistantMessageClass: { prototype: atomicAssistantPrototype },
+	};
+	assert.throws(
+		() => installToolVisibilityShim(atomicOptions),
+		/installation failed and was rolled back.*injected assistant patch failure after mutation/,
+		"a late patch failure must report successful rollback",
+	);
+	assert.equal(
+		AtomicToolRow.prototype.render,
+		atomicToolRender,
+		"failed installation must restore the original tool render identity",
+	);
+	assert.equal(
+		atomicAssistantPrototype.render,
+		atomicAssistantRender,
+		"failed installation must preserve the original assistant render identity",
+	);
+	const atomicRetry = installToolVisibilityShim(atomicOptions);
+	assert.notEqual(AtomicToolRow.prototype.render, atomicToolRender, "retry must install after rollback");
+	assert.equal(atomicRetry.dispose(), true);
+	assert.equal(AtomicToolRow.prototype.render, atomicToolRender, "retry disposal must restore tool identity");
+	assert.equal(atomicAssistantPrototype.render, atomicAssistantRender, "retry disposal must restore assistant identity");
 
 	for (const piVersion of ["0.82.0", "0.82.1-beta.1", "invalid"]) {
 		assert.throws(
@@ -265,17 +343,29 @@ try {
 		["hide", "show", "status", "diagnostics"],
 		"/tools must expose only the approved arguments",
 	);
-	assert.equal(harness.statuses.at(-1)[1], "🛠️", "default footer status must be a compact tool icon");
+	assert.equal(
+		harness.statuses.at(-1)[1],
+		"TOOLS: shown",
+		"default footer status must preserve the normal verbose rendering",
+	);
+	assert.deepEqual(harness.thinkingLabelCalls, [], "default mode must not alter Pi's thinking label");
 	assert.deepEqual(harness.workingCalls, [], "tool visibility must not alter Pi's working indicator");
 
 	const newRow = createToolRow("new_custom_tool");
 	await harness.command("tools");
 	assert.deepEqual(newRow.render(80), [], "bare /tools must hide newly-created arbitrary tool rows");
 	assert.deepEqual(harness.notifications.at(-1), ["TOOLS: hidden", "info"]);
-	assert.equal(harness.statuses.at(-1)[1], "🧰", "hidden footer status must use the put-away tool icon");
+	assert.equal(harness.statuses.at(-1)[1], "🧰", "only hidden mode must use the compact tool icon");
+	assert.deepEqual(
+		harness.thinkingLabelCalls.at(-1),
+		[COMPACT_HIDDEN_THINKING_LABEL],
+		"hidden mode must apply the public thinking-label marker",
+	);
 
 	await harness.command("tools");
 	assert.ok(newRow.render(80).length > 0, "bare /tools must toggle hidden rows back to shown");
+	assert.equal(harness.statuses.at(-1)[1], "TOOLS: shown", "shown mode must restore the normal footer");
+	assert.deepEqual(harness.thinkingLabelCalls.at(-1), [], "shown mode must restore Pi's thinking label");
 	for (const removedAlias of ["toggle", "on", "off", "visible", "hidden", "diagnostic", "diag"]) {
 		await harness.command("tools", removedAlias);
 		assert.deepEqual(harness.notifications.at(-1), ["Usage: /tools [hide|show|status|diagnostics]", "warning"]);
@@ -301,7 +391,10 @@ try {
 	assert.deepEqual([...reloaded.commands.keys()], ["tools"]);
 	await reloaded.command("tools", "diagnostics");
 	assert.match(reloaded.notifications.at(-1)[0], /owners=1$/);
+	await reloaded.command("tools", "hide");
+	assert.deepEqual(reloaded.thinkingLabelCalls.at(-1), [COMPACT_HIDDEN_THINKING_LABEL]);
 	await reloaded.emit("session_shutdown", { reason: "quit" });
+	assert.deepEqual(reloaded.thinkingLabelCalls.at(-1), [], "shutdown must restore Pi's thinking label");
 	assert.equal(prototype.render, originalRender, "reloaded instance must clean up tool patches");
 	assert.equal(
 		assistantPrototype.render,

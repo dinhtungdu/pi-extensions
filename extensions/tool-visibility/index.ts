@@ -1,12 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	COMPACT_HIDDEN_THINKING_LABEL,
 	installToolVisibilityShim,
 	MINIMUM_PI_VERSION,
 	type ToolVisibilityController,
 } from "./visibility-shim.js";
 
 const STATUS_KEY = "tool-visibility";
-const STATUS_ICONS = { shown: "🛠️", hidden: "🧰" } as const;
+const HIDDEN_STATUS_ICON = "🧰";
 
 type VisibilityAction = "toggle" | "show" | "hide";
 
@@ -19,7 +20,10 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
-		ctx.ui.setStatus(STATUS_KEY, STATUS_ICONS[stateLabel()]);
+		ctx.ui.setStatus(
+			STATUS_KEY,
+			stateLabel() === "hidden" ? HIDDEN_STATUS_ICON : "TOOLS: shown",
+		);
 	}
 
 	function install(ctx: ExtensionContext): void {
@@ -55,7 +59,12 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 		if (!activeController) return;
 		const visible = action === "show" || (action === "toggle" && !activeController.isVisible());
 		activeController.setVisible(visible);
-		// setStatus requests a TUI render, so existing rows disappear or return immediately.
+		if (visible) {
+			ctx.ui.setHiddenThinkingLabel();
+		} else {
+			ctx.ui.setHiddenThinkingLabel(COMPACT_HIDDEN_THINKING_LABEL);
+		}
+		// Both UI setters request a render, so existing rows update immediately.
 		updateStatus(ctx);
 		ctx.ui.notify(`TOOLS: ${visible ? "shown" : "hidden"}`, "info");
 	}
@@ -108,6 +117,7 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
+		if (controller?.isVisible() === false) ctx.ui.setHiddenThinkingLabel();
 		if (controller && !controller.dispose()) {
 			ctx.ui.notify(
 				"tool visibility could not safely restore compact rendering because another patch replaced it",
