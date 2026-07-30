@@ -1,20 +1,17 @@
 import { ToolExecutionComponent, VERSION } from "@earendil-works/pi-coding-agent";
 
 /**
- * Pi 0.82.1 has no public API for hiding every tool row. Keep the unsupported
- * prototype patch in this file so a future Pi upgrade has one obvious failure
- * point. The wrapper only changes rendering; tool component state keeps updating.
+ * Pi has no public API for hiding every tool row. Keep the unsupported prototype
+ * patch in this file so a future Pi upgrade has one obvious failure point. The
+ * wrapper only changes rendering; tool component state keeps updating.
  */
-export const SUPPORTED_PI_VERSION = "0.82.1";
+export const MINIMUM_PI_VERSION = "0.82.1";
 
 const PATCH_KEY = Symbol.for("pi-extensions.tool-visibility.v1");
 
-type Render = (width: number) => string[];
+type Render = (width: number, ...args: unknown[]) => string[];
 type ToolExecutionPrototype = {
 	render: Render;
-	updateResult?: unknown;
-	setExpanded?: unknown;
-	setShowImages?: unknown;
 	[PATCH_KEY]?: PatchRecord;
 };
 type ToolExecutionClass = { prototype: ToolExecutionPrototype };
@@ -29,7 +26,7 @@ type PatchRecord = {
 
 export type ToolVisibilityDiagnostics = {
 	piVersion: string;
-	supportedVersion: string;
+	minimumVersion: string;
 	visible: boolean;
 	ownerCount: number;
 	patched: boolean;
@@ -47,20 +44,36 @@ type InstallOptions = {
 	ToolExecutionClass?: ToolExecutionClass;
 };
 
+function parseVersion(version: string): { parts: [number, number, number]; prerelease: boolean } | undefined {
+	const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+	if (!match) return undefined;
+	return {
+		parts: [Number(match[1]), Number(match[2]), Number(match[3])],
+		prerelease: match[4] !== undefined,
+	};
+}
+
+function isSupportedVersion(piVersion: string): boolean {
+	const current = parseVersion(piVersion);
+	const minimum = parseVersion(MINIMUM_PI_VERSION);
+	if (!current || !minimum) return false;
+	for (let index = 0; index < current.parts.length; index++) {
+		if (current.parts[index] !== minimum.parts[index]) {
+			return current.parts[index] > minimum.parts[index];
+		}
+	}
+	return !current.prerelease;
+}
+
 function assertCompatible(piVersion: string, prototype: ToolExecutionPrototype): void {
-	if (piVersion !== SUPPORTED_PI_VERSION) {
+	if (!isSupportedVersion(piVersion)) {
 		throw new Error(
-			`tool-visibility compatibility error: Pi ${SUPPORTED_PI_VERSION} is required; found ${piVersion}. Tool rows were left visible.`,
+			`tool-visibility compatibility error: requires Pi >=${MINIMUM_PI_VERSION}; found ${piVersion}. Tool rows were left visible.`,
 		);
 	}
-	if (
-		typeof prototype.render !== "function" ||
-		typeof prototype.updateResult !== "function" ||
-		typeof prototype.setExpanded !== "function" ||
-		typeof prototype.setShowImages !== "function"
-	) {
+	if (typeof prototype.render !== "function") {
 		throw new Error(
-			"tool-visibility compatibility error: ToolExecutionComponent no longer has the expected Pi 0.82.1 rendering methods. Tool rows were left visible.",
+			"tool-visibility compatibility error: ToolExecutionComponent.render is unavailable. Tool rows were left visible.",
 		);
 	}
 }
@@ -98,11 +111,11 @@ export function installToolVisibilityShim(options: InstallOptions = {}): ToolVis
 			owners: new Set(),
 		};
 		const sharedRecord = record;
-		record.wrapper = function (this: ToolExecutionPrototype, width: number): string[] {
+		record.wrapper = function (this: ToolExecutionPrototype, width: number, ...args: unknown[]): string[] {
 			for (const owner of sharedRecord.owners) {
 				if (!owner.visible) return [];
 			}
-			return sharedRecord.originalRender.call(this, width);
+			return sharedRecord.originalRender.call(this, width, ...args);
 		};
 		Object.defineProperty(prototype, "render", { ...descriptor, value: record.wrapper });
 		Object.defineProperty(prototype, PATCH_KEY, {
@@ -125,7 +138,7 @@ export function installToolVisibilityShim(options: InstallOptions = {}): ToolVis
 		diagnostics() {
 			return {
 				piVersion,
-				supportedVersion: SUPPORTED_PI_VERSION,
+				minimumVersion: MINIMUM_PI_VERSION,
 				visible: owner.visible,
 				ownerCount: record.owners.size,
 				patched: prototype.render === record.wrapper && prototype[PATCH_KEY] === record,

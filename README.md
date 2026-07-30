@@ -104,7 +104,7 @@ Tool rows are visible by default. The extension changes only TUI rendering: tool
 
 The persistent `TOOLS: shown|hidden` footer status and each toggle notification expose the current state on narrow/mobile terminals. Pi's working indicator and Escape cancellation remain untouched.
 
-Pi has no public global tool-row visibility API. `extensions/tool-visibility/visibility-shim.ts` contains the isolated Pi 0.82.1 compatibility patch. It wraps only `ToolExecutionComponent.render`, shares one patch across duplicate/reloaded instances, and restores the original method on shutdown when safe. A changed Pi version or component shape leaves rows visible and raises a visible compatibility error; use `/tools diagnostics` to inspect it.
+Pi has no public global tool-row visibility API. `extensions/tool-visibility/visibility-shim.ts` contains an isolated compatibility patch for Pi 0.82.1 and newer. At runtime it verifies that `ToolExecutionComponent.render` is available and safely patchable, wraps only that method, forwards all render arguments, shares one patch across duplicate/reloaded instances, and restores the original method on shutdown when safe. A version below 0.82.1 or incompatible runtime shape leaves rows visible and raises a visible compatibility error; use `/tools diagnostics` to inspect it.
 
 ## Voice
 

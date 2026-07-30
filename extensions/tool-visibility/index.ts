@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	installToolVisibilityShim,
-	SUPPORTED_PI_VERSION,
+	MINIMUM_PI_VERSION,
 	type ToolVisibilityController,
 } from "./visibility-shim.js";
 
@@ -66,14 +66,14 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 	function reportDiagnostics(ctx: ExtensionContext): void {
 		if (!controller) {
 			ctx.ui.notify(
-				`TOOLS diagnostics: Pi compatibility target ${SUPPORTED_PI_VERSION}; shim inactive; ${compatibilityError ?? `mode=${ctx.mode}`}`,
+				`TOOLS diagnostics: Pi compatibility requires >=${MINIMUM_PI_VERSION}; shim inactive; ${compatibilityError ?? `mode=${ctx.mode}`}`,
 				compatibilityError ? "error" : "warning",
 			);
 			return;
 		}
 		const diagnostics = controller.diagnostics();
 		ctx.ui.notify(
-			`TOOLS diagnostics: Pi ${diagnostics.piVersion}; target ${diagnostics.supportedVersion}; tools=${diagnostics.visible ? "shown" : "hidden"}; patched=${diagnostics.patched}; owners=${diagnostics.ownerCount}`,
+			`TOOLS diagnostics: Pi ${diagnostics.piVersion}; minimum ${diagnostics.minimumVersion}; runtime-compatible=${diagnostics.patched}; tools=${diagnostics.visible ? "shown" : "hidden"}; owners=${diagnostics.ownerCount}`,
 			diagnostics.patched ? "info" : "error",
 		);
 	}

@@ -82,7 +82,7 @@ try {
 	const extensionModule = await import(
 		pathToFileURL(join(output, "extensions", "tool-visibility", "index.js"))
 	);
-	const { installToolVisibilityShim, SUPPORTED_PI_VERSION } = shimModule;
+	const { installToolVisibilityShim, MINIMUM_PI_VERSION } = shimModule;
 
 	const prototype = ToolExecutionComponent.prototype;
 	const originalRender = prototype.render;
@@ -127,10 +127,49 @@ try {
 	assert.equal(second.dispose(), true);
 	assert.equal(prototype.render, originalRender, "last dispose must restore Pi's original render method");
 
+	class FutureToolRow {
+		calls = [];
+		render(width, ...args) {
+			this.calls.push([width, ...args]);
+			return [`${width}:${args.join(":")}`];
+		}
+	}
+	const future = installToolVisibilityShim({
+		piVersion: "99.0.0",
+		ToolExecutionClass: FutureToolRow,
+	});
+	const futureRow = new FutureToolRow();
+	assert.deepEqual(futureRow.render(42, "extra"), ["42:extra"], "compatible future renders must pass through");
+	assert.deepEqual(futureRow.calls, [[42, "extra"]], "the shim must forward every render argument");
+	future.setVisible(false);
+	assert.deepEqual(futureRow.render(42, "hidden"), [], "compatible future rows must hide");
+	assert.deepEqual(futureRow.calls, [[42, "extra"]], "hidden renders must not invoke Pi's renderer");
+	assert.equal(future.dispose(), true);
+
+	for (const piVersion of ["0.82.0", "0.82.1-beta.1", "invalid"]) {
+		assert.throws(
+			() => installToolVisibilityShim({ piVersion }),
+			/compatibility error.*Tool rows were left visible/,
+			`Pi ${piVersion} must fail the minimum-version check`,
+		);
+	}
 	assert.throws(
-		() => installToolVisibilityShim({ piVersion: "99.0.0" }),
-		/compatibility error.*Tool rows were left visible/,
-		"unsupported Pi internals must fail explicitly",
+		() => installToolVisibilityShim({
+			piVersion: MINIMUM_PI_VERSION,
+			ToolExecutionClass: { prototype: {} },
+		}),
+		/ToolExecutionComponent\.render is unavailable/,
+		"incompatible runtime shape must fail explicitly",
+	);
+	const lockedPrototype = {};
+	Object.defineProperty(lockedPrototype, "render", { value: () => ["locked"], writable: false });
+	assert.throws(
+		() => installToolVisibilityShim({
+			piVersion: MINIMUM_PI_VERSION,
+			ToolExecutionClass: { prototype: lockedPrototype },
+		}),
+		/ToolExecutionComponent\.render cannot be patched safely/,
+		"a non-writable renderer must fail explicitly",
 	);
 	assert.equal(prototype.render, originalRender);
 
@@ -165,8 +204,8 @@ try {
 	await harness.command("tools", "status");
 	assert.deepEqual(harness.notifications.at(-1), ["TOOLS: shown", "info"]);
 	await harness.command("tools", "diagnostics");
-	assert.match(harness.notifications.at(-1)[0], new RegExp(`target ${SUPPORTED_PI_VERSION.replaceAll(".", "\\.")}`));
-	assert.match(harness.notifications.at(-1)[0], /patched=true; owners=1$/);
+	assert.match(harness.notifications.at(-1)[0], new RegExp(`minimum ${MINIMUM_PI_VERSION.replaceAll(".", "\\.")}`));
+	assert.match(harness.notifications.at(-1)[0], /runtime-compatible=true;.*owners=1$/);
 
 	await harness.emit("session_shutdown", { reason: "reload" });
 	assert.equal(prototype.render, originalRender, "reload shutdown must restore Pi before the next extension instance");
