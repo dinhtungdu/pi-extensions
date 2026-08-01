@@ -10,6 +10,11 @@ export interface ProjectIdentityOptions {
 	timeoutMs?: number;
 }
 
+export interface ProjectContext {
+	projectIdentity: string;
+	checkoutRoot: string;
+}
+
 function gitEnvironment(): NodeJS.ProcessEnv {
 	const environment = { ...process.env };
 	for (const name of [
@@ -70,20 +75,30 @@ function isNestedGitMetadata(path: string): boolean {
 }
 
 /**
- * Resolve a stable Discord project identity without making Git availability a
- * bridge requirement. Normal checkouts and linked worktrees share their common
- * .git directory; submodules retain their own working-tree identity.
+ * Resolve stable project and checkout identities without making Git
+ * availability a bridge requirement. Normal checkouts and linked worktrees
+ * share their common .git directory while retaining distinct checkout roots.
  */
-export async function resolveProjectIdentity(cwd: string, options: ProjectIdentityOptions = {}): Promise<string> {
+export async function resolveProjectContext(cwd: string, options: ProjectIdentityOptions = {}): Promise<ProjectContext> {
 	const fallback = normalizeCwd(cwd);
-	try {
-		const commonDirectory = absoluteGitPath(await runGit(fallback, "--git-common-dir", options));
-		if (!commonDirectory) return fallback;
-		if (basename(commonDirectory) === ".git") return dirname(commonDirectory);
-		if (!isNestedGitMetadata(commonDirectory)) return commonDirectory;
-		const topLevel = absoluteGitPath(await runGit(fallback, "--show-toplevel", options));
-		return topLevel ?? fallback;
-	} catch {
-		return fallback;
-	}
+	const [commonResult, topLevelResult] = await Promise.allSettled([
+		runGit(fallback, "--git-common-dir", options),
+		runGit(fallback, "--show-toplevel", options),
+	]);
+	const commonDirectory = commonResult.status === "fulfilled" ? absoluteGitPath(commonResult.value) : undefined;
+	const topLevel = topLevelResult.status === "fulfilled" ? absoluteGitPath(topLevelResult.value) : undefined;
+	if (!commonDirectory) return { projectIdentity: fallback, checkoutRoot: topLevel ?? fallback };
+	const projectIdentity = basename(commonDirectory) === ".git"
+		? dirname(commonDirectory)
+		: isNestedGitMetadata(commonDirectory)
+			? topLevel ?? fallback
+			: commonDirectory;
+	return {
+		projectIdentity,
+		checkoutRoot: topLevel ?? commonDirectory,
+	};
+}
+
+export async function resolveProjectIdentity(cwd: string, options: ProjectIdentityOptions = {}): Promise<string> {
+	return (await resolveProjectContext(cwd, options)).projectIdentity;
 }

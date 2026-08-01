@@ -12,7 +12,8 @@ import { DiscordStateStore } from "./state.js";
 import { DiscordJsTransport, type DiscordTransport } from "./transport.js";
 import { runRelayChild } from "./relay-child.js";
 import { launchRelayChild } from "./relay-launcher.js";
-import { resolveProjectIdentity } from "./project-identity.js";
+import { resolveProjectContext } from "./project-identity.js";
+import { discoverTaskTitle } from "./task-title.js";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 
 const STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.discord;
@@ -60,11 +61,12 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
 
 		async function sessionFrom(ctx: ExtensionContext): Promise<BridgeSession> {
+			const project = await resolveProjectContext(ctx.cwd);
 			return {
-				cwd: await resolveProjectIdentity(ctx.cwd),
+				cwd: project.projectIdentity,
 				projectIdentityResolved: true,
 				sessionId: ctx.sessionManager.getSessionId(),
-				sessionName: pi.getSessionName(),
+				sessionName: await discoverTaskTitle(project.checkoutRoot) ?? pi.getSessionName(),
 			};
 		}
 

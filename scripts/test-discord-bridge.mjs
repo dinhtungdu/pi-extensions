@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:net";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -225,7 +225,8 @@ try {
 	const { PACKAGE_FOOTER_STATUS_KEYS } = await importBuilt("extensions/footer-status.js");
 	const { DiscordStateStore } = await importBuilt("extensions/discord/state.js");
 	const { LocalRelayClient } = await importBuilt("extensions/discord/relay-client.js");
-	const { resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
+	const { resolveProjectContext, resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
+	const { discoverTaskTitle, parseTaskTitle } = await importBuilt("extensions/discord/task-title.js");
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
@@ -342,6 +343,41 @@ try {
 	assert.equal(await resolveProjectIdentity(mainCheckout), canonicalMainCheckout, "a normal checkout must identify its repository root");
 	assert.equal(await resolveProjectIdentity(linkedWorktree), canonicalMainCheckout, "a linked worktree must identify its main checkout");
 	assert.equal(await resolveProjectIdentity(linkedSubdirectory), canonicalMainCheckout, "a worktree subdirectory must retain repository identity");
+	const linkedContext = await resolveProjectContext(linkedSubdirectory);
+	assert.equal(linkedContext.projectIdentity, canonicalMainCheckout);
+	assert.equal(linkedContext.checkoutRoot, await realpath(linkedWorktree), "task discovery must retain the current linked-worktree root");
+
+	assert.equal(parseTaskTitle("# Heading task\n\nDetails\n"), "Heading task");
+	assert.equal(
+		parseTaskTitle("---\ntitle: Frontmatter task\nowner: test\n---\n# Heading task\n"),
+		"Frontmatter task",
+		"valid frontmatter title must take precedence over the first H1",
+	);
+	assert.equal(parseTaskTitle("---\ntitle: 'Quoted task'\n---\n"), "Quoted task");
+	assert.equal(parseTaskTitle("Task details without an explicit title\n"), undefined);
+	assert.equal(parseTaskTitle("---\ntitle: Broken task\n# Missing closing delimiter\n"), undefined);
+	assert.equal(parseTaskTitle("---\ntitle: First\ntitle: Second\n---\n# Heading\n"), undefined);
+	assert.equal(parseTaskTitle(`# ${"x".repeat(201)}\n`), undefined);
+	assert.equal(parseTaskTitle("# Binary\0task\n"), undefined);
+
+	const taskMetadataDirectory = join(gitIdentityDirectory, "task metadata cases");
+	await mkdir(taskMetadataDirectory);
+	assert.equal(await discoverTaskTitle(taskMetadataDirectory), undefined, "absent TASK.md must preserve session-name fallback");
+	await writeFile(join(taskMetadataDirectory, "TASK.md"), "---\ntitle: Valid task title\n---\n# Ignored heading\n");
+	assert.equal(await discoverTaskTitle(taskMetadataDirectory), "Valid task title");
+	await writeFile(join(taskMetadataDirectory, "TASK.md"), "---\ntitle: Malformed without closing frontmatter\n# Heading\n");
+	assert.equal(await discoverTaskTitle(taskMetadataDirectory), undefined, "malformed task metadata must preserve session-name fallback");
+	await writeFile(join(taskMetadataDirectory, "TASK.md"), `# Oversized\n${"x".repeat(16_384)}\n`);
+	assert.equal(await discoverTaskTitle(taskMetadataDirectory), undefined, "oversized task metadata must be ignored");
+	await writeFile(join(taskMetadataDirectory, "TASK.md"), Buffer.from([0x23, 0x20, 0xff, 0x0a]));
+	assert.equal(await discoverTaskTitle(taskMetadataDirectory), undefined, "non-UTF-8 task metadata must be ignored");
+	await rm(join(taskMetadataDirectory, "TASK.md"));
+	const outsideTaskFile = join(gitIdentityDirectory, "outside TASK.md");
+	await writeFile(outsideTaskFile, "# Unsafe external title\n");
+	await symlink(outsideTaskFile, join(taskMetadataDirectory, "TASK.md"));
+	assert.equal(await discoverTaskTitle(taskMetadataDirectory), undefined, "symlinked task metadata outside the checkout must be ignored");
+	await writeFile(join(linkedWorktree, "TASK.md"), "# Implement task-title thread naming\n");
+	assert.equal(await discoverTaskTitle(linkedContext.checkoutRoot), "Implement task-title thread naming");
 
 	const submoduleSource = join(gitIdentityDirectory, "submodule source");
 	await mkdir(submoduleSource);
@@ -446,6 +482,10 @@ try {
 	assert.match(collidingProjectChannelName("/tmp/另一个项目"), /^project-[a-f0-9]{8}$/);
 	assert.equal(projectChannelName("/tmp/Café déjà"), "cafe-deja");
 	assert.match(sessionThreadName("12345678-abcd", "Fix Things"), /^pi-fix-things-12345678$/);
+	assert.equal(sessionThreadName("12345678-abcd"), "pi-session-12345678");
+	assert.equal(sessionThreadName("aaaaaaaa-1111", "Shared task"), "pi-shared-task-aaaaaaaa");
+	assert.equal(sessionThreadName("bbbbbbbb-2222", "Shared task"), "pi-shared-task-bbbbbbbb");
+	assert.notEqual(sessionThreadName("aaaaaaaa-1111", "Shared task"), sessionThreadName("bbbbbbbb-2222", "Shared task"));
 	assert.equal(assistantText({
 		role: "assistant",
 		stopReason: "stop",
@@ -934,6 +974,22 @@ try {
 		sessionName: "Second session",
 	});
 	await second.emit("session_start", { reason: "startup" });
+	const taskNamed = createExtensionHarness(extension, {
+		cwd: linkedSubdirectory,
+		sessionId: "tasktitle-33333333",
+		sessionName: "Generic Pi session",
+	});
+	await taskNamed.emit("session_start", { reason: "startup" });
+	const taskNamedMapping = await new DiscordStateStore(stateFile).getSession("tasktitle-33333333");
+	const taskThreadName = sessionThreadName("tasktitle-33333333", "Implement task-title thread naming");
+	assert.ok(FakeGateway.instances[0].threadRequests.some((request) => request.name === taskThreadName), "explicit worktree task title must override the Pi session name at registration");
+	await writeFile(join(linkedWorktree, "TASK.md"), "# A changed task title must not rename an existing thread\n");
+	await taskNamed.runCommand("discord", "reconnect");
+	assert.equal(
+		(await new DiscordStateStore(stateFile).getSession("tasktitle-33333333")).threadId,
+		taskNamedMapping.threadId,
+		"rediscovered task titles must not rename an existing session thread",
+	);
 	assert.equal(FakeGateway.instances.length, 1, "concurrent Pi clients must share one Discord gateway");
 	assert.equal(FakeGateway.activeConnections, 1);
 	assert.equal(FakeGateway.maximumActiveConnections, 1);
@@ -949,6 +1005,10 @@ try {
 
 	assert.deepEqual(first.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
 	assert.deepEqual(second.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
+	assert.deepEqual(taskNamed.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
+	assert.ok(FakeGateway.instances[0].threadRequests.some(
+		(request) => request.name === sessionThreadName("session-11111111", "First session"),
+	), "absent task metadata must preserve the Pi session name");
 	const firstMapping = await new DiscordStateStore(stateFile).getSession("session-11111111");
 	const secondMapping = await new DiscordStateStore(stateFile).getSession("session-22222222");
 	const { channelId: firstChannel, threadId: firstThread } = firstMapping;
@@ -1202,6 +1262,7 @@ try {
 	await waitFor(() => resumed.entries.some((entry) => entry.data?.messageId === "30"), "queued Pi acceptance receipt");
 	await resumed.emit("session_shutdown", { reason: "quit" });
 
+	await taskNamed.emit("session_shutdown", { reason: "quit" });
 	await second.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "zero-client relay child shutdown");
 	FakeGateway.catchUpByThread.set(inactiveThread, [
@@ -1269,7 +1330,7 @@ try {
 	assert.equal(rolloverA.statuses.at(-1)?.[1], "💬");
 	await rolloverA.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "rollover relay shutdown");
-	for (const harness of [first, second, failedInjection, retriedInjection, inactive, resumed, restarted, rolloverA, rolloverB]) {
+	for (const harness of [first, second, taskNamed, failedInjection, retriedInjection, inactive, resumed, restarted, rolloverA, rolloverB]) {
 		for (const [key, text] of harness.statuses) {
 			assert.equal(key, PACKAGE_FOOTER_STATUS_KEYS.discord);
 			assert.ok(text === undefined || text === "💬" || text === "🔄" || text === "⚠️", `footer status must be compact: ${text}`);
