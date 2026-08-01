@@ -12,6 +12,8 @@ const CONNECT_RETRY_MIN_MS = 25;
 const CONNECT_RETRY_MAX_MS = 500;
 const INITIAL_CONNECT_ATTEMPTS = 120;
 const REQUEST_TIMEOUT_MS = 30_000;
+const ACK_TIMEOUT_MS = 2_000;
+const SHUTDOWN_TIMEOUT_MS = 2_000;
 
 export interface RelayClientStatus {
 	connected: boolean;
@@ -21,14 +23,15 @@ export interface RelayClientStatus {
 }
 
 export interface RelayClientCallbacks {
-	onInbound(text: string): void | Promise<void>;
+	onInbound(messageId: string, text: string): void | Promise<void>;
 	onError(error: Error): void;
 	onStatus(status: RelayClientStatus): void;
 }
 
 export interface RelayClientDependencies {
 	paths: RelayPaths;
-	createHost(lease: LeaderLease, token: string, fingerprint: string): LocalRelayHost;
+	createHost(lease: LeaderLease, token: string, fingerprint: string, config: DiscordBridgeConfig): LocalRelayHost;
+	reloadConfig?: () => Promise<DiscordBridgeConfig>;
 }
 
 interface PendingRequest {
@@ -52,26 +55,40 @@ function asError(error: unknown): Error {
 
 class FatalRelayConnectionError extends Error {}
 
+async function bounded<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(() => reject(new Error(message)), milliseconds);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 export class LocalRelayClient {
 	private readonly clientId = randomUUID();
-	private readonly fingerprint: string;
+	private config: DiscordBridgeConfig;
+	private fingerprint: string;
 	private token: string | undefined;
 	private socket: Socket | undefined;
 	private ownedHost: LocalRelayHost | undefined;
 	private connecting: Promise<void> | undefined;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly pendingRequests = new Map<string, PendingRequest>();
-	private readonly pendingInboundAcks = new Set<string>();
-	private readonly inboundAckWaiters = new Set<() => void>();
 	private currentStatus: RelayClientStatus = { connected: false };
 	private stopped = true;
 
 	constructor(
-		private readonly config: DiscordBridgeConfig,
+		config: DiscordBridgeConfig,
 		private readonly registration: RelaySessionRegistration,
 		private readonly callbacks: RelayClientCallbacks,
 		private readonly dependencies: RelayClientDependencies,
 	) {
+		this.config = config;
 		this.fingerprint = configFingerprint(config);
 	}
 
@@ -88,13 +105,12 @@ export class LocalRelayClient {
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 		this.reconnectTimer = undefined;
 		const socket = this.socket;
-		if (socket && !socket.destroyed) await this.waitForInboundAcks();
 		this.socket = undefined;
 		if (socket && !socket.destroyed) {
 			const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
 			socket.write(encodeFrame({ type: "unregister" }));
 			socket.end();
-			await closed;
+			await bounded(closed, SHUTDOWN_TIMEOUT_MS, "Timed out closing local Discord relay socket").catch(() => socket.destroy());
 		}
 		this.rejectPending(new Error("Local Discord relay client stopped"));
 		const host = this.ownedHost;
@@ -111,13 +127,15 @@ export class LocalRelayClient {
 	}
 
 	async sendUserText(text: string): Promise<void> {
-		if (!text.trim()) return;
-		await this.sendRequest("user_text", text);
+		await this.queueOutbound("user", text);
 	}
 
 	async sendAssistantText(text: string): Promise<void> {
-		if (!text.trim()) return;
-		await this.sendRequest("assistant_text", text);
+		await this.queueOutbound("assistant", text);
+	}
+
+	async acknowledgeInbound(messageId: string): Promise<void> {
+		await this.sendRequest({ type: "ack_inbound", requestId: randomUUID(), messageId }, ACK_TIMEOUT_MS);
 	}
 
 	private ensureConnected(): Promise<void> {
@@ -133,6 +151,10 @@ export class LocalRelayClient {
 		let lastError = new Error("Local Discord relay is unavailable");
 		for (let attempt = 0; attempt < INITIAL_CONNECT_ATTEMPTS && !this.stopped; attempt++) {
 			try {
+				if (this.dependencies.reloadConfig) {
+					this.config = await this.dependencies.reloadConfig();
+					this.fingerprint = configFingerprint(this.config);
+				}
 				await this.connectOnce();
 				return;
 			} catch (error) {
@@ -143,7 +165,7 @@ export class LocalRelayClient {
 			if (!this.ownedHost) {
 				const lease = await tryAcquireLeader(this.dependencies.paths);
 				if (lease) {
-					const host = this.dependencies.createHost(lease, this.token!, this.fingerprint);
+					const host = this.dependencies.createHost(lease, this.token!, this.fingerprint, this.config);
 					try {
 						await host.start();
 						this.ownedHost = host;
@@ -164,6 +186,7 @@ export class LocalRelayClient {
 	private connectOnce(): Promise<void> {
 		return new Promise<void>((resolve, reject) => {
 			const socket = createConnection(this.dependencies.paths.socket);
+			const generation = randomUUID();
 			socket.setEncoding("utf8");
 			let settled = false;
 			let buffer = "";
@@ -194,7 +217,9 @@ export class LocalRelayClient {
 					type: "register",
 					token: this.token!,
 					clientId: this.clientId,
+					generation,
 					configFingerprint: this.fingerprint,
+					configEpoch: this.config.epoch,
 					...this.registration,
 				};
 				socket.write(encodeFrame(frame));
@@ -225,8 +250,6 @@ export class LocalRelayClient {
 				}
 				if (this.socket !== socket) return;
 				this.socket = undefined;
-				this.pendingInboundAcks.clear();
-				this.notifyInboundAckWaiters();
 				this.updateStatus({ connected: false });
 				this.rejectPending(new Error("Local Discord relay connection closed"));
 				if (!this.stopped) {
@@ -263,23 +286,18 @@ export class LocalRelayClient {
 		}
 		if (frame.type === "inbound") {
 			try {
-				this.pendingInboundAcks.add(frame.messageId);
-				const delivery = this.callbacks.onInbound(frame.text);
-				if (delivery instanceof Promise) await delivery;
-				socket.write(encodeFrame({ type: "ack_inbound", messageId: frame.messageId }));
+				await this.callbacks.onInbound(frame.messageId, frame.text);
 			} catch (error) {
-				this.pendingInboundAcks.delete(frame.messageId);
-				this.notifyInboundAckWaiters();
 				this.callbacks.onError(asError(error));
 			}
 			return;
 		}
-		if (frame.type === "inbound_acked") {
-			this.pendingInboundAcks.delete(frame.messageId);
-			this.notifyInboundAckWaiters();
+		if (frame.type === "replacing") {
+			socket.destroy();
+			waiter.reject(new Error(`Local Discord relay is replacing configuration with epoch ${frame.configEpoch}`));
 			return;
 		}
-		if (frame.type === "sent") {
+		if (frame.type === "inbound_acked" || frame.type === "outbound_queued") {
 			const pending = this.pendingRequests.get(frame.requestId);
 			if (pending) {
 				clearTimeout(pending.timer);
@@ -289,19 +307,33 @@ export class LocalRelayClient {
 		}
 	}
 
-	private async sendRequest(type: "user_text" | "assistant_text", text: string): Promise<void> {
+	private async queueOutbound(kind: "user" | "assistant", text: string): Promise<void> {
+		if (!text.trim()) return;
+		const messageId = randomUUID();
+		for (;;) {
+			if (this.stopped) throw new Error("Local Discord relay client is stopped");
+			try {
+				await this.sendRequest({ type: "outbound", requestId: randomUUID(), messageId, kind, text }, REQUEST_TIMEOUT_MS);
+				return;
+			} catch (error) {
+				if (this.stopped) throw error;
+				await this.ensureConnected();
+			}
+		}
+	}
+
+	private async sendRequest(frame: Extract<ClientFrame, { requestId: string }>, timeoutMs: number): Promise<void> {
 		if (this.stopped) throw new Error("Local Discord relay client is stopped");
 		await this.ensureConnected();
 		const socket = this.socket;
 		if (!socket || socket.destroyed) throw new Error("Local Discord relay is disconnected");
-		const requestId = randomUUID();
 		await new Promise<void>((resolve, reject) => {
 			const timer = setTimeout(() => {
-				this.pendingRequests.delete(requestId);
-				reject(new Error(`Local Discord relay request timed out after ${REQUEST_TIMEOUT_MS}ms`));
-			}, REQUEST_TIMEOUT_MS);
-			this.pendingRequests.set(requestId, { resolve, reject, timer });
-			socket.write(encodeFrame({ type, requestId, text }));
+				this.pendingRequests.delete(frame.requestId);
+				reject(new Error(`Local Discord relay request timed out after ${timeoutMs}ms`));
+			}, timeoutMs);
+			this.pendingRequests.set(frame.requestId, { resolve, reject, timer });
+			socket.write(encodeFrame(frame));
 		});
 	}
 
@@ -315,17 +347,6 @@ export class LocalRelayClient {
 				if (!(failure instanceof FatalRelayConnectionError)) this.scheduleReconnect();
 			});
 		}, CONNECT_RETRY_MIN_MS);
-	}
-
-	private waitForInboundAcks(): Promise<void> {
-		if (this.pendingInboundAcks.size === 0) return Promise.resolve();
-		return new Promise((resolve) => this.inboundAckWaiters.add(resolve));
-	}
-
-	private notifyInboundAckWaiters(): void {
-		if (this.pendingInboundAcks.size > 0) return;
-		for (const resolve of this.inboundAckWaiters) resolve();
-		this.inboundAckWaiters.clear();
 	}
 
 	private rejectPending(error: Error): void {

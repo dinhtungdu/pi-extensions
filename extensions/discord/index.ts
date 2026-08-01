@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DiscordBridge, type BridgeSession } from "./bridge.js";
+import { DiscordBridge, inboundMessageId, stripInboundMarker, type BridgeSession } from "./bridge.js";
 import {
 	DISCORD_CONFIG_FILE,
 	type DiscordBridgeConfig,
@@ -14,12 +14,13 @@ import { DiscordRelayCore } from "./relay-core.js";
 import { LocalRelayHost } from "./relay-host.js";
 
 const STATUS_KEY = "discord-bridge";
+const ACCEPTED_INBOUND_ENTRY = "discord-bridge-inbound-accepted";
 
 type ConfigLoader = () => Promise<DiscordBridgeConfig | null>;
 
 export interface DiscordExtensionDependencies {
 	loadConfig?: ConfigLoader;
-	saveConfig?: (config: DiscordBridgeConfig) => Promise<void>;
+	saveConfig?: (config: Omit<DiscordBridgeConfig, "epoch"> | DiscordBridgeConfig) => Promise<void>;
 	paths?: RelayPaths;
 	createStateStore?: () => DiscordStateStore;
 	createTransport?: () => DiscordTransport;
@@ -39,6 +40,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 	return function discordExtension(pi: ExtensionAPI): void {
 		let bridge: DiscordBridge | undefined;
 		let operation: Promise<void> = Promise.resolve();
+		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
 
 		function sessionFrom(ctx: ExtensionContext): BridgeSession {
 			return {
@@ -99,12 +101,30 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				},
 				{
 					paths,
-					createHost(lease, token, fingerprint) {
-						const core = new DiscordRelayCore(config!, createStateStore(), createTransport());
-						return new LocalRelayHost({ paths, token, configFingerprint: fingerprint, lease, core });
+					reloadConfig: async () => (await loadConfig()) ?? config!,
+					createHost(lease, token, fingerprint, hostConfig) {
+						let host: LocalRelayHost;
+						const core = new DiscordRelayCore(hostConfig, createStateStore(), createTransport(), (error) => {
+							ctx.ui.notify(`Discord relay gateway failed: ${error.message}`, "error");
+							void host?.stop();
+						});
+						host = new LocalRelayHost({
+							paths,
+							token,
+							configFingerprint: fingerprint,
+							configEpoch: hostConfig.epoch,
+							lease,
+							core,
+						});
+						return host;
 					},
 				},
 			);
+			const acceptedIds = ctx.sessionManager.getBranch()
+				.filter((entry) => entry.type === "custom" && entry.customType === ACCEPTED_INBOUND_ENTRY)
+				.map((entry) => (entry as { data?: { messageId?: unknown } }).data?.messageId)
+				.filter((id): id is string => typeof id === "string");
+			candidate.restoreAcceptedInbound(acceptedIds);
 			try {
 				bridge = candidate;
 				await candidate.start();
@@ -161,6 +181,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		});
 
 		pi.on("session_shutdown", async (_event, ctx) => {
+			for (const timer of inboundAcceptanceTimers) clearTimeout(timer);
+			inboundAcceptanceTimers.clear();
 			await serialize(() => stopBridge(ctx));
 		});
 
@@ -174,12 +196,42 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			return { action: "continue" };
 		});
 
+		pi.on("context", (event) => ({
+			messages: event.messages.map((message) => {
+				if (message.role !== "user") return message;
+				if (typeof message.content === "string") return { ...message, content: stripInboundMarker(message.content) };
+				return {
+					...message,
+					content: message.content.map((part) => part.type === "text" ? { ...part, text: stripInboundMarker(part.text) } : part),
+				};
+			}),
+		}));
+
 		pi.on("before_agent_start", () => {
 			bridge?.beginAgentRun();
 		});
 
-		pi.on("message_end", (event) => {
-			bridge?.captureAssistantMessage(event.message);
+		pi.on("message_end", (event, ctx) => {
+			if (event.message.role === "assistant") {
+				bridge?.captureAssistantMessage(event.message);
+				return;
+			}
+			if (event.message.role !== "user" || !bridge) return;
+			const text = typeof event.message.content === "string"
+				? event.message.content
+				: event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+			const messageId = inboundMessageId(text);
+			if (!messageId) return;
+			const acceptingBridge = bridge;
+			// Pi 0.83 persists the user message immediately after message_end handlers return.
+			const timer = setTimeout(() => {
+				inboundAcceptanceTimers.delete(timer);
+				pi.appendEntry(ACCEPTED_INBOUND_ENTRY, { messageId });
+				void acceptingBridge.confirmInboundAccepted(messageId).catch((error) => {
+					ctx.ui.notify(`Discord inbound acknowledgement deferred: ${errorMessage(error)}`, "warning");
+				});
+			}, 0);
+			inboundAcceptanceTimers.add(timer);
 		});
 
 		pi.on("agent_settled", async (_event, ctx) => {

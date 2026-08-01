@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -7,6 +7,7 @@ export interface DiscordBridgeConfig {
 	token: string;
 	guildId: string;
 	categoryId?: string;
+	epoch: number;
 }
 
 export const DISCORD_BRIDGE_DIR = join(homedir(), ".pi", "agent", "discord-bridge");
@@ -92,10 +93,13 @@ export function parseDiscordConfig(value: unknown): DiscordBridgeConfig {
 	}
 	const candidate = value as Record<string, unknown>;
 	const categoryId = optionalString(candidate.categoryId);
+	const epoch = candidate.epoch === undefined ? 0 : Number(candidate.epoch);
+	if (!Number.isSafeInteger(epoch) || epoch < 0) throw new Error("Discord bridge config epoch must be a non-negative integer");
 	return {
 		token: requiredString(candidate.token, "token"),
 		guildId: discordId(candidate.guildId, "guildId"),
 		...(categoryId ? { categoryId: discordId(categoryId, "categoryId") } : {}),
+		epoch,
 	};
 }
 
@@ -104,12 +108,14 @@ export async function loadDiscordConfig(
 	environment: NodeJS.ProcessEnv = process.env,
 ): Promise<DiscordBridgeConfig | null> {
 	let fromFile: Record<string, unknown> = {};
+	let fileEpoch = 0;
 	try {
 		const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 			throw new Error("config must be a JSON object");
 		}
 		fromFile = parsed as Record<string, unknown>;
+		fileEpoch = Math.floor((await stat(file)).mtimeMs);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 			throw new Error(`Cannot read Discord bridge config ${file}: ${error instanceof Error ? error.message : String(error)}`);
@@ -122,15 +128,43 @@ export async function loadDiscordConfig(
 	const categoryId = categoryOverride ?? fromFile.categoryId;
 
 	if (!token && !guildId && !categoryId) return null;
-	return parseDiscordConfig({ token, guildId, categoryId });
+	const configuredEpoch = Number.isSafeInteger(fromFile.epoch) ? Number(fromFile.epoch) : 0;
+	return parseDiscordConfig({ token, guildId, categoryId, epoch: Math.max(configuredEpoch, fileEpoch) });
 }
 
-export async function saveDiscordConfig(config: DiscordBridgeConfig, file = DISCORD_CONFIG_FILE): Promise<void> {
-	const validated = parseDiscordConfig(config);
+export async function saveDiscordConfig(config: Omit<DiscordBridgeConfig, "epoch"> | DiscordBridgeConfig, file = DISCORD_CONFIG_FILE): Promise<void> {
 	await mkdir(dirname(file), { recursive: true, mode: 0o700 });
 	await chmod(dirname(file), 0o700);
-	const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-	await writeFile(temporary, `${JSON.stringify(validated, null, "\t")}\n`, { mode: 0o600 });
-	await rename(temporary, file);
-	await chmod(file, 0o600);
+	const lockFile = `${file}.lock`;
+	let lock;
+	for (let attempt = 0; !lock && attempt < 200; attempt++) {
+		try {
+			lock = await open(lockFile, "wx", 0o600);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const lockStat = await stat(lockFile).catch(() => undefined);
+			if (lockStat && Date.now() - lockStat.mtimeMs > 30_000) await unlink(lockFile).catch(() => {});
+			await wait(25);
+		}
+	}
+	if (!lock) throw new Error(`Timed out waiting for Discord bridge config lock ${lockFile}`);
+	try {
+		let previousEpoch = -1;
+		try {
+			const existing = JSON.parse(await readFile(file, "utf8")) as { epoch?: unknown };
+			const storedEpoch = Number.isSafeInteger(existing.epoch) && Number(existing.epoch) >= 0 ? Number(existing.epoch) : 0;
+			previousEpoch = Math.max(storedEpoch, Math.floor((await stat(file)).mtimeMs));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") previousEpoch = -1;
+		}
+		const requestedEpoch = "epoch" in config ? config.epoch : 0;
+		const validated = parseDiscordConfig({ ...config, epoch: Math.max(previousEpoch + 1, requestedEpoch) });
+		const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+		await writeFile(temporary, `${JSON.stringify(validated, null, "\t")}\n`, { mode: 0o600 });
+		await rename(temporary, file);
+		await chmod(file, 0o600);
+	} finally {
+		await lock.close();
+		await unlink(lockFile).catch(() => {});
+	}
 }

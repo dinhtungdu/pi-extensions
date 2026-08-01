@@ -38,7 +38,8 @@ export interface DiscordTransport {
 	ensureProjectChannel(request: ProjectChannelRequest): Promise<string>;
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
-	sendText(channelId: string, text: string): Promise<void>;
+	sendText(channelId: string, text: string, nonce: string): Promise<string>;
+	onTerminalError(listener: (error: Error) => void): () => void;
 }
 
 export function assertConfiguredCategory(
@@ -68,9 +69,37 @@ export async function reuseSessionThread(
 	return thread.id;
 }
 
+function compareIds(left: string, right: string): number {
+	try {
+		return BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0;
+	} catch {
+		return left.localeCompare(right);
+	}
+}
+
+export async function collectChronologicalMessages(
+	fetchPage: (options: { after?: string; before?: string; limit: 100 }) => Promise<DiscordInboundMessage[]>,
+	afterId?: string,
+): Promise<DiscordInboundMessage[]> {
+	let page = await fetchPage({ ...(afterId ? { after: afterId } : {}), limit: 100 });
+	const collected = new Map(page.map((message) => [message.id, message]));
+	if (!afterId) return [...collected.values()].sort((left, right) => compareIds(left.id, right.id));
+	for (let pages = 1; page.length === 100; pages++) {
+		if (pages >= 1_000) throw new Error("Discord catch-up exceeded 100,000 messages; cursor was not advanced");
+		const oldest = [...page].sort((left, right) => compareIds(left.id, right.id))[0]!.id;
+		const older = await fetchPage({ before: oldest, limit: 100 });
+		const eligible = older.filter((message) => compareIds(message.id, afterId) > 0);
+		for (const message of eligible) collected.set(message.id, message);
+		if (older.length < 100 || eligible.length < older.length) break;
+		page = older;
+	}
+	return [...collected.values()].sort((left, right) => compareIds(left.id, right.id));
+}
+
 export class DiscordJsTransport implements DiscordTransport {
 	private client: Client | undefined;
 	private readonly listeners = new Set<(message: DiscordInboundMessage) => void>();
+	private readonly terminalListeners = new Set<(error: Error) => void>();
 
 	async connect(config: DiscordBridgeConfig): Promise<void> {
 		if (this.client) throw new Error("Discord transport is already connected");
@@ -80,6 +109,15 @@ export class DiscordJsTransport implements DiscordTransport {
 		this.client = client;
 		client.on(Events.Error, (error) => {
 			console.error("[discord-bridge] Discord client error:", error);
+		});
+		client.on(Events.Invalidated, () => {
+			const error = new Error("Discord gateway session was invalidated");
+			for (const listener of this.terminalListeners) listener(error);
+		});
+		client.on(Events.ShardDisconnect, (event) => {
+			if (![4_004, 4_010, 4_011, 4_013, 4_014].includes(event.code)) return;
+			const error = new Error(`Discord gateway closed terminally with code ${event.code}`);
+			for (const listener of this.terminalListeners) listener(error);
 		});
 		client.on(Events.MessageCreate, (message) => {
 			const normalized: DiscordInboundMessage = {
@@ -163,32 +201,34 @@ export class DiscordJsTransport implements DiscordTransport {
 		if (!channel?.isTextBased() || channel.isDMBased()) {
 			throw new Error(`Discord thread ${channelId} is missing or cannot fetch messages`);
 		}
-		const result: DiscordInboundMessage[] = [];
-		let cursor = afterId;
-		for (let page = 0; page < 100; page++) {
-			const messages = await channel.messages.fetch({ after: cursor, limit: 100 });
-			const ordered = [...messages.values()].sort((left, right) => left.createdTimestamp - right.createdTimestamp);
-			if (ordered.length === 0) break;
-			for (const message of ordered) {
-				result.push({
-					id: message.id,
-					channelId: message.channelId,
-					content: message.content,
-					authorBot: message.author.bot,
-				});
-			}
-			cursor = ordered.at(-1)!.id;
-			if (ordered.length < 100) break;
-		}
-		return result;
+		return collectChronologicalMessages(async (options) => {
+			const messages = await channel.messages.fetch(options);
+			return [...messages.values()].map((message) => ({
+				id: message.id,
+				channelId: message.channelId,
+				content: message.content,
+				authorBot: message.author.bot,
+			}));
+		}, afterId);
 	}
 
-	async sendText(channelId: string, text: string): Promise<void> {
+	async sendText(channelId: string, text: string, nonce: string): Promise<string> {
 		const channel = await this.readyClient().channels.fetch(channelId).catch(() => null);
 		if (!channel?.isTextBased() || channel.isDMBased()) {
 			throw new Error(`Discord thread ${channelId} is missing or cannot receive messages`);
 		}
-		await channel.send({ content: text, allowedMentions: { parse: [] } });
+		const message = await channel.send({
+			content: text,
+			nonce,
+			enforceNonce: true,
+			allowedMentions: { parse: [] },
+		});
+		return message.id;
+	}
+
+	onTerminalError(listener: (error: Error) => void): () => void {
+		this.terminalListeners.add(listener);
+		return () => this.terminalListeners.delete(listener);
 	}
 
 	private readyClient(): Client<true> {

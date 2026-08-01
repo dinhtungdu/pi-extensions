@@ -23,7 +23,7 @@ function compileExtensions() {
 
 async function waitFor(predicate, description) {
 	for (let attempt = 0; attempt < 500; attempt++) {
-		if (predicate()) return;
+		if (await predicate()) return;
 		await new Promise((resolveWait) => setTimeout(resolveWait, 10));
 	}
 	throw new Error(`Timed out waiting for ${description}`);
@@ -34,9 +34,12 @@ class FakeGateway {
 	static activeConnections = 0;
 	static maximumActiveConnections = 0;
 	static catchUpByThread = new Map();
+	static nonceResults = new Map();
+	static failSendAt = undefined;
 
 	connected = false;
 	listeners = new Set();
+	terminalListeners = new Set();
 	projectRequests = [];
 	threadRequests = [];
 	sent = [];
@@ -88,8 +91,23 @@ class FakeGateway {
 		});
 	}
 
-	async sendText(channelId, text) {
-		this.sent.push({ channelId, text });
+	async sendText(channelId, text, nonce) {
+		const existing = FakeGateway.nonceResults.get(nonce);
+		if (existing) return existing;
+		if (FakeGateway.failSendAt === this.sent.length) throw new Error("injected Discord send failure");
+		const id = `sent-${FakeGateway.nonceResults.size + 1}`;
+		this.sent.push({ channelId, text, nonce, id });
+		FakeGateway.nonceResults.set(nonce, id);
+		return id;
+	}
+
+	onTerminalError(listener) {
+		this.terminalListeners.add(listener);
+		return () => this.terminalListeners.delete(listener);
+	}
+
+	terminal(error = new Error("injected terminal gateway failure")) {
+		for (const listener of this.terminalListeners) listener(error);
 	}
 
 	async emit(message) {
@@ -97,7 +115,7 @@ class FakeGateway {
 	}
 }
 
-function createExtensionHarness(extension, { cwd, sessionId, sessionName }) {
+function createExtensionHarness(extension, { cwd, sessionId, sessionName, entries = [] }) {
 	const events = new Map();
 	const commands = new Map();
 	const notifications = [];
@@ -105,6 +123,7 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName }) {
 	const userMessages = [];
 	const userWaiters = [];
 	let idle = true;
+	let injectionError = false;
 	const pi = {
 		on(name, handler) {
 			const handlers = events.get(name) ?? [];
@@ -115,6 +134,7 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName }) {
 			commands.set(name, definition);
 		},
 		sendUserMessage(text, options) {
+			if (injectionError) throw new Error("injected Pi acceptance failure");
 			const message = { text, options };
 			userMessages.push(message);
 			userWaiters.shift()?.(message);
@@ -122,12 +142,15 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName }) {
 		getSessionName() {
 			return sessionName;
 		},
+		appendEntry(customType, data) {
+			entries.push({ type: "custom", customType, data });
+		},
 	};
 	const ctx = {
 		cwd,
 		hasUI: true,
 		isIdle: () => idle,
-		sessionManager: { getSessionId: () => sessionId },
+		sessionManager: { getSessionId: () => sessionId, getBranch: () => entries },
 		ui: {
 			notify: (...args) => notifications.push(args),
 			setStatus: (...args) => statuses.push(args),
@@ -140,7 +163,9 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName }) {
 		notifications,
 		statuses,
 		userMessages,
+		entries,
 		setIdle(value) { idle = value; },
+		setInjectionError(value) { injectionError = value; },
 		nextUserMessage() {
 			return new Promise((resolveMessage) => userWaiters.push(resolveMessage));
 		},
@@ -159,16 +184,20 @@ try {
 		loadDiscordConfig,
 		parseDiscordConfig,
 		relayPaths,
+		saveDiscordConfig,
 	} = await importBuilt("extensions/discord/config.js");
 	const { DiscordStateStore } = await importBuilt("extensions/discord/state.js");
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
+	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
+	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const { tryAcquireLeader } = await importBuilt("extensions/discord/leader.js");
 	const { assistantText, projectChannelName, sessionThreadName, splitDiscordText } = await importBuilt("extensions/discord/text.js");
-	const { assertConfiguredCategory, reuseSessionThread } = await importBuilt("extensions/discord/transport.js");
+	const { assertConfiguredCategory, collectChronologicalMessages, reuseSessionThread } = await importBuilt("extensions/discord/transport.js");
 
 	assert.deepEqual(parseDiscordConfig({ token: " token ", guildId: "12345", categoryId: "" }), {
 		token: "token",
 		guildId: "12345",
+		epoch: 0,
 	});
 	assert.throws(
 		() => parseDiscordConfig({ token: "token", guildId: "12345", categoryId: "not-an-id" }),
@@ -195,6 +224,11 @@ try {
 	const malformedConfig = join(dataDir, "malformed-config.json");
 	await writeFile(malformedConfig, "{oops");
 	await assert.rejects(() => loadDiscordConfig(malformedConfig, {}), /Cannot read Discord bridge config/);
+	const epochConfig = join(dataDir, "epoch-config.json");
+	await saveDiscordConfig({ token: "one", guildId: "12345" }, epochConfig);
+	const firstEpoch = (await loadDiscordConfig(epochConfig, {})).epoch;
+	await saveDiscordConfig({ token: "two", guildId: "12345" }, epochConfig);
+	assert.ok((await loadDiscordConfig(epochConfig, {})).epoch > firstEpoch, "serialized config writes must advance the relay epoch");
 
 	assert.equal(projectChannelName("/one/My Project"), projectChannelName("/one/My Project"));
 	assert.notEqual(projectChannelName("/one/project"), projectChannelName("/two/project"));
@@ -213,6 +247,62 @@ try {
 	assert.equal(chunks.join(""), "a".repeat(4_100));
 	assert.ok(chunks.every((chunk) => chunk.length <= 1_900));
 
+	const apiMessages = Array.from({ length: 250 }, (_, index) => ({
+		id: String(index + 1),
+		channelId: "pagination-thread",
+		content: `message-${index + 1}`,
+		authorBot: false,
+	}));
+	const paginationCalls = [];
+	const paginated = await collectChronologicalMessages(async (options) => {
+		paginationCalls.push(options);
+		return apiMessages
+			.filter((message) => options.after ? BigInt(message.id) > BigInt(options.after) : true)
+			.filter((message) => options.before ? BigInt(message.id) < BigInt(options.before) : true)
+			.sort((left, right) => Number(right.id) - Number(left.id))
+			.slice(0, options.limit);
+	}, "100");
+	assert.deepEqual(paginated.map((message) => message.id), Array.from({ length: 150 }, (_, index) => String(index + 101)));
+	assert.deepEqual(paginationCalls.map(({ after, before }) => ({ after, before })), [
+		{ after: "100", before: undefined },
+		{ after: undefined, before: "151" },
+	]);
+
+	const cursorState = new DiscordStateStore(join(dataDir, "cursor-state.json"));
+	await cursorState.resolveProjectChannel("/cursor", async () => "cursor-channel");
+	await cursorState.resolveSessionThread("cursor-session", "/cursor", "cursor-channel", async () => "cursor-thread");
+	await cursorState.recordDiscordMessage("cursor-session", {
+		id: "100",
+		channelId: "cursor-thread",
+		content: "",
+		authorBot: true,
+	});
+	FakeGateway.catchUpByThread.set(
+		"cursor-thread",
+		apiMessages.slice(100).map((message) => ({ ...message, channelId: "cursor-thread" })),
+	);
+	const persistCursorMessage = cursorState.recordDiscordMessage.bind(cursorState);
+	cursorState.recordDiscordMessage = async (sessionId, message) => {
+		if (message.id === "102") throw new Error("injected cursor persistence failure");
+		return persistCursorMessage(sessionId, message);
+	};
+	const cursorCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		cursorState,
+		new FakeGateway(),
+	);
+	await cursorCore.start();
+	await assert.rejects(
+		() => cursorCore.prepareRegistration("cursor-client", "cursor-generation", {
+			cwd: "/cursor",
+			sessionId: "cursor-session",
+		}),
+		/injected cursor persistence failure/,
+	);
+	assert.equal((await new DiscordStateStore(join(dataDir, "cursor-state.json")).getSession("cursor-session")).threadCursors["cursor-thread"], "101");
+	await cursorCore.stop();
+	FakeGateway.catchUpByThread.delete("cursor-thread");
+
 	const electionPaths = relayPaths(join(dataDir, "election"));
 	const contenders = await Promise.all([
 		tryAcquireLeader(electionPaths),
@@ -222,18 +312,85 @@ try {
 	const winningLeases = contenders.filter(Boolean);
 	assert.equal(winningLeases.length, 1, "atomic leader contention must produce exactly one winner");
 	await winningLeases[0].release();
-	await writeFile(electionPaths.leaderLock, JSON.stringify({ pid: 999_999_999, nonce: "stale", createdAt: 1 }));
+	await writeFile(electionPaths.leaderLock, JSON.stringify({
+		pid: process.pid,
+		nonce: "stale-reused-pid",
+		createdAt: 1,
+		processIdentity: "unrelated-process-with-reused-pid",
+	}));
 	assert.equal(await tryAcquireLeader(electionPaths), undefined, "first stale-owner pass performs guarded recovery");
 	const recoveredLease = await tryAcquireLeader(electionPaths);
 	assert.ok(recoveredLease, "next contender must acquire after stale-owner recovery");
 	await recoveredLease.release();
+
+	const remapState = new DiscordStateStore(join(dataDir, "remap-state.json"));
+	await remapState.resolveProjectChannel("/old", async () => "old-channel");
+	await remapState.resolveSessionThread("remapped-session", "/old", "old-channel", async () => "old-thread");
+	await remapState.recordDiscordMessage("remapped-session", {
+		id: "500",
+		channelId: "old-thread",
+		content: "preserve across remap",
+		authorBot: false,
+	});
+	await remapState.resolveSessionThread("remapped-session", "/new", "new-channel", async () => "new-thread");
+	const remapped = await remapState.getSession("remapped-session");
+	assert.deepEqual(remapped.pendingMessages, [{ id: "500", content: "preserve across remap" }]);
+	assert.equal(remapped.threadCursors["old-thread"], "500");
+	assert.equal(remapped.threadCursors["new-thread"], undefined);
+
+	const faultStateFile = join(dataDir, "fault-state.json");
+	const faultState = new DiscordStateStore(faultStateFile);
+	const faultGateway = new FakeGateway();
+	let terminalFailure;
+	const faultCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		faultState,
+		faultGateway,
+		(error) => { terminalFailure = error; },
+	);
+	await faultCore.start();
+	const faultRegistration = { cwd: "/fault", sessionId: "fault-session", sessionName: "Fault session" };
+	await faultCore.prepareRegistration("same-client", "generation-1", faultRegistration);
+	await faultCore.activateRegistration("same-client", "generation-1", "fault-session", () => {});
+	await faultCore.prepareRegistration("same-client", "generation-2", faultRegistration);
+	await faultCore.activateRegistration("same-client", "generation-2", "fault-session", () => {});
+	faultCore.unregisterClient("same-client", "generation-1");
+	const markChunkSent = faultState.markOutboundChunkSent.bind(faultState);
+	let failChunkPersistence = true;
+	faultState.markOutboundChunkSent = async (...args) => {
+		if (failChunkPersistence) {
+			failChunkPersistence = false;
+			throw new Error("injected crash after Discord accepted chunk");
+		}
+		return markChunkSent(...args);
+	};
+	const longOutbound = "x".repeat(4_000);
+	await faultCore.queueOutbound("same-client", "generation-2", "fault-session", "stable-outbound-id", "assistant", longOutbound);
+	await waitFor(() => terminalFailure, "fault-injected partial Discord send failure");
+	await faultCore.stop();
+	const retryGateway = new FakeGateway();
+	const retryCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		new DiscordStateStore(faultStateFile),
+		retryGateway,
+	);
+	await retryCore.start();
+	await waitFor(async () => !(await new DiscordStateStore(faultStateFile).nextOutbound()), "durable outbound retry completion");
+	const sentChunks = [...faultGateway.sent, ...retryGateway.sent];
+	assert.equal(sentChunks.map((message) => message.text).join(""), longOutbound, "partial retries must send each chunk once");
+	assert.equal(new Set(sentChunks.map((message) => message.nonce)).size, sentChunks.length, "chunk nonces must deduplicate retries");
+	await retryCore.stop();
+	FakeGateway.instances = [];
+	FakeGateway.activeConnections = 0;
+	FakeGateway.maximumActiveConnections = 0;
+	FakeGateway.nonceResults.clear();
 
 	const relayDirectory = join(dataDir, "shared-relay");
 	const paths = relayPaths(relayDirectory);
 	const stateFile = join(relayDirectory, "state.json");
 	const extension = createDiscordExtension({
 		paths,
-		loadConfig: async () => ({ token: "token", guildId: "12345", categoryId: "67890" }),
+		loadConfig: async () => ({ token: "token", guildId: "12345", categoryId: "67890", epoch: 1 }),
 		saveConfig: async () => {},
 		createStateStore: () => new DiscordStateStore(stateFile),
 		createTransport: () => new FakeGateway(),
@@ -272,7 +429,16 @@ try {
 	second.setIdle(false);
 	const routedSecond = second.nextUserMessage();
 	await gateway.emit({ id: "10", channelId: secondThread, content: "route to second", authorBot: false });
-	assert.deepEqual(await routedSecond, { text: "route to second", options: { deliverAs: "followUp" } });
+	const routedSecondMessage = await routedSecond;
+	assert.equal(stripInboundMarker(routedSecondMessage.text), "route to second");
+	assert.equal(inboundMessageId(routedSecondMessage.text), "10");
+	assert.deepEqual(routedSecondMessage.options, { deliverAs: "followUp" });
+	const contextResult = await second.emit("context", {
+		messages: [{ role: "user", content: [{ type: "text", text: routedSecondMessage.text }] }],
+	});
+	assert.equal(contextResult.messages[0].content[0].text, "route to second", "inbound receipt marker must not reach the model");
+	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: routedSecondMessage.text }] } });
+	await waitFor(() => second.entries.some((entry) => entry.data?.messageId === "10"), "durable Pi acceptance receipt");
 	assert.equal(first.userMessages.length, 0, "Discord input must route only to its Pi session");
 	await gateway.emit({ id: "10", channelId: secondThread, content: "duplicate", authorBot: false });
 	assert.equal(second.userMessages.length, 1, "duplicate Discord IDs must not deliver twice");
@@ -280,7 +446,9 @@ try {
 	assert.equal(second.userMessages.length, 1, "bot output must not loop back into Pi");
 
 	await first.emit("input", { text: "local input", source: "interactive" });
-	assert.deepEqual(gateway.sent.at(-1), { channelId: firstThread, text: "local input" });
+	await waitFor(() => gateway.sent.some((message) => message.text === "local input"), "durable outbound user send");
+	assert.equal(gateway.sent.at(-1).channelId, firstThread);
+	assert.equal(gateway.sent.at(-1).text, "local input");
 	const sentBeforeLoopCheck = gateway.sent.length;
 	await first.emit("input", { text: "Discord echo", source: "extension" });
 	assert.equal(gateway.sent.length, sentBeforeLoopCheck, "extension input must not loop back to Discord");
@@ -290,7 +458,37 @@ try {
 	});
 	assert.notEqual(gateway.sent.at(-1)?.text, "final only");
 	await first.emit("agent_settled", {});
+	await waitFor(() => gateway.sent.some((message) => message.text === "final only"), "durable final assistant send");
 	assert.equal(gateway.sent.at(-1)?.text, "final only", "assistant output must wait for agent_settled");
+
+	const failedInjection = createExtensionHarness(extension, {
+		cwd: "/work/failing",
+		sessionId: "session-44444444",
+		sessionName: "Failing injection",
+	});
+	await failedInjection.emit("session_start", { reason: "startup" });
+	const failedThread = failedInjection.statuses.findLast(([, text]) => text?.startsWith("Discord relay "))[1].split("/").at(-1);
+	failedInjection.setInjectionError(true);
+	await gateway.emit({ id: "15", channelId: failedThread, content: "must remain pending", authorBot: false });
+	await waitFor(() => failedInjection.notifications.some(([text]) => text.includes("injected Pi acceptance failure")), "Pi injection failure");
+	assert.equal(failedInjection.userMessages.length, 0);
+	const shutdownStarted = Date.now();
+	await failedInjection.emit("session_shutdown", { reason: "quit" });
+	assert.ok(Date.now() - shutdownStarted < 2_500, "unconfirmed inbound must not block shutdown");
+	const failedState = await new DiscordStateStore(stateFile).getSession("session-44444444");
+	assert.deepEqual(failedState.pendingMessages, [{ id: "15", content: "must remain pending" }]);
+	const retriedInjection = createExtensionHarness(extension, {
+		cwd: "/work/failing",
+		sessionId: "session-44444444",
+		sessionName: "Failing injection",
+	});
+	const retriedDelivery = retriedInjection.nextUserMessage();
+	await retriedInjection.emit("session_start", { reason: "resume" });
+	const retriedMessage = await retriedDelivery;
+	assert.equal(stripInboundMarker(retriedMessage.text), "must remain pending");
+	await retriedInjection.emit("message_end", { message: { role: "user", content: [{ type: "text", text: retriedMessage.text }] } });
+	await waitFor(() => retriedInjection.entries.some((entry) => entry.data?.messageId === "15"), "retried Pi acceptance receipt");
+	await retriedInjection.emit("session_shutdown", { reason: "quit" });
 
 	await first.emit("session_shutdown", { reason: "quit" });
 	await waitFor(
@@ -302,7 +500,10 @@ try {
 	const failoverGateway = FakeGateway.instances[1];
 	const afterFailover = second.nextUserMessage();
 	await failoverGateway.emit({ id: "20", channelId: secondThread, content: "after failover", authorBot: false });
-	assert.equal((await afterFailover).text, "after failover");
+	const afterFailoverMessage = await afterFailover;
+	assert.equal(stripInboundMarker(afterFailoverMessage.text), "after failover");
+	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: afterFailoverMessage.text }] } });
+	await waitFor(() => second.entries.some((entry) => entry.data?.messageId === "20"), "post-failover Pi acceptance receipt");
 
 	const inactive = createExtensionHarness(extension, {
 		cwd: "/work/inactive",
@@ -322,7 +523,10 @@ try {
 	});
 	const queuedDelivery = resumed.nextUserMessage();
 	await resumed.emit("session_start", { reason: "resume" });
-	assert.equal((await queuedDelivery).text, "queued while inactive", "inactive-session messages must queue durably");
+	const queuedMessage = await queuedDelivery;
+	assert.equal(stripInboundMarker(queuedMessage.text), "queued while inactive", "inactive-session messages must queue durably");
+	await resumed.emit("message_end", { message: { role: "user", content: [{ type: "text", text: queuedMessage.text }] } });
+	await waitFor(() => resumed.entries.some((entry) => entry.data?.messageId === "30"), "queued Pi acceptance receipt");
 	await resumed.emit("session_shutdown", { reason: "quit" });
 
 	await second.emit("session_shutdown", { reason: "quit" });
@@ -338,17 +542,58 @@ try {
 	});
 	const catchUpDelivery = restarted.nextUserMessage();
 	await restarted.emit("session_start", { reason: "resume" });
-	assert.equal((await catchUpDelivery).text, "missed while offline", "relay restart must fetch after the durable cursor");
+	const catchUpMessage = await catchUpDelivery;
+	assert.equal(stripInboundMarker(catchUpMessage.text), "missed while offline", "relay restart must fetch after the durable cursor");
+	await restarted.emit("message_end", { message: { role: "user", content: [{ type: "text", text: catchUpMessage.text }] } });
+	await waitFor(() => restarted.entries.some((entry) => entry.data?.messageId === "40"), "catch-up Pi acceptance receipt");
 	assert.equal(restarted.userMessages.length, 1, "catch-up must not redeliver acknowledged Discord messages");
 	await restarted.emit("session_shutdown", { reason: "quit" });
 
 	const persisted = JSON.parse(await readFile(stateFile, "utf8"));
 	assert.equal(persisted.sessions["session-33333333"].pendingMessages.length, 0);
-	assert.equal(persisted.sessions["session-33333333"].lastMessageId, "40");
+	assert.equal(persisted.sessions["session-33333333"].threadCursors[inactiveThread], "40");
 	assert.equal(FakeGateway.maximumActiveConnections, 1);
+
+	const rolloverDirectory = join(dataDir, "rollover-relay");
+	let liveConfig = { token: "token-v1", guildId: "12345", epoch: 1 };
+	const rolloverStateFile = join(rolloverDirectory, "state.json");
+	const rolloverExtension = createDiscordExtension({
+		paths: relayPaths(rolloverDirectory),
+		loadConfig: async () => liveConfig,
+		saveConfig: async () => {},
+		createStateStore: () => new DiscordStateStore(rolloverStateFile),
+		createTransport: () => new FakeGateway(),
+	});
+	const rolloverA = createExtensionHarness(rolloverExtension, {
+		cwd: "/rollover",
+		sessionId: "rollover-a",
+		sessionName: "Rollover A",
+	});
+	await rolloverA.emit("session_start", { reason: "startup" });
+	const beforeRolloverCount = FakeGateway.instances.length;
+	liveConfig = { token: "token-v2", guildId: "12345", epoch: 2 };
+	const rolloverB = createExtensionHarness(rolloverExtension, {
+		cwd: "/rollover",
+		sessionId: "rollover-b",
+		sessionName: "Rollover B",
+	});
+	await rolloverB.emit("session_start", { reason: "startup" });
+	await waitFor(
+		() => FakeGateway.instances.length > beforeRolloverCount && FakeGateway.instances.at(-1).config?.token === "token-v2",
+		"atomic config epoch rollover",
+	);
+	assert.equal(FakeGateway.activeConnections, 1);
+	assert.equal(FakeGateway.maximumActiveConnections, 1);
+	const beforeTerminalCount = FakeGateway.instances.length;
+	FakeGateway.instances.at(-1).terminal();
+	await waitFor(() => FakeGateway.instances.length > beforeTerminalCount, "terminal gateway replacement");
+	assert.equal(FakeGateway.activeConnections, 1);
+	assert.equal(FakeGateway.maximumActiveConnections, 1);
+	await rolloverA.emit("session_shutdown", { reason: "quit" });
+	await rolloverB.emit("session_shutdown", { reason: "quit" });
 
 	console.log("[discord bridge test] passed");
 } finally {
 	await rm(output, { recursive: true, force: true });
-	await rm(dataDir, { recursive: true, force: true });
+	await rm(dataDir, { recursive: true, force: true }).catch(() => {});
 }

@@ -18,12 +18,26 @@ export interface QueuedDiscordMessage {
 	content: string;
 }
 
+export interface OutboundChunk {
+	index: number;
+	content: string;
+	nonce: string;
+	discordMessageId?: string;
+}
+
+export interface OutboundMessage {
+	id: string;
+	kind: "user" | "assistant";
+	chunks: OutboundChunk[];
+}
+
 export interface SessionThreadMapping {
 	cwd: string;
 	channelId: string;
 	threadId: string;
-	lastMessageId?: string;
+	threadCursors: Record<string, string>;
 	pendingMessages: QueuedDiscordMessage[];
+	outboundMessages: OutboundMessage[];
 }
 
 export interface DiscordBridgeState {
@@ -39,6 +53,29 @@ function emptyState(): DiscordBridgeState {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseOutboundMessages(value: unknown, file: string): OutboundMessage[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) throw new Error(`Discord bridge state ${file} has an invalid outbound queue`);
+	return value.map((message) => {
+		if (!isRecord(message) || typeof message.id !== "string" || (message.kind !== "user" && message.kind !== "assistant") || !Array.isArray(message.chunks)) {
+			throw new Error(`Discord bridge state ${file} has an invalid outbound message`);
+		}
+		const chunks = message.chunks.map((chunk) => {
+			if (!isRecord(chunk) || typeof chunk.index !== "number" || typeof chunk.content !== "string" || typeof chunk.nonce !== "string" ||
+				(chunk.discordMessageId !== undefined && typeof chunk.discordMessageId !== "string")) {
+				throw new Error(`Discord bridge state ${file} has an invalid outbound chunk`);
+			}
+			return {
+				index: chunk.index,
+				content: chunk.content,
+				nonce: chunk.nonce,
+				...(typeof chunk.discordMessageId === "string" ? { discordMessageId: chunk.discordMessageId } : {}),
+			};
+		});
+		return { id: message.id, kind: message.kind, chunks };
+	});
 }
 
 function parsePendingMessages(value: unknown, file: string): QueuedDiscordMessage[] {
@@ -75,16 +112,28 @@ function parseState(value: unknown, file: string): DiscordBridgeState {
 			typeof mapping.cwd !== "string" ||
 			typeof mapping.channelId !== "string" ||
 			typeof mapping.threadId !== "string" ||
-			(mapping.lastMessageId !== undefined && typeof mapping.lastMessageId !== "string")
+			(mapping.lastMessageId !== undefined && typeof mapping.lastMessageId !== "string") ||
+			(mapping.threadCursors !== undefined && !isRecord(mapping.threadCursors))
 		) {
 			throw new Error(`Discord bridge state ${file} has an invalid session mapping`);
+		}
+		const threadCursors: Record<string, string> = {};
+		if (isRecord(mapping.threadCursors)) {
+			for (const [threadId, cursor] of Object.entries(mapping.threadCursors)) {
+				if (typeof cursor !== "string") throw new Error(`Discord bridge state ${file} has an invalid thread cursor`);
+				threadCursors[threadId] = cursor;
+			}
+		}
+		if (typeof mapping.lastMessageId === "string" && !threadCursors[mapping.threadId]) {
+			threadCursors[mapping.threadId] = mapping.lastMessageId;
 		}
 		sessions[sessionId] = {
 			cwd: mapping.cwd,
 			channelId: mapping.channelId,
 			threadId: mapping.threadId,
-			...(typeof mapping.lastMessageId === "string" ? { lastMessageId: mapping.lastMessageId } : {}),
+			threadCursors,
 			pendingMessages: parsePendingMessages(mapping.pendingMessages, file),
+			outboundMessages: parseOutboundMessages(mapping.outboundMessages, file),
 		};
 	}
 
@@ -154,8 +203,9 @@ export class DiscordStateStore {
 				cwd,
 				channelId,
 				threadId,
-				...(sameParent && existing?.lastMessageId ? { lastMessageId: existing.lastMessageId } : {}),
-				pendingMessages: sameParent ? existing.pendingMessages : [],
+				threadCursors: existing?.threadCursors ?? {},
+				pendingMessages: existing?.pendingMessages ?? [],
+				outboundMessages: existing?.outboundMessages ?? [],
 			};
 			state.sessions[sessionId] = mapping;
 			return structuredClone(mapping);
@@ -177,12 +227,15 @@ export class DiscordStateStore {
 
 	async recordDiscordMessage(
 		sessionId: string,
-		message: { id: string; content: string; authorBot: boolean },
+		message: { id: string; channelId: string; content: string; authorBot: boolean },
+		advanceCursor = true,
 	): Promise<{ queued: boolean; message?: QueuedDiscordMessage }> {
 		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) return { queued: false };
-			session.lastMessageId = laterDiscordId(session.lastMessageId, message.id);
+			if (advanceCursor) {
+				session.threadCursors[message.channelId] = laterDiscordId(session.threadCursors[message.channelId], message.id);
+			}
 			if (message.authorBot || !message.content.trim() || state.recentMessageIds.includes(message.id)) {
 				return { queued: false };
 			}
@@ -204,6 +257,50 @@ export class DiscordStateStore {
 		await this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (session) session.pendingMessages = session.pendingMessages.filter((message) => message.id !== messageId);
+		});
+	}
+
+	async enqueueOutbound(sessionId: string, message: OutboundMessage): Promise<void> {
+		await this.mutate(async (state) => {
+			const session = state.sessions[sessionId];
+			if (!session) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
+			const existing = session.outboundMessages.find((candidate) => candidate.id === message.id);
+			if (existing) {
+				const sameChunks = existing.chunks.length === message.chunks.length && existing.chunks.every((chunk, index) => {
+					const retried = message.chunks[index];
+					return retried && chunk.index === retried.index && chunk.content === retried.content && chunk.nonce === retried.nonce;
+				});
+				if (!sameChunks || existing.kind !== message.kind) throw new Error(`Outbound message ${message.id} was retried with different content`);
+				return;
+			}
+			session.outboundMessages.push(structuredClone(message));
+		});
+	}
+
+	async nextOutbound(): Promise<{ sessionId: string; mapping: SessionThreadMapping; message: OutboundMessage } | undefined> {
+		const state = await this.load();
+		for (const [sessionId, mapping] of Object.entries(state.sessions)) {
+			const message = mapping.outboundMessages[0];
+			if (message) return { sessionId, mapping, message };
+		}
+		return undefined;
+	}
+
+	async markOutboundChunkSent(sessionId: string, messageId: string, index: number, discordMessageId: string): Promise<void> {
+		await this.mutate(async (state) => {
+			const message = state.sessions[sessionId]?.outboundMessages.find((candidate) => candidate.id === messageId);
+			const chunk = message?.chunks[index];
+			if (!chunk) throw new Error(`Outbound chunk ${messageId}/${index} is missing`);
+			chunk.discordMessageId = discordMessageId;
+		});
+	}
+
+	async completeOutbound(sessionId: string, messageId: string): Promise<void> {
+		await this.mutate(async (state) => {
+			const session = state.sessions[sessionId];
+			if (!session || session.outboundMessages[0]?.id !== messageId) return;
+			if (!session.outboundMessages[0].chunks.every((chunk) => chunk.discordMessageId)) return;
+			session.outboundMessages.shift();
 		});
 	}
 

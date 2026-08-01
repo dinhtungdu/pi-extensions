@@ -9,12 +9,14 @@ export interface RelayHostOptions {
 	paths: RelayPaths;
 	token: string;
 	configFingerprint: string;
+	configEpoch: number;
 	lease: LeaderLease;
 	core: DiscordRelayCore;
 }
 
 interface SocketState {
 	clientId?: string;
+	generation?: string;
 	sessionId?: string;
 	closed: boolean;
 	buffer: string;
@@ -25,6 +27,7 @@ export class LocalRelayHost {
 	private server: Server | undefined;
 	private readonly sockets = new Set<Socket>();
 	private stopPromise: Promise<void> | undefined;
+	private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	private stopped = true;
 
 	constructor(private readonly options: RelayHostOptions) {}
@@ -32,6 +35,12 @@ export class LocalRelayHost {
 	async start(): Promise<void> {
 		if (!this.stopped) return;
 		this.stopped = false;
+		this.heartbeatTimer = setInterval(() => {
+			void this.options.lease.heartbeat().then((current) => {
+				if (!current) void this.stop();
+			}).catch(() => void this.stop());
+		}, 1_000);
+		this.heartbeatTimer.unref();
 		try {
 			await this.options.core.start();
 			if (process.platform !== "win32") {
@@ -71,6 +80,8 @@ export class LocalRelayHost {
 	}
 
 	private async performStop(): Promise<void> {
+		if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+		this.heartbeatTimer = undefined;
 		for (const socket of this.sockets) socket.destroy();
 		this.sockets.clear();
 		const server = this.server;
@@ -121,7 +132,7 @@ export class LocalRelayHost {
 			state.closed = true;
 			this.sockets.delete(socket);
 			void state.queue.finally(() => {
-				if (state.clientId) this.options.core.unregisterClient(state.clientId);
+				if (state.clientId && state.generation) this.options.core.unregisterClient(state.clientId, state.generation);
 			});
 		};
 		socket.once("close", close);
@@ -137,29 +148,35 @@ export class LocalRelayHost {
 				this.fail(socket, "Local Discord relay authentication failed", true);
 				return;
 			}
-			if (parsed.configFingerprint !== this.options.configFingerprint) {
-				this.fail(socket, "Discord bridge configuration differs from the active local relay", true);
+			if (parsed.configEpoch > this.options.configEpoch) {
+				this.write(socket, { type: "replacing", configEpoch: parsed.configEpoch });
+				void this.stop().catch(() => {});
 				return;
 			}
-			const prepared = await this.options.core.prepareRegistration(parsed.clientId, {
+			if (parsed.configEpoch !== this.options.configEpoch || parsed.configFingerprint !== this.options.configFingerprint) {
+				this.fail(socket, "Discord bridge client configuration is stale or differs from the active relay", true);
+				return;
+			}
+			const prepared = await this.options.core.prepareRegistration(parsed.clientId, parsed.generation, {
 				cwd: parsed.cwd,
 				sessionId: parsed.sessionId,
 				sessionName: parsed.sessionName,
 			});
 			if (state.closed) {
-				this.options.core.unregisterClient(parsed.clientId);
+				this.options.core.unregisterClient(parsed.clientId, parsed.generation);
 				return;
 			}
 			state.clientId = parsed.clientId;
+			state.generation = parsed.generation;
 			state.sessionId = parsed.sessionId;
 			let registered = false;
 			const buffered: Array<{ id: string; content: string }> = [];
-			await this.options.core.activateRegistration(parsed.clientId, parsed.sessionId, (message) => {
+			await this.options.core.activateRegistration(parsed.clientId, parsed.generation, parsed.sessionId, (message) => {
 				if (!registered) buffered.push(message);
 				else this.write(socket, { type: "inbound", messageId: message.id, text: message.content });
 			});
 			if (state.closed) {
-				this.options.core.unregisterClient(parsed.clientId);
+				this.options.core.unregisterClient(parsed.clientId, parsed.generation);
 				return;
 			}
 			this.write(socket, {
@@ -176,16 +193,17 @@ export class LocalRelayHost {
 		}
 
 		const clientId = state.clientId;
+		const generation = state.generation!;
 		const sessionId = state.sessionId!;
 		if (parsed.type === "register") throw new Error("Local Discord relay client is already registered");
 		if (parsed.type === "ack_inbound") {
-			await this.options.core.acknowledge(clientId, sessionId, parsed.messageId);
-			this.write(socket, { type: "inbound_acked", messageId: parsed.messageId });
+			await this.options.core.acknowledge(clientId, generation, sessionId, parsed.messageId);
+			this.write(socket, { type: "inbound_acked", requestId: parsed.requestId, messageId: parsed.messageId });
 			return;
 		}
-		if (parsed.type === "user_text" || parsed.type === "assistant_text") {
-			await this.options.core.sendClientText(clientId, sessionId, parsed.text);
-			this.write(socket, { type: "sent", requestId: parsed.requestId });
+		if (parsed.type === "outbound") {
+			await this.options.core.queueOutbound(clientId, generation, sessionId, parsed.messageId, parsed.kind, parsed.text);
+			this.write(socket, { type: "outbound_queued", requestId: parsed.requestId, messageId: parsed.messageId });
 			return;
 		}
 		if (parsed.type === "ping") {
