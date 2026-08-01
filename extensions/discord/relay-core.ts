@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DiscordBridgeConfig } from "./config.js";
 import { DiscordStateStore, type OutboundMessage, type QueuedDiscordMessage, type SessionThreadMapping } from "./state.js";
-import { normalizeCwd, projectChannelName, sessionThreadName, splitDiscordText } from "./text.js";
+import { normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
 import type { DiscordInboundMessage, DiscordTransport } from "./transport.js";
 
 export interface RelaySessionRegistration {
@@ -88,12 +88,13 @@ export class DiscordRelayCore {
 		this.catchingUpSessions.add(registration.sessionId);
 		try {
 			const cwd = normalizeCwd(registration.cwd);
-			const channelId = await this.state.resolveProjectChannel(cwd, (mappedChannelId) => {
+			const channelId = await this.state.resolveProjectChannel(cwd, (project) => {
 				return this.transport.ensureProjectChannel({
 					guildId: this.config.guildId,
 					categoryId: this.config.categoryId,
-					mappedChannelId,
-					name: projectChannelName(cwd),
+					mappedChannelId: project.existingChannelId,
+					name: project.name,
+					cwd,
 				});
 			});
 			const mapping = await this.state.resolveSessionThread(

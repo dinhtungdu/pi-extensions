@@ -204,8 +204,16 @@ try {
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { tryAcquireLeader } = await importBuilt("extensions/discord/leader.js");
-	const { assistantText, projectChannelName, sessionThreadName, splitDiscordText } = await importBuilt("extensions/discord/text.js");
-	const { assertConfiguredCategory, collectChronologicalMessages, reuseSessionThread } = await importBuilt("extensions/discord/transport.js");
+	const {
+		assistantText,
+		collidingProjectChannelName,
+		isLegacyProjectChannelName,
+		legacyProjectChannelName,
+		projectChannelName,
+		sessionThreadName,
+		splitDiscordText,
+	} = await importBuilt("extensions/discord/text.js");
+	const { assertConfiguredCategory, collectChronologicalMessages, reuseProjectChannel, reuseSessionThread } = await importBuilt("extensions/discord/transport.js");
 
 	assert.deepEqual(parseDiscordConfig({ token: " token ", guildId: "12345", categoryId: "" }), {
 		token: "token",
@@ -234,6 +242,35 @@ try {
 		async setArchived(value) { reopened = value === false; },
 	}, "channel-1"), "thread-1");
 	assert.equal(reopened, true);
+	const legacyCwd = "/work/Legacy Project";
+	const migratedNames = [];
+	assert.equal(await reuseProjectChannel({
+		id: "legacy-channel",
+		guildId: "12345",
+		type: ChannelType.GuildText,
+		name: legacyProjectChannelName(legacyCwd),
+		topic: "Pi project bridge",
+		async setName(name) { migratedNames.push(name); },
+	}, "12345", projectChannelName(legacyCwd), legacyCwd), "legacy-channel");
+	assert.deepEqual(migratedNames, ["legacy-project"]);
+	const intentionalNames = [];
+	await reuseProjectChannel({
+		id: "manual-channel",
+		guildId: "12345",
+		type: ChannelType.GuildText,
+		name: "team-owned-name",
+		topic: "Pi project bridge",
+		async setName(name) { intentionalNames.push(name); },
+	}, "12345", "legacy-project", legacyCwd);
+	await reuseProjectChannel({
+		id: "unrelated-channel",
+		guildId: "12345",
+		type: ChannelType.GuildText,
+		name: legacyProjectChannelName(legacyCwd),
+		topic: "Manually managed",
+		async setName(name) { intentionalNames.push(name); },
+	}, "12345", "legacy-project", legacyCwd);
+	assert.deepEqual(intentionalNames, [], "manual names and unrelated legacy-shaped channels must not be overwritten");
 	const malformedConfig = join(dataDir, "malformed-config.json");
 	await writeFile(malformedConfig, "{oops");
 	await assert.rejects(() => loadDiscordConfig(malformedConfig, {}), /Cannot read Discord bridge config/);
@@ -248,8 +285,16 @@ try {
 	const environmentSecond = await loadDiscordConfig(environmentConfig, { DISCORD_TOKEN: "environment-two" });
 	assert.ok(environmentSecond.epoch > environmentFirst.epoch, "environment-only effective config changes need an authoritative epoch");
 
-	assert.equal(projectChannelName("/one/My Project"), projectChannelName("/one/My Project"));
-	assert.notEqual(projectChannelName("/one/project"), projectChannelName("/two/project"));
+	assert.equal(projectChannelName("/one/My Project"), "my-project");
+	assert.equal(projectChannelName("/one/project"), projectChannelName("/two/project"));
+	assert.equal(projectChannelName(`/tmp/${"a".repeat(150)}`).length, 100);
+	assert.equal(collidingProjectChannelName(`/tmp/${"a".repeat(150)}`).length, 100);
+	assert.match(collidingProjectChannelName("/one/project"), /^project-[a-f0-9]{8}$/);
+	assert.equal(projectChannelName("/tmp/项目"), "project");
+	assert.match(collidingProjectChannelName("/tmp/另一个项目"), /^project-[a-f0-9]{8}$/);
+	assert.equal(projectChannelName("/tmp/Café déjà"), "cafe-deja");
+	assert.equal(isLegacyProjectChannelName("/one/My Project", legacyProjectChannelName("/one/My Project")), true);
+	assert.equal(isLegacyProjectChannelName("/one/My Project", "my-project"), false);
 	assert.match(sessionThreadName("12345678-abcd", "Fix Things"), /^pi-fix-things-12345678$/);
 	assert.equal(assistantText({
 		role: "assistant",
@@ -311,6 +356,66 @@ try {
 		{ after: "100", before: undefined },
 		{ after: undefined, before: "151" },
 	]);
+
+	const namingStateFile = join(dataDir, "channel-naming-state.json");
+	const firstNamingStore = new DiscordStateStore(namingStateFile);
+	const allocatedNames = new Map();
+	await Promise.all([
+		firstNamingStore.resolveProjectChannel("/workspace/one/shared", async (request) => {
+			allocatedNames.set("/workspace/one/shared", request.name);
+			return "shared-channel-one";
+		}),
+		new DiscordStateStore(namingStateFile).resolveProjectChannel("/workspace/two/shared", async (request) => {
+			allocatedNames.set("/workspace/two/shared", request.name);
+			return "shared-channel-two";
+		}),
+	]);
+	assert.equal(new Set(allocatedNames.values()).size, 2, "same-basename projects need distinct allocations");
+	assert.ok([...allocatedNames.values()].includes("shared"), "the first race-safe mapping keeps the clean basename");
+	for (const [cwd, name] of allocatedNames) {
+		if (name !== "shared") assert.equal(name, collidingProjectChannelName(cwd));
+	}
+	const persistedNames = (await firstNamingStore.load()).projects;
+	const restartedNames = new Map();
+	await new DiscordStateStore(namingStateFile).resolveProjectChannel("/workspace/one/shared", async (request) => {
+		restartedNames.set("/workspace/one/shared", request.name);
+		return request.existingChannelId;
+	});
+	await new DiscordStateStore(namingStateFile).resolveProjectChannel("/workspace/two/shared", async (request) => {
+		restartedNames.set("/workspace/two/shared", request.name);
+		return request.existingChannelId;
+	});
+	assert.equal(restartedNames.get("/workspace/one/shared"), persistedNames["/workspace/one/shared"].name);
+	assert.equal(restartedNames.get("/workspace/two/shared"), persistedNames["/workspace/two/shared"].name);
+	let fallbackName;
+	await firstNamingStore.resolveProjectChannel("/workspace/项目", async (request) => {
+		fallbackName = request.name;
+		return "fallback-channel";
+	});
+	assert.equal(fallbackName, "project");
+	let canonicalName;
+	await firstNamingStore.resolveProjectChannel("/workspace/canonical/../canonical/unique", async (request) => {
+		canonicalName = request.name;
+		return "canonical-channel";
+	});
+	assert.equal(canonicalName, "unique");
+	assert.ok((await firstNamingStore.load()).projects["/workspace/canonical/unique"], "absolute normalized cwd remains the mapping identity");
+	const legacyStateFile = join(dataDir, "legacy-channel-state.json");
+	await writeFile(legacyStateFile, JSON.stringify({
+		version: 1,
+		projects: { [legacyCwd]: { channelId: "legacy-channel" } },
+		sessions: {},
+		recentMessageIds: [],
+	}));
+	let legacyAllocation;
+	await new DiscordStateStore(legacyStateFile).resolveProjectChannel(legacyCwd, async (request) => {
+		legacyAllocation = request;
+		return request.existingChannelId;
+	});
+	assert.deepEqual(legacyAllocation, {
+		existingChannelId: "legacy-channel",
+		name: "legacy-project",
+	});
 
 	const cursorState = new DiscordStateStore(join(dataDir, "cursor-state.json"));
 	await cursorState.resolveProjectChannel("/cursor", async () => "cursor-channel");

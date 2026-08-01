@@ -14,6 +14,16 @@ function slug(value: string, fallback: string): string {
 	return result || fallback;
 }
 
+function projectSlug(value: string): string {
+	const result = value
+		.normalize("NFKD")
+		.replace(/\p{M}+/gu, "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return result || "project";
+}
+
 function shortHash(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 8);
 }
@@ -23,10 +33,25 @@ export function normalizeCwd(cwd: string): string {
 }
 
 export function projectChannelName(cwd: string): string {
+	return projectSlug(basename(normalizeCwd(cwd))).slice(0, DISCORD_NAME_LIMIT);
+}
+
+export function collidingProjectChannelName(cwd: string): string {
+	const normalized = normalizeCwd(cwd);
+	const suffix = shortHash(normalized);
+	const prefix = projectChannelName(normalized);
+	return `${prefix.slice(0, DISCORD_NAME_LIMIT - suffix.length - 1)}-${suffix}`;
+}
+
+export function legacyProjectChannelName(cwd: string): string {
 	const normalized = normalizeCwd(cwd);
 	const suffix = shortHash(normalized);
 	const prefix = `pi-${slug(basename(normalized), "project")}`;
 	return `${prefix.slice(0, DISCORD_NAME_LIMIT - suffix.length - 1)}-${suffix}`;
+}
+
+export function isLegacyProjectChannelName(cwd: string, name: string): boolean {
+	return name === legacyProjectChannelName(cwd);
 }
 
 export function sessionThreadName(sessionId: string, sessionName?: string): string {

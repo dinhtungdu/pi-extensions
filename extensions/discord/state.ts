@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { DISCORD_STATE_FILE } from "./config.js";
+import { collidingProjectChannelName, normalizeCwd, projectChannelName } from "./text.js";
 
 const STATE_VERSION = 1;
 const MAX_RECENT_MESSAGE_IDS = 2_000;
@@ -11,6 +12,7 @@ const LOCK_RETRY_MS = 50;
 
 export interface ProjectChannelMapping {
 	channelId: string;
+	name?: string;
 }
 
 export interface QueuedDiscordMessage {
@@ -106,10 +108,14 @@ function parseState(value: unknown, file: string): DiscordBridgeState {
 
 	const projects: Record<string, ProjectChannelMapping> = {};
 	for (const [cwd, mapping] of Object.entries(value.projects)) {
-		if (!isRecord(mapping) || typeof mapping.channelId !== "string") {
+		if (!isRecord(mapping) || typeof mapping.channelId !== "string" ||
+			(mapping.name !== undefined && typeof mapping.name !== "string")) {
 			throw new Error(`Discord bridge state ${file} has an invalid project mapping`);
 		}
-		projects[cwd] = { channelId: mapping.channelId };
+		projects[cwd] = {
+			channelId: mapping.channelId,
+			...(typeof mapping.name === "string" ? { name: mapping.name } : {}),
+		};
 	}
 
 	const sessions: Record<string, SessionThreadMapping> = {};
@@ -187,11 +193,26 @@ export class DiscordStateStore {
 
 	async resolveProjectChannel(
 		cwd: string,
-		resolve: (existingChannelId: string | undefined) => Promise<string>,
+		resolve: (request: { existingChannelId?: string; name: string }) => Promise<string>,
 	): Promise<string> {
+		const canonicalCwd = normalizeCwd(cwd);
 		return this.mutate(async (state) => {
-			const channelId = await resolve(state.projects[cwd]?.channelId);
-			state.projects[cwd] = { channelId };
+			const cleanName = projectChannelName(canonicalCwd);
+			const collidingCwds = Object.keys(state.projects).filter((mappedCwd) => projectChannelName(mappedCwd) === cleanName);
+			if (!collidingCwds.includes(canonicalCwd)) collidingCwds.push(canonicalCwd);
+			for (const [index, mappedCwd] of collidingCwds.entries()) {
+				const mapping = state.projects[mappedCwd];
+				if (mapping && !mapping.name) {
+					mapping.name = index === 0 ? cleanName : collidingProjectChannelName(mappedCwd);
+				}
+			}
+			const existing = state.projects[canonicalCwd];
+			const name = existing?.name ?? (collidingCwds[0] === canonicalCwd ? cleanName : collidingProjectChannelName(canonicalCwd));
+			const channelId = await resolve({
+				...(existing?.channelId ? { existingChannelId: existing.channelId } : {}),
+				name,
+			});
+			state.projects[canonicalCwd] = { channelId, name };
 			return channelId;
 		});
 	}
