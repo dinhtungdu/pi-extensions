@@ -8,7 +8,6 @@ import {
 	type TextChannel,
 } from "discord.js";
 import type { DiscordBridgeConfig } from "./config.js";
-import { isLegacyProjectChannelName } from "./text.js";
 
 const READY_TIMEOUT_MS = 30_000;
 
@@ -24,7 +23,6 @@ export interface ProjectChannelRequest {
 	categoryId?: string;
 	mappedChannelId?: string;
 	name: string;
-	cwd: string;
 }
 
 export interface SessionThreadRequest {
@@ -54,26 +52,6 @@ export function assertConfiguredCategory(
 			`Configured Discord category ${categoryId} does not exist in guild ${guildId} or is not a category`,
 		);
 	}
-}
-
-export async function reuseProjectChannel(
-	channel: {
-		id: string;
-		guildId: string;
-		type: ChannelType;
-		name: string;
-		topic: string | null;
-		setName(name: string, reason?: string): Promise<unknown>;
-	} | null,
-	guildId: string,
-	name: string,
-	cwd: string,
-): Promise<string | undefined> {
-	if (!channel || channel.type !== ChannelType.GuildText || channel.guildId !== guildId) return undefined;
-	if (isLegacyProjectChannelName(cwd, channel.name) && channel.topic === "Pi project bridge" && channel.name !== name) {
-		await channel.setName(name, "Migrate Pi project channel naming");
-	}
-	return channel.id;
 }
 
 export async function reuseSessionThread(
@@ -184,13 +162,7 @@ export class DiscordJsTransport implements DiscordTransport {
 
 		if (request.mappedChannelId) {
 			const mapped = await guild.channels.fetch(request.mappedChannelId).catch(() => null);
-			const reused = await reuseProjectChannel(
-				mapped?.type === ChannelType.GuildText ? mapped : null,
-				guild.id,
-				request.name,
-				request.cwd,
-			);
-			if (reused) return reused;
+			if (mapped?.type === ChannelType.GuildText && mapped.guildId === guild.id) return mapped.id;
 		}
 
 		const channel = await guild.channels.create({

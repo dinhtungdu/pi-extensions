@@ -43,17 +43,6 @@ export function collidingProjectChannelName(cwd: string): string {
 	return `${prefix.slice(0, DISCORD_NAME_LIMIT - suffix.length - 1)}-${suffix}`;
 }
 
-export function legacyProjectChannelName(cwd: string): string {
-	const normalized = normalizeCwd(cwd);
-	const suffix = shortHash(normalized);
-	const prefix = `pi-${slug(basename(normalized), "project")}`;
-	return `${prefix.slice(0, DISCORD_NAME_LIMIT - suffix.length - 1)}-${suffix}`;
-}
-
-export function isLegacyProjectChannelName(cwd: string, name: string): boolean {
-	return name === legacyProjectChannelName(cwd);
-}
-
 export function sessionThreadName(sessionId: string, sessionName?: string): string {
 	const suffix = slug(sessionId.replaceAll("-", "").slice(0, 8), "session");
 	const prefix = `pi-${slug(sessionName ?? "session", "session")}`;
@@ -76,6 +65,29 @@ export function assistantText(message: {
 		.join("")
 		.trim();
 	return text || undefined;
+}
+
+const INTERACTIVE_PREFIX = "🖥️ **";
+const INTERACTIVE_SUFFIX = "**";
+const DISCORD_MARKDOWN_CHARACTERS = new Set(["\\", "`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "-", ".", "!", "|", ">", "~"]);
+
+export function interactiveUserChunks(text: string, maximum = SAFE_MESSAGE_LIMIT): string[] {
+	const payloadLimit = maximum - INTERACTIVE_PREFIX.length - INTERACTIVE_SUFFIX.length;
+	if (!Number.isInteger(maximum) || payloadLimit < 1 || maximum > DISCORD_MESSAGE_LIMIT) {
+		throw new Error(`Formatted Discord message limit must be between ${INTERACTIVE_PREFIX.length + INTERACTIVE_SUFFIX.length + 1} and ${DISCORD_MESSAGE_LIMIT}`);
+	}
+	const payloads: string[] = [];
+	let payload = "";
+	for (const character of text) {
+		const escaped = DISCORD_MARKDOWN_CHARACTERS.has(character) ? `\\${character}` : character;
+		if (payload && payload.length + escaped.length > payloadLimit) {
+			payloads.push(payload);
+			payload = "";
+		}
+		payload += escaped;
+	}
+	if (payload) payloads.push(payload);
+	return payloads.map((chunk) => `${INTERACTIVE_PREFIX}${chunk}${INTERACTIVE_SUFFIX}`);
 }
 
 export function splitDiscordText(text: string, maximum = SAFE_MESSAGE_LIMIT): string[] {

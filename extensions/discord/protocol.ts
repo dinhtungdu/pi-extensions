@@ -6,7 +6,7 @@ export const MAX_IPC_FRAME_BYTES = 1_048_576;
 
 export type ClientFrame =
 	| ({ type: "register"; token: string; clientId: string; generation: string; configFingerprint: string; configEpoch: number } & RelaySessionRegistration)
-	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
+	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "interactive" | "assistant"; text: string }
 	| { type: "ack_inbound"; requestId: string; messageId: string }
 	| { type: "unregister" }
 	| { type: "ping" };
@@ -46,7 +46,7 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 	}
 	if (frame.type === "outbound") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string" && typeof frame.text === "string" &&
-			(frame.kind === "user" || frame.kind === "assistant");
+			(frame.kind === "user" || frame.kind === "interactive" || frame.kind === "assistant");
 	}
 	if (frame.type === "ack_inbound") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	return frame.type === "unregister" || frame.type === "ping";

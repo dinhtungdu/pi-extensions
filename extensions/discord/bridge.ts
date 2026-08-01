@@ -83,8 +83,9 @@ export class DiscordBridge {
 		return this.relay.status();
 	}
 
-	async mirrorUserText(text: string): Promise<void> {
-		await this.relay.sendUserText(text);
+	async mirrorUserText(text: string, interactive = false): Promise<void> {
+		if (interactive) await this.relay.sendInteractiveUserText(text);
+		else await this.relay.sendUserText(text);
 	}
 
 	restoreAcceptedInbound(messageIds: Iterable<string>): void {

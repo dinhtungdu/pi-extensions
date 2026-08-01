@@ -185,7 +185,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		pi.on("input", async (event, ctx) => {
 			if (event.source === "extension" || !bridge) return { action: "continue" };
 			try {
-				await bridge.mirrorUserText(event.text);
+				await bridge.mirrorUserText(event.text, event.source === "interactive");
 			} catch (error) {
 				ctx.ui.notify(`Discord user-message mirror failed: ${errorMessage(error)}`, "error");
 			}

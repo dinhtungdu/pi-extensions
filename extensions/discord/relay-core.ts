@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DiscordBridgeConfig } from "./config.js";
 import { DiscordStateStore, type OutboundMessage, type QueuedDiscordMessage, type SessionThreadMapping } from "./state.js";
-import { normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
+import { interactiveUserChunks, normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
 import type { DiscordInboundMessage, DiscordTransport } from "./transport.js";
 
 export interface RelaySessionRegistration {
@@ -94,7 +94,6 @@ export class DiscordRelayCore {
 					categoryId: this.config.categoryId,
 					mappedChannelId: project.existingChannelId,
 					name: project.name,
-					cwd,
 				});
 			});
 			const mapping = await this.state.resolveSessionThread(
@@ -174,7 +173,7 @@ export class DiscordRelayCore {
 		generation: string,
 		sessionId: string,
 		messageId: string,
-		kind: "user" | "assistant",
+		kind: "user" | "interactive" | "assistant",
 		text: string,
 	): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
@@ -185,7 +184,7 @@ export class DiscordRelayCore {
 			id: messageId,
 			kind,
 			threadId: mapping.threadId,
-			chunks: splitDiscordText(text).map((content, index) => ({
+			chunks: (kind === "interactive" ? interactiveUserChunks(text) : splitDiscordText(text)).map((content, index) => ({
 				index,
 				content,
 				nonce: createHash("sha256").update(`${messageId}:${index}`).digest("hex").slice(0, 25),

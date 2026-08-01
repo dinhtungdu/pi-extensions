@@ -132,6 +132,10 @@ export class LocalRelayClient {
 		await this.queueOutbound("user", text);
 	}
 
+	async sendInteractiveUserText(text: string): Promise<void> {
+		await this.queueOutbound("interactive", text);
+	}
+
 	async sendAssistantText(text: string): Promise<void> {
 		await this.queueOutbound("assistant", text);
 	}
@@ -309,7 +313,7 @@ export class LocalRelayClient {
 		}
 	}
 
-	private async queueOutbound(kind: "user" | "assistant", text: string): Promise<void> {
+	private async queueOutbound(kind: "user" | "interactive" | "assistant", text: string): Promise<void> {
 		if (!text.trim()) return;
 		const messageId = randomUUID();
 		for (;;) {

@@ -29,7 +29,7 @@ export interface OutboundChunk {
 
 export interface OutboundMessage {
 	id: string;
-	kind: "user" | "assistant";
+	kind: "user" | "interactive" | "assistant";
 	threadId: string;
 	chunks: OutboundChunk[];
 }
@@ -62,7 +62,8 @@ function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: s
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) throw new Error(`Discord bridge state ${file} has an invalid outbound queue`);
 	return value.map((message) => {
-		if (!isRecord(message) || typeof message.id !== "string" || (message.kind !== "user" && message.kind !== "assistant") ||
+		if (!isRecord(message) || typeof message.id !== "string" ||
+			(message.kind !== "user" && message.kind !== "interactive" && message.kind !== "assistant") ||
 			(message.threadId !== undefined && typeof message.threadId !== "string") || !Array.isArray(message.chunks)) {
 			throw new Error(`Discord bridge state ${file} has an invalid outbound message`);
 		}

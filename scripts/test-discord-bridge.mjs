@@ -207,13 +207,12 @@ try {
 	const {
 		assistantText,
 		collidingProjectChannelName,
-		isLegacyProjectChannelName,
-		legacyProjectChannelName,
+		interactiveUserChunks,
 		projectChannelName,
 		sessionThreadName,
 		splitDiscordText,
 	} = await importBuilt("extensions/discord/text.js");
-	const { assertConfiguredCategory, collectChronologicalMessages, reuseProjectChannel, reuseSessionThread } = await importBuilt("extensions/discord/transport.js");
+	const { assertConfiguredCategory, collectChronologicalMessages, reuseSessionThread } = await importBuilt("extensions/discord/transport.js");
 
 	assert.deepEqual(parseDiscordConfig({ token: " token ", guildId: "12345", categoryId: "" }), {
 		token: "token",
@@ -242,35 +241,6 @@ try {
 		async setArchived(value) { reopened = value === false; },
 	}, "channel-1"), "thread-1");
 	assert.equal(reopened, true);
-	const legacyCwd = "/work/Legacy Project";
-	const migratedNames = [];
-	assert.equal(await reuseProjectChannel({
-		id: "legacy-channel",
-		guildId: "12345",
-		type: ChannelType.GuildText,
-		name: legacyProjectChannelName(legacyCwd),
-		topic: "Pi project bridge",
-		async setName(name) { migratedNames.push(name); },
-	}, "12345", projectChannelName(legacyCwd), legacyCwd), "legacy-channel");
-	assert.deepEqual(migratedNames, ["legacy-project"]);
-	const intentionalNames = [];
-	await reuseProjectChannel({
-		id: "manual-channel",
-		guildId: "12345",
-		type: ChannelType.GuildText,
-		name: "team-owned-name",
-		topic: "Pi project bridge",
-		async setName(name) { intentionalNames.push(name); },
-	}, "12345", "legacy-project", legacyCwd);
-	await reuseProjectChannel({
-		id: "unrelated-channel",
-		guildId: "12345",
-		type: ChannelType.GuildText,
-		name: legacyProjectChannelName(legacyCwd),
-		topic: "Manually managed",
-		async setName(name) { intentionalNames.push(name); },
-	}, "12345", "legacy-project", legacyCwd);
-	assert.deepEqual(intentionalNames, [], "manual names and unrelated legacy-shaped channels must not be overwritten");
 	const malformedConfig = join(dataDir, "malformed-config.json");
 	await writeFile(malformedConfig, "{oops");
 	await assert.rejects(() => loadDiscordConfig(malformedConfig, {}), /Cannot read Discord bridge config/);
@@ -293,8 +263,6 @@ try {
 	assert.equal(projectChannelName("/tmp/项目"), "project");
 	assert.match(collidingProjectChannelName("/tmp/另一个项目"), /^project-[a-f0-9]{8}$/);
 	assert.equal(projectChannelName("/tmp/Café déjà"), "cafe-deja");
-	assert.equal(isLegacyProjectChannelName("/one/My Project", legacyProjectChannelName("/one/My Project")), true);
-	assert.equal(isLegacyProjectChannelName("/one/My Project", "my-project"), false);
 	assert.match(sessionThreadName("12345678-abcd", "Fix Things"), /^pi-fix-things-12345678$/);
 	assert.equal(assistantText({
 		role: "assistant",
@@ -309,6 +277,20 @@ try {
 	const chunks = splitDiscordText("a".repeat(4_100));
 	assert.equal(chunks.join(""), "a".repeat(4_100));
 	assert.ok(chunks.every((chunk) => chunk.length <= 1_900));
+	assert.deepEqual(interactiveUserChunks("ordinary input"), ["🖥️ **ordinary input**"]);
+	assert.deepEqual(interactiveUserChunks("line one\nline two"), ["🖥️ **line one\nline two**"]);
+	assert.deepEqual(
+		interactiveUserChunks("**bold** _under_ `code` \\ slash"),
+		["🖥️ **\\*\\*bold\\*\\* \\_under\\_ \\`code\\` \\\\ slash**"],
+	);
+	const longInteractiveInput = "long *markdown* line\n".repeat(300);
+	const longInteractiveChunks = interactiveUserChunks(longInteractiveInput);
+	assert.ok(longInteractiveChunks.length > 1);
+	assert.ok(longInteractiveChunks.every((chunk) => chunk.startsWith("🖥️ **") && chunk.endsWith("**") && chunk.length <= 1_900));
+	const reconstructedInteractive = longInteractiveChunks
+		.map((chunk) => chunk.slice("🖥️ **".length, -2).replace(/\\([\\`*_{}[\]()#+\-.!|>~])/g, "$1"))
+		.join("");
+	assert.equal(reconstructedInteractive, longInteractiveInput);
 
 	class SlowSocket extends EventEmitter {
 		destroyed = false;
@@ -400,23 +382,6 @@ try {
 	});
 	assert.equal(canonicalName, "unique");
 	assert.ok((await firstNamingStore.load()).projects["/workspace/canonical/unique"], "absolute normalized cwd remains the mapping identity");
-	const legacyStateFile = join(dataDir, "legacy-channel-state.json");
-	await writeFile(legacyStateFile, JSON.stringify({
-		version: 1,
-		projects: { [legacyCwd]: { channelId: "legacy-channel" } },
-		sessions: {},
-		recentMessageIds: [],
-	}));
-	let legacyAllocation;
-	await new DiscordStateStore(legacyStateFile).resolveProjectChannel(legacyCwd, async (request) => {
-		legacyAllocation = request;
-		return request.existingChannelId;
-	});
-	assert.deepEqual(legacyAllocation, {
-		existingChannelId: "legacy-channel",
-		name: "legacy-project",
-	});
-
 	const cursorState = new DiscordStateStore(join(dataDir, "cursor-state.json"));
 	await cursorState.resolveProjectChannel("/cursor", async () => "cursor-channel");
 	await cursorState.resolveSessionThread("cursor-session", "/cursor", "cursor-channel", async () => "cursor-thread");
@@ -663,12 +628,24 @@ try {
 	assert.equal(second.userMessages.length, 1, "bot output must not loop back into Pi");
 
 	await first.emit("input", { text: "local input", source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === "local input"), "durable outbound user send");
+	await waitFor(() => gateway.sent.some((message) => message.text === "🖥️ **local input**"), "formatted interactive user send");
 	assert.equal(gateway.sent.at(-1).channelId, firstThread);
-	assert.equal(gateway.sent.at(-1).text, "local input");
+	assert.equal(gateway.sent.at(-1).text, "🖥️ **local input**");
+	await first.emit("input", { text: "line one\nline two", source: "interactive" });
+	await waitFor(() => gateway.sent.some((message) => message.text === "🖥️ **line one\nline two**"), "formatted multiline interactive send");
+	const markdownInput = "**bold** _under_ `code` \\ slash";
+	const markdownOutput = interactiveUserChunks(markdownInput)[0];
+	await first.emit("input", { text: markdownInput, source: "interactive" });
+	await waitFor(() => gateway.sent.some((message) => message.text === markdownOutput), "markdown-safe interactive send");
+	const longStart = gateway.sent.length;
+	await first.emit("input", { text: longInteractiveInput, source: "interactive" });
+	await waitFor(() => gateway.sent.length >= longStart + longInteractiveChunks.length, "chunk-safe long interactive send");
+	assert.deepEqual(gateway.sent.slice(longStart).map((message) => message.text), longInteractiveChunks);
+	await first.emit("input", { text: "RPC input", source: "rpc" });
+	await waitFor(() => gateway.sent.some((message) => message.text === "RPC input"), "unchanged non-interactive input send");
 	const sentBeforeLoopCheck = gateway.sent.length;
 	await first.emit("input", { text: "Discord echo", source: "extension" });
-	assert.equal(gateway.sent.length, sentBeforeLoopCheck, "extension input must not loop back to Discord");
+	assert.equal(gateway.sent.length, sentBeforeLoopCheck, "Discord-origin extension input must not loop back to Discord");
 	await first.emit("before_agent_start", {});
 	await first.emit("message_end", {
 		message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "final only" }] },
