@@ -10,8 +10,8 @@ import {
 } from "./config.js";
 import { DiscordStateStore } from "./state.js";
 import { DiscordJsTransport, type DiscordTransport } from "./transport.js";
-import { DiscordRelayCore } from "./relay-core.js";
-import { LocalRelayHost } from "./relay-host.js";
+import { runRelayChild } from "./relay-child.js";
+import { launchRelayChild } from "./relay-launcher.js";
 
 const STATUS_KEY = "discord-bridge";
 const ACCEPTED_INBOUND_ENTRY = "discord-bridge-inbound-accepted";
@@ -24,6 +24,7 @@ export interface DiscordExtensionDependencies {
 	paths?: RelayPaths;
 	createStateStore?: () => DiscordStateStore;
 	createTransport?: () => DiscordTransport;
+	launchRelay?: () => Promise<void>;
 }
 
 function errorMessage(error: unknown): string {
@@ -36,6 +37,16 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 	const paths = dependencies.paths ?? relayPaths();
 	const createStateStore = dependencies.createStateStore ?? (() => new DiscordStateStore());
 	const createTransport = dependencies.createTransport ?? (() => new DiscordJsTransport());
+	let inProcessRelay: Promise<boolean> | undefined;
+	const launchRelay = dependencies.launchRelay ?? (dependencies.createStateStore || dependencies.createTransport
+		? async () => {
+			if (!inProcessRelay) {
+				inProcessRelay = runRelayChild(paths, { createStateStore, createTransport }).finally(() => {
+					inProcessRelay = undefined;
+				});
+			}
+		}
+		: () => launchRelayChild(paths));
 
 	return function discordExtension(pi: ExtensionAPI): void {
 		let bridge: DiscordBridge | undefined;
@@ -102,22 +113,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				{
 					paths,
 					reloadConfig: async () => (await loadConfig()) ?? config!,
-					createHost(lease, token, fingerprint, hostConfig) {
-						let host: LocalRelayHost;
-						const core = new DiscordRelayCore(hostConfig, createStateStore(), createTransport(), (error) => {
-							ctx.ui.notify(`Discord relay gateway failed: ${error.message}`, "error");
-							void host?.stop();
-						});
-						host = new LocalRelayHost({
-							paths,
-							token,
-							configFingerprint: fingerprint,
-							configEpoch: hostConfig.epoch,
-							lease,
-							core,
-						});
-						return host;
-					},
+					launchRelay,
 				},
 			);
 			const acceptedIds = ctx.sessionManager.getBranch()

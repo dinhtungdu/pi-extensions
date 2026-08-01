@@ -37,6 +37,8 @@ class FakeGateway {
 	static catchUpByThread = new Map();
 	static nonceResults = new Map();
 	static failSendAt = undefined;
+	static failOnceTexts = new Set();
+	static sendAttempts = new Map();
 	static deletedThreads = new Set();
 
 	connected = false;
@@ -95,6 +97,8 @@ class FakeGateway {
 	}
 
 	async sendText(channelId, text, nonce) {
+		FakeGateway.sendAttempts.set(text, (FakeGateway.sendAttempts.get(text) ?? 0) + 1);
+		if (FakeGateway.failOnceTexts.delete(text)) throw new Error("injected transient Discord send failure");
 		if (FakeGateway.deletedThreads.has(channelId)) throw new Error("Unknown Channel");
 		const existing = FakeGateway.nonceResults.get(nonce);
 		if (existing) return existing;
@@ -351,7 +355,6 @@ try {
 	assert.equal(await tryAcquireLeader(electionPaths, {
 		lookupProcessIdentity: async () => undefined,
 		probeRelay: async () => true,
-		wait: async () => {},
 	}), undefined, "failed process inspection must not steal a live relay lease");
 	assert.equal(await liveLease.heartbeat(), true, "inconclusive inspection must leave the prior owner unfenced");
 	await liveLease.release();
@@ -371,16 +374,12 @@ try {
 	assert.ok(fencedLease);
 	const expired = new Date(Date.now() - 10_000);
 	await utimes(fencedPaths.leaderLock, expired, expired);
-	let fenceWaitCompleted = false;
 	assert.equal(await tryAcquireLeader(fencedPaths, {
 		lookupProcessIdentity: async () => undefined,
 		probeRelay: async () => false,
-		wait: async () => { fenceWaitCompleted = true; },
-	}), undefined);
-	assert.equal(fenceWaitCompleted, true, "stale takeover must fence and settle the prior owner before acquisition");
-	const fencedSuccessor = await tryAcquireLeader(fencedPaths);
-	assert.ok(fencedSuccessor);
-	await fencedSuccessor.release();
+	}), undefined, "a live but uninspectable owner must never be replaced merely for unresponsiveness");
+	assert.equal(await fencedLease.heartbeat(), true);
+	await fencedLease.release();
 
 	const remapState = new DiscordStateStore(join(dataDir, "remap-state.json"));
 	await remapState.resolveProjectChannel("/old", async () => "old-channel");
@@ -428,6 +427,11 @@ try {
 	assert.equal(deletedGateway.sent.filter((message) => message.text === "retarget me").length, 1);
 	assert.equal(deletedGateway.sent.find((message) => message.text === "retarget me").channelId, repaired.threadId);
 	assert.equal((await deletedState.getSession("deleted-session")).outboundMessages.length, 0);
+	FakeGateway.failOnceTexts.add("retry without another event");
+	await deletedCore.queueOutbound("healthy-client", "healthy-generation", "healthy-session", "retry-outbound", "assistant", "retry without another event");
+	await waitFor(async () => deletedGateway.sent.some((message) => message.text === "retry without another event") &&
+		(await deletedState.getSession("healthy-session")).outboundMessages.length === 0, "automatic transient outbound retry");
+	assert.equal(FakeGateway.sendAttempts.get("retry without another event"), 2);
 	FakeGateway.deletedThreads.delete(deletedPrepared.threadId);
 	await deletedCore.stop();
 
@@ -589,13 +593,10 @@ try {
 	await retriedInjection.emit("session_shutdown", { reason: "quit" });
 
 	await first.emit("session_shutdown", { reason: "quit" });
-	await waitFor(
-		() => FakeGateway.instances.length === 2 && second.statuses.at(-1)?.[1]?.startsWith("Discord relay "),
-		"follower relay failover",
-	);
-	assert.equal(FakeGateway.activeConnections, 1, "failover must restore exactly one gateway connection");
-	assert.equal(FakeGateway.maximumActiveConnections, 1, "leader handoff must not overlap gateway clients");
-	const failoverGateway = FakeGateway.instances[1];
+	assert.equal(FakeGateway.instances.length, 1, "relay child must survive the Pi client that launched it");
+	assert.equal(FakeGateway.activeConnections, 1);
+	assert.equal(FakeGateway.maximumActiveConnections, 1);
+	const failoverGateway = gateway;
 	const afterFailover = second.nextUserMessage();
 	await failoverGateway.emit({ id: "20", channelId: secondThread, content: "after failover", authorBot: false });
 	const afterFailoverMessage = await afterFailover;
@@ -628,7 +629,7 @@ try {
 	await resumed.emit("session_shutdown", { reason: "quit" });
 
 	await second.emit("session_shutdown", { reason: "quit" });
-	assert.equal(FakeGateway.activeConnections, 0, "relay may stop when every Pi process is closed");
+	await waitFor(() => FakeGateway.activeConnections === 0, "zero-client relay child shutdown");
 	FakeGateway.catchUpByThread.set(inactiveThread, [
 		{ id: "30", channelId: inactiveThread, content: "old duplicate", authorBot: false },
 		{ id: "40", channelId: inactiveThread, content: "missed while offline", authorBot: false },
@@ -646,6 +647,7 @@ try {
 	await waitFor(() => restarted.entries.some((entry) => entry.data?.messageId === "40"), "catch-up Pi acceptance receipt");
 	assert.equal(restarted.userMessages.length, 1, "catch-up must not redeliver acknowledged Discord messages");
 	await restarted.emit("session_shutdown", { reason: "quit" });
+	await waitFor(() => FakeGateway.activeConnections === 0, "restarted zero-client relay shutdown");
 
 	const persisted = JSON.parse(await readFile(stateFile, "utf8"));
 	assert.equal(persisted.sessions["session-33333333"].pendingMessages.length, 0);
@@ -686,8 +688,10 @@ try {
 	await waitFor(() => FakeGateway.instances.length > beforeTerminalCount, "terminal gateway replacement");
 	assert.equal(FakeGateway.activeConnections, 1);
 	assert.equal(FakeGateway.maximumActiveConnections, 1);
-	await rolloverA.emit("session_shutdown", { reason: "quit" });
 	await rolloverB.emit("session_shutdown", { reason: "quit" });
+	assert.equal(FakeGateway.activeConnections, 1, "newest-config relay must survive its introducing client");
+	assert.ok(rolloverA.statuses.at(-1)?.[1]?.startsWith("Discord relay "));
+	await rolloverA.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "rollover relay shutdown");
 
 	console.log("[discord bridge test] passed");

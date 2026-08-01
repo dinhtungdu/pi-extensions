@@ -48,8 +48,8 @@
 	},
 	"scripts": {
 		"check": "tsc --noEmit",
-		"lint": "oxlint extensions/discord scripts/test-discord-bridge.mjs",
-		"test:discord": "node ./scripts/test-discord-bridge.mjs",
+		"lint": "oxlint extensions/discord scripts/test-discord*.mjs scripts/fixtures/discord-relay-*.mjs",
+		"test:discord": "node ./scripts/test-discord-bridge.mjs && node ./scripts/test-discord-relay-child.mjs",
 		"test:tool-visibility": "node ./scripts/test-tool-visibility.mjs",
 		"setup:voice": "node ./scripts/setup-voice.mjs",
 		"uninstall:voice": "node ./scripts/uninstall-voice.mjs",
@@ -60,6 +60,7 @@
 		"test:voice-components": "node ./scripts/test-voice-components.mjs"
 	},
 	"dependencies": {
-		"discord.js": "^14.27.0"
+		"discord.js": "^14.27.0",
+		"jiti": "^2.7.0"
 	}
 }

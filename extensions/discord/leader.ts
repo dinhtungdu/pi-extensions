@@ -7,8 +7,7 @@ import type { RelayPaths } from "./config.js";
 import { encodeFrame, isServerFrame, parseFrame } from "./protocol.js";
 
 const INCOMPLETE_LOCK_GRACE_MS = 5_000;
-const OWNER_HEARTBEAT_TIMEOUT_MS = 5_000;
-const OWNER_FENCE_WAIT_MS = 1_100;
+
 const execFileAsync = promisify(execFile);
 
 interface LeaderMetadata {
@@ -21,7 +20,6 @@ interface LeaderMetadata {
 export interface LeaderInspection {
 	lookupProcessIdentity(pid: number): Promise<string | undefined>;
 	probeRelay(path: string): Promise<boolean>;
-	wait(milliseconds: number): Promise<void>;
 }
 
 export interface LeaderLease {
@@ -103,7 +101,6 @@ async function protocolReachable(path: string): Promise<boolean> {
 const defaultInspection: LeaderInspection = {
 	lookupProcessIdentity: processIdentity,
 	probeRelay: protocolReachable,
-	wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 
 async function currentMetadata(paths: RelayPaths): Promise<LeaderMetadata | undefined> {
@@ -115,33 +112,26 @@ async function currentMetadata(paths: RelayPaths): Promise<LeaderMetadata | unde
 	}
 }
 
-async function takeoverEligible(
-	paths: RelayPaths,
-	inspection: LeaderInspection,
-): Promise<{ eligible: boolean; requiresFenceWait: boolean }> {
+async function takeoverEligible(paths: RelayPaths, inspection: LeaderInspection): Promise<boolean> {
 	const metadata = await currentMetadata(paths);
 	const ownerStat = await stat(paths.leaderLock).catch((error: NodeJS.ErrnoException) => {
 		if (error.code === "ENOENT") return undefined;
 		throw error;
 	});
-	if (!ownerStat) return { eligible: true, requiresFenceWait: false };
-	const heartbeatExpired = Date.now() - ownerStat.mtimeMs >= OWNER_HEARTBEAT_TIMEOUT_MS;
+	if (!ownerStat) return true;
 	if (!metadata) {
-		if (!heartbeatExpired) return { eligible: false, requiresFenceWait: false };
-		return { eligible: !(await inspection.probeRelay(paths.socket)), requiresFenceWait: true };
+		if (Date.now() - ownerStat.mtimeMs < INCOMPLETE_LOCK_GRACE_MS) return false;
+		return !(await inspection.probeRelay(paths.socket));
 	}
-	if (!processExists(metadata.pid)) return { eligible: true, requiresFenceWait: false };
-	const identity = await inspection.lookupProcessIdentity(metadata.pid);
-	if (identity !== undefined && identity !== metadata.processIdentity) {
-		return { eligible: true, requiresFenceWait: false };
+	if (processExists(metadata.pid)) {
+		const identity = await inspection.lookupProcessIdentity(metadata.pid);
+		if (identity === undefined || identity === metadata.processIdentity) return false;
 	}
-	if (!heartbeatExpired) return { eligible: false, requiresFenceWait: false };
-	if (await inspection.probeRelay(paths.socket)) return { eligible: false, requiresFenceWait: false };
-	return { eligible: true, requiresFenceWait: true };
+	return !(await inspection.probeRelay(paths.socket));
 }
 
 async function recoverStaleLeader(paths: RelayPaths, inspection: LeaderInspection): Promise<boolean> {
-	if (!(await takeoverEligible(paths, inspection)).eligible) return false;
+	if (!(await takeoverEligible(paths, inspection))) return false;
 	let recovery;
 	try {
 		recovery = await open(paths.recoveryLock, "wx", 0o600);
@@ -156,8 +146,7 @@ async function recoverStaleLeader(paths: RelayPaths, inspection: LeaderInspectio
 		return false;
 	}
 	try {
-		const rechecked = await takeoverEligible(paths, inspection);
-		if (!rechecked.eligible) return false;
+		if (!(await takeoverEligible(paths, inspection))) return false;
 		await unlink(paths.leaderLock).catch((error: NodeJS.ErrnoException) => {
 			if (error.code !== "ENOENT") throw error;
 		});
@@ -166,7 +155,6 @@ async function recoverStaleLeader(paths: RelayPaths, inspection: LeaderInspectio
 				if (error.code !== "ENOENT") throw error;
 			});
 		}
-		if (rechecked.requiresFenceWait) await inspection.wait(OWNER_FENCE_WAIT_MS);
 		return true;
 	} finally {
 		await recovery.close();

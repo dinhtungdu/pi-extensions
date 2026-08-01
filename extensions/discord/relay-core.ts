@@ -22,6 +22,9 @@ interface ActiveSession {
 	deliveredIds: Set<string>;
 }
 
+const OUTBOUND_RETRY_MIN_MS = 100;
+const OUTBOUND_RETRY_MAX_MS = 5_000;
+
 export class DiscordRelayCore {
 	private readonly activeSessions = new Map<string, ActiveSession>();
 	private readonly reservedSessions = new Map<string, { clientId: string; generation: string }>();
@@ -32,6 +35,8 @@ export class DiscordRelayCore {
 	private inboundQueue: Promise<void> = Promise.resolve();
 	private drainingOutbound = false;
 	private outboundDrainRequested = false;
+	private readonly outboundRetryAttempts = new Map<string, number>();
+	private readonly outboundRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private started = false;
 
 	constructor(
@@ -65,6 +70,9 @@ export class DiscordRelayCore {
 		this.activeSessions.clear();
 		this.reservedSessions.clear();
 		this.clientSessions.clear();
+		for (const timer of this.outboundRetryTimers.values()) clearTimeout(timer);
+		this.outboundRetryTimers.clear();
+		this.outboundRetryAttempts.clear();
 		await this.transport.disconnect();
 	}
 
@@ -139,7 +147,10 @@ export class DiscordRelayCore {
 		}
 		for (const sessionId of this.clientSessions.get(clientId) ?? []) {
 			const active = this.activeSessions.get(sessionId);
-			if (active?.clientId === clientId && active.generation === generation) this.activeSessions.delete(sessionId);
+			if (active?.clientId === clientId && active.generation === generation) {
+				this.activeSessions.delete(sessionId);
+				this.clearOutboundRetry(sessionId);
+			}
 		}
 		if (![...this.activeSessions.values()].some((active) => active.clientId === clientId)) this.clientSessions.delete(clientId);
 	}
@@ -204,12 +215,16 @@ export class DiscordRelayCore {
 						discordMessageId = await this.transport.sendText(next.message.threadId, chunk.content, chunk.nonce);
 					} catch {
 						blockedSessions.add(next.sessionId);
+						this.scheduleOutboundRetry(next.sessionId);
 						deliveryFailed = true;
 						break;
 					}
 					await this.state.markOutboundChunkSent(next.sessionId, next.message.id, chunk.index, discordMessageId);
 				}
-				if (!deliveryFailed) await this.state.completeOutbound(next.sessionId, next.message.id);
+				if (!deliveryFailed) {
+					await this.state.completeOutbound(next.sessionId, next.message.id);
+					this.clearOutboundRetry(next.sessionId);
+				}
 			}
 		} finally {
 			this.drainingOutbound = false;
@@ -218,6 +233,26 @@ export class DiscordRelayCore {
 				void this.drainOutbound().catch(this.onTerminalError);
 			}
 		}
+	}
+
+	private scheduleOutboundRetry(sessionId: string): void {
+		if (this.outboundRetryTimers.has(sessionId) || !this.activeSessions.has(sessionId)) return;
+		const attempt = (this.outboundRetryAttempts.get(sessionId) ?? 0) + 1;
+		this.outboundRetryAttempts.set(sessionId, attempt);
+		const delay = Math.min(OUTBOUND_RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 6), OUTBOUND_RETRY_MAX_MS);
+		const timer = setTimeout(() => {
+			this.outboundRetryTimers.delete(sessionId);
+			if (this.started && this.activeSessions.has(sessionId)) void this.drainOutbound().catch(this.onTerminalError);
+		}, delay);
+		timer.unref();
+		this.outboundRetryTimers.set(sessionId, timer);
+	}
+
+	private clearOutboundRetry(sessionId: string): void {
+		const timer = this.outboundRetryTimers.get(sessionId);
+		if (timer) clearTimeout(timer);
+		this.outboundRetryTimers.delete(sessionId);
+		this.outboundRetryAttempts.delete(sessionId);
 	}
 
 	private async catchUp(sessionId: string, mapping: SessionThreadMapping): Promise<void> {

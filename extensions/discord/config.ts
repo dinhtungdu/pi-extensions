@@ -153,42 +153,45 @@ async function authoritativeEpoch(
 	});
 }
 
+export interface RelayConfigIntent {
+	config: DiscordBridgeConfig;
+	fingerprint: string;
+}
+
 export async function publishRelayConfigIntent(
 	paths: RelayPaths,
-	epoch: number,
+	config: DiscordBridgeConfig,
 	fingerprint: string,
 ): Promise<void> {
 	await mkdir(paths.directory, { recursive: true, mode: 0o700 });
 	await withExclusiveLock(`${paths.configIntent}.lock`, async () => {
-		let current: { epoch: number; fingerprint: string } | undefined;
+		let current: RelayConfigIntent | undefined;
 		try {
-			const parsed = JSON.parse(await readFile(paths.configIntent, "utf8")) as { epoch?: unknown; fingerprint?: unknown };
-			if (Number.isSafeInteger(parsed.epoch) && typeof parsed.fingerprint === "string") {
-				current = { epoch: Number(parsed.epoch), fingerprint: parsed.fingerprint };
+			const parsed = JSON.parse(await readFile(paths.configIntent, "utf8")) as { config?: unknown; fingerprint?: unknown };
+			if (typeof parsed.fingerprint === "string" && parsed.config !== undefined) {
+				current = { config: parseDiscordConfig(parsed.config), fingerprint: parsed.fingerprint };
 			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
-		if (current && (current.epoch > epoch || (current.epoch === epoch && current.fingerprint === fingerprint))) return;
-		if (current?.epoch === epoch && current.fingerprint !== fingerprint) {
-			throw new Error(`Discord relay configuration epoch ${epoch} has conflicting fingerprints`);
+		if (current && (current.config.epoch > config.epoch ||
+			(current.config.epoch === config.epoch && current.fingerprint === fingerprint))) return;
+		if (current?.config.epoch === config.epoch && current.fingerprint !== fingerprint) {
+			throw new Error(`Discord relay configuration epoch ${config.epoch} has conflicting fingerprints`);
 		}
 		const temporary = `${paths.configIntent}.${process.pid}.${randomUUID()}.tmp`;
-		await writeFile(temporary, `${JSON.stringify({ epoch, fingerprint })}\n`, { mode: 0o600 });
+		await writeFile(temporary, `${JSON.stringify({ config, fingerprint })}\n`, { mode: 0o600 });
 		await rename(temporary, paths.configIntent);
 	});
 }
 
-export async function mayLeadRelayConfig(paths: RelayPaths, epoch: number, fingerprint: string): Promise<boolean> {
+export async function loadRelayConfigIntent(paths: RelayPaths): Promise<RelayConfigIntent> {
 	try {
-		const intent = JSON.parse(await readFile(paths.configIntent, "utf8")) as { epoch?: unknown; fingerprint?: unknown };
-		if (!Number.isSafeInteger(intent.epoch) || typeof intent.fingerprint !== "string") {
-			throw new Error(`Discord relay configuration intent ${paths.configIntent} is invalid`);
-		}
-		return Number(intent.epoch) < epoch || (intent.epoch === epoch && intent.fingerprint === fingerprint);
+		const intent = JSON.parse(await readFile(paths.configIntent, "utf8")) as { config?: unknown; fingerprint?: unknown };
+		if (typeof intent.fingerprint !== "string") throw new Error("missing fingerprint");
+		return { config: parseDiscordConfig(intent.config), fingerprint: intent.fingerprint };
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-		throw error;
+		throw new Error(`Cannot read Discord relay configuration intent ${paths.configIntent}: ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
 

@@ -20,6 +20,7 @@ interface SocketState {
 	generation?: string;
 	sessionId?: string;
 	closed: boolean;
+	registered: boolean;
 	buffer: string;
 	queue: Promise<void>;
 	queuedInputFrames: number;
@@ -27,12 +28,17 @@ interface SocketState {
 	writer: BoundedSocketWriter;
 }
 
+const ZERO_CLIENT_GRACE_MS = 1_000;
+
 export class LocalRelayHost {
 	private server: Server | undefined;
 	private readonly sockets = new Set<Socket>();
 	private readonly socketStates = new Map<Socket, SocketState>();
 	private stopPromise: Promise<void> | undefined;
 	private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	private zeroClientTimer: ReturnType<typeof setTimeout> | undefined;
+	private registeredClientCount = 0;
+	private readonly stopWaiters = new Set<() => void>();
 	private stopped = true;
 
 	constructor(private readonly options: RelayHostOptions) {}
@@ -64,6 +70,7 @@ export class LocalRelayHost {
 				});
 			});
 			if (process.platform !== "win32") await chmod(this.options.paths.socket, 0o600);
+			this.scheduleZeroClientStop();
 			server.on("error", (error) => {
 				for (const socket of this.sockets) {
 					const state = this.socketStates.get(socket);
@@ -79,6 +86,11 @@ export class LocalRelayHost {
 		}
 	}
 
+	waitForStop(): Promise<void> {
+		if (this.stopped) return Promise.resolve();
+		return new Promise((resolve) => this.stopWaiters.add(resolve));
+	}
+
 	async stop(): Promise<void> {
 		if (this.stopPromise) return this.stopPromise;
 		if (this.stopped) return;
@@ -89,7 +101,9 @@ export class LocalRelayHost {
 
 	private async performStop(): Promise<void> {
 		if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+		if (this.zeroClientTimer) clearTimeout(this.zeroClientTimer);
 		this.heartbeatTimer = undefined;
+		this.zeroClientTimer = undefined;
 		for (const [socket, state] of this.socketStates) {
 			state.writer.close();
 			socket.destroy();
@@ -111,6 +125,8 @@ export class LocalRelayHost {
 			}
 		} finally {
 			await this.options.lease.release();
+			for (const resolve of this.stopWaiters) resolve();
+			this.stopWaiters.clear();
 		}
 	}
 
@@ -120,6 +136,7 @@ export class LocalRelayHost {
 		const state = {} as SocketState;
 		Object.assign(state, {
 			closed: false,
+			registered: false,
 			buffer: "",
 			queue: Promise.resolve(),
 			queuedInputFrames: 0,
@@ -169,6 +186,10 @@ export class LocalRelayHost {
 			state.writer.close();
 			this.sockets.delete(socket);
 			this.socketStates.delete(socket);
+			if (state.registered) {
+				this.registeredClientCount--;
+				this.scheduleZeroClientStop();
+			}
 			void state.queue.finally(() => {
 				if (state.clientId && state.generation) this.options.core.unregisterClient(state.clientId, state.generation);
 			});
@@ -199,6 +220,10 @@ export class LocalRelayHost {
 				this.fail(socket, state, "Discord bridge configuration authority reported an epoch collision", true);
 				return;
 			}
+			state.registered = true;
+			this.registeredClientCount++;
+			if (this.zeroClientTimer) clearTimeout(this.zeroClientTimer);
+			this.zeroClientTimer = undefined;
 			const prepared = await this.options.core.prepareRegistration(parsed.clientId, parsed.generation, {
 				cwd: parsed.cwd,
 				sessionId: parsed.sessionId,
@@ -246,6 +271,15 @@ export class LocalRelayHost {
 			return;
 		}
 		if (parsed.type === "unregister") socket.end();
+	}
+
+	private scheduleZeroClientStop(): void {
+		if (this.stopped || this.registeredClientCount > 0 || this.zeroClientTimer) return;
+		this.zeroClientTimer = setTimeout(() => {
+			this.zeroClientTimer = undefined;
+			if (this.registeredClientCount === 0) void this.stop();
+		}, ZERO_CLIENT_GRACE_MS);
+		this.zeroClientTimer.unref();
 	}
 
 	private write(state: SocketState, frame: ServerFrame): boolean {
