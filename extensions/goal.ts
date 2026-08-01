@@ -8,6 +8,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { PACKAGE_FOOTER_STATUS_KEYS } from "./footer-status.js";
 
 type GoalStatus = "active" | "paused" | "budget_limited" | "complete" | "cleared";
 
@@ -81,7 +82,7 @@ interface UsageShape {
 
 const ENTRY_TYPE = "pi-extensions-goal-state";
 const CONTINUATION_MESSAGE_TYPE = "pi-extensions-goal-continuation";
-const STATUS_KEY = "goal";
+const STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.goal;
 const MAX_OBJECTIVE_LENGTH = 4_000;
 
 const TERMINAL_STATUSES = new Set<GoalStatus>(["complete", "budget_limited", "cleared"]);

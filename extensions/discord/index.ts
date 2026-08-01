@@ -12,8 +12,9 @@ import { DiscordStateStore } from "./state.js";
 import { DiscordJsTransport, type DiscordTransport } from "./transport.js";
 import { runRelayChild } from "./relay-child.js";
 import { launchRelayChild } from "./relay-launcher.js";
+import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 
-const STATUS_KEY = "discord-bridge";
+const STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.discord;
 const STATUS_CONNECTED = "💬";
 const STATUS_RECONNECTING = "🔄";
 const STATUS_ERROR = "⚠️";

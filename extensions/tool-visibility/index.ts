@@ -5,8 +5,9 @@ import {
 	MINIMUM_PI_VERSION,
 	type ToolVisibilityController,
 } from "./visibility-shim.js";
+import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 
-const STATUS_KEY = "tool-visibility";
+const STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.toolVisibility;
 const HIDDEN_STATUS_ICON = "🧰";
 
 type VisibilityAction = "toggle" | "show" | "hide";

@@ -1,7 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { VoicePhase } from "./runtime.js";
+import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 
-export const VOICE_STATUS_KEY = "voice";
+export const VOICE_STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.voice;
 export const VOICE_STATUS_ICON = "🎙";
 
 function voiceColor(phase: VoicePhase): "dim" | "accent" | "success" | "error" {

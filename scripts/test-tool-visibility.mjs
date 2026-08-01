@@ -105,6 +105,9 @@ function createExtensionHarness(extension) {
 try {
 	initTheme("dark");
 	compileExtensions();
+	const { PACKAGE_FOOTER_STATUS_KEYS } = await import(
+		pathToFileURL(join(output, "extensions", "footer-status.js"))
+	);
 	const shimModule = await import(
 		pathToFileURL(join(output, "extensions", "tool-visibility", "visibility-shim.js"))
 	);
@@ -369,7 +372,7 @@ try {
 	);
 	assert.deepEqual(
 		harness.statuses.at(-1),
-		["tool-visibility", undefined],
+		[PACKAGE_FOOTER_STATUS_KEYS.toolVisibility, undefined],
 		"startup must leave the footer clear while tools are shown",
 	);
 	assert.deepEqual(harness.thinkingLabelCalls, [], "default mode must not alter Pi's thinking label");
@@ -390,7 +393,7 @@ try {
 	assert.ok(newRow.render(80).length > 0, "bare /tools must toggle hidden rows back to shown");
 	assert.deepEqual(
 		harness.statuses.at(-1),
-		["tool-visibility", undefined],
+		[PACKAGE_FOOTER_STATUS_KEYS.toolVisibility, undefined],
 		"toggle-to-shown must clear the footer status",
 	);
 	assert.deepEqual(harness.thinkingLabelCalls.at(-1), [], "shown mode must restore Pi's thinking label");
@@ -403,14 +406,14 @@ try {
 	assert.deepEqual(newRow.render(80), [], "/tools hide must hide rows");
 	assert.deepEqual(
 		harness.statuses.at(-1),
-		["tool-visibility", "🧰"],
+		[PACKAGE_FOOTER_STATUS_KEYS.toolVisibility, "🧰"],
 		"/tools hide must retain only the compact hidden status",
 	);
 	await harness.command("tools", "show");
 	assert.ok(newRow.render(80).length > 0, "/tools show must restore rows");
 	assert.deepEqual(
 		harness.statuses.at(-1),
-		["tool-visibility", undefined],
+		[PACKAGE_FOOTER_STATUS_KEYS.toolVisibility, undefined],
 		"/tools show must clear the footer status",
 	);
 	await harness.command("tools", "status");
@@ -421,7 +424,7 @@ try {
 
 	await harness.emit("session_shutdown", { reason: "reload" });
 	assert.equal(prototype.render, originalRender, "reload shutdown must restore Pi before the next extension instance");
-	assert.deepEqual(harness.statuses.at(-1), ["tool-visibility", undefined]);
+	assert.deepEqual(harness.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.toolVisibility, undefined]);
 
 	const reloaded = createExtensionHarness(extensionModule.default);
 	await reloaded.emit("session_start", { reason: "reload" });

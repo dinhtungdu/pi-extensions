@@ -203,6 +203,7 @@ try {
 		relayPaths,
 		saveDiscordConfig,
 	} = await importBuilt("extensions/discord/config.js");
+	const { PACKAGE_FOOTER_STATUS_KEYS } = await importBuilt("extensions/footer-status.js");
 	const { DiscordStateStore } = await importBuilt("extensions/discord/state.js");
 	const { LocalRelayClient } = await importBuilt("extensions/discord/relay-client.js");
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
@@ -676,8 +677,8 @@ try {
 	assert.ok(first.events.has("agent_settled"));
 	assert.equal(first.events.has("agent_end"), false);
 
-	assert.deepEqual(first.statuses.at(-1), ["discord-bridge", "💬"]);
-	assert.deepEqual(second.statuses.at(-1), ["discord-bridge", "💬"]);
+	assert.deepEqual(first.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
+	assert.deepEqual(second.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
 	const firstMapping = await new DiscordStateStore(stateFile).getSession("session-11111111");
 	const secondMapping = await new DiscordStateStore(stateFile).getSession("session-22222222");
 	const { channelId: firstChannel, threadId: firstThread } = firstMapping;
@@ -744,7 +745,7 @@ try {
 	failedInjection.setInjectionError(true);
 	await gateway.emit({ id: "15", channelId: failedThread, content: "must remain pending", authorBot: false });
 	await waitFor(() => failedInjection.notifications.some(([text]) => text.includes("injected Pi acceptance failure")), "Pi injection failure");
-	assert.deepEqual(failedInjection.statuses.at(-1), ["discord-bridge", "⚠️"]);
+	assert.deepEqual(failedInjection.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "⚠️"]);
 	assert.equal(failedInjection.userMessages.length, 0);
 	const shutdownStarted = Date.now();
 	await failedInjection.emit("session_shutdown", { reason: "quit" });
@@ -868,7 +869,7 @@ try {
 	await waitFor(() => FakeGateway.activeConnections === 0, "rollover relay shutdown");
 	for (const harness of [first, second, failedInjection, retriedInjection, inactive, resumed, restarted, rolloverA, rolloverB]) {
 		for (const [key, text] of harness.statuses) {
-			assert.equal(key, "discord-bridge");
+			assert.equal(key, PACKAGE_FOOTER_STATUS_KEYS.discord);
 			assert.ok(text === undefined || text === "💬" || text === "🔄" || text === "⚠️", `footer status must be compact: ${text}`);
 		}
 	}
