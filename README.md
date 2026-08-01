@@ -94,7 +94,7 @@ Notes:
 
 ## Discord bridge
 
-The Discord extension connects automatically when configured. It keeps one durable text channel per working directory and one durable thread per Pi session. Resuming a session reuses its thread and reopens it when archived; channels and threads are never deleted.
+The Discord extension connects automatically when configured. The first active Pi process becomes the local relay leader and owns the only Discord gateway connection; other Pi processes register their cwd and session over authenticated local IPC. The relay is bundled in the extension—there is no daemon or system service to install. Leadership fails over when the owner exits. It keeps one durable text channel per working directory and one durable thread per Pi session. Resuming a session reuses its thread and reopens it when archived; channels and threads are never deleted.
 
 Bot setup:
 
@@ -112,7 +112,9 @@ Bot setup:
 
 `categoryId` is optional; omit it to create project channels at the guild root. A configured category that is missing, belongs to another guild, or is not a category fails startup explicitly instead of silently falling back to the root. `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, and `DISCORD_CATEGORY_ID` override file values.
 
-Mappings and recent inbound message IDs are stored in `~/.pi/agent/discord-bridge/state.json`. State writes are atomic and cross-process locked. The bridge ignores bot messages and duplicate Discord IDs, and extension-injected Pi input is not echoed back. Discord messages received while Pi is active use Pi 0.83's normal `followUp` queue. Assistant text is sent only after `agent_settled`; thinking, tools, progress, attachments, and intermediate responses are not forwarded.
+Mappings, per-thread Discord cursors, pending inbound messages, and recent IDs are stored in `~/.pi/agent/discord-bridge/state.json`. Relay ownership, its Unix socket/named pipe, and a generated 256-bit IPC token live in the same mode-0700 directory; token and Unix socket are mode 0600. State writes are atomic and cross-process locked. Inactive sessions receive queued messages when they register again. If every Pi process was closed, the next relay fetches messages after each registering session's durable cursor where Discord history APIs permit.
+
+The bridge ignores bot messages and duplicate Discord IDs, and extension-injected Pi input is not echoed back. Discord messages received while Pi is active use Pi 0.83's normal `followUp` queue. Assistant text is sent only after `agent_settled`; thinking, tools, progress, attachments, and intermediate responses are not forwarded.
 
 Commands:
 

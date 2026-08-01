@@ -3,11 +3,15 @@ import { DiscordBridge, type BridgeSession } from "./bridge.js";
 import {
 	DISCORD_CONFIG_FILE,
 	type DiscordBridgeConfig,
+	type RelayPaths,
 	loadDiscordConfig,
+	relayPaths,
 	saveDiscordConfig,
 } from "./config.js";
 import { DiscordStateStore } from "./state.js";
 import { DiscordJsTransport, type DiscordTransport } from "./transport.js";
+import { DiscordRelayCore } from "./relay-core.js";
+import { LocalRelayHost } from "./relay-host.js";
 
 const STATUS_KEY = "discord-bridge";
 
@@ -16,6 +20,7 @@ type ConfigLoader = () => Promise<DiscordBridgeConfig | null>;
 export interface DiscordExtensionDependencies {
 	loadConfig?: ConfigLoader;
 	saveConfig?: (config: DiscordBridgeConfig) => Promise<void>;
+	paths?: RelayPaths;
 	createStateStore?: () => DiscordStateStore;
 	createTransport?: () => DiscordTransport;
 }
@@ -27,6 +32,7 @@ function errorMessage(error: unknown): string {
 export function createDiscordExtension(dependencies: DiscordExtensionDependencies = {}) {
 	const loadConfig = dependencies.loadConfig ?? (() => loadDiscordConfig());
 	const saveConfig = dependencies.saveConfig ?? ((config) => saveDiscordConfig(config));
+	const paths = dependencies.paths ?? relayPaths();
 	const createStateStore = dependencies.createStateStore ?? (() => new DiscordStateStore());
 	const createTransport = dependencies.createTransport ?? (() => new DiscordJsTransport());
 
@@ -46,7 +52,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			const status = bridge?.status();
 			ctx.ui.setStatus(
 				STATUS_KEY,
-				status?.connected ? `Discord ${status.channelId}/${status.threadId}` : undefined,
+				status?.connected ? `Discord relay ${status.channelId}/${status.threadId}` : undefined,
 			);
 		}
 
@@ -75,15 +81,27 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			const candidate = new DiscordBridge(
 				config,
 				sessionFrom(ctx),
-				createStateStore(),
-				createTransport(),
 				{
 					onUserText(text) {
 						if (ctx.isIdle()) pi.sendUserMessage(text);
 						else pi.sendUserMessage(text, { deliverAs: "followUp" });
 					},
 					onError(error) {
+						ctx.ui.setStatus(STATUS_KEY, "Discord error");
 						ctx.ui.notify(`Discord bridge: ${error.message}`, "error");
+					},
+					onStatus(status) {
+						ctx.ui.setStatus(
+							STATUS_KEY,
+							status.connected ? `Discord relay ${status.channelId}/${status.threadId}` : "Discord relay reconnecting",
+						);
+					},
+				},
+				{
+					paths,
+					createHost(lease, token, fingerprint) {
+						const core = new DiscordRelayCore(config!, createStateStore(), createTransport());
+						return new LocalRelayHost({ paths, token, configFingerprint: fingerprint, lease, core });
 					},
 				},
 			);
@@ -92,6 +110,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				await candidate.start();
 				setConnectedStatus(ctx);
 			} catch (error) {
+				await candidate.stop().catch(() => {});
 				bridge = undefined;
 				ctx.ui.setStatus(STATUS_KEY, "Discord error");
 				ctx.ui.notify(`Discord bridge failed: ${errorMessage(error)}`, "error");
@@ -192,7 +211,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					const status = bridge?.status();
 					ctx.ui.notify(
 						status?.connected
-							? `Discord bridge connected\nProject channel: ${status.channelId}\nSession thread: ${status.threadId}`
+							? `Discord bridge connected through local relay PID ${status.leaderPid}\nProject channel: ${status.channelId}\nSession thread: ${status.threadId}`
 							: `Discord bridge disconnected\nConfig: ${DISCORD_CONFIG_FILE}`,
 						"info",
 					);

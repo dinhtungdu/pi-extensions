@@ -37,6 +37,7 @@ export interface DiscordTransport {
 	onMessage(listener: (message: DiscordInboundMessage) => void): () => void;
 	ensureProjectChannel(request: ProjectChannelRequest): Promise<string>;
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
+	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
 	sendText(channelId: string, text: string): Promise<void>;
 }
 
@@ -77,6 +78,9 @@ export class DiscordJsTransport implements DiscordTransport {
 			intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 		});
 		this.client = client;
+		client.on(Events.Error, (error) => {
+			console.error("[discord-bridge] Discord client error:", error);
+		});
 		client.on(Events.MessageCreate, (message) => {
 			const normalized: DiscordInboundMessage = {
 				id: message.id,
@@ -152,6 +156,31 @@ export class DiscordJsTransport implements DiscordTransport {
 			reason: "Pi Discord bridge session thread",
 		});
 		return thread.id;
+	}
+
+	async fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]> {
+		const channel = await this.readyClient().channels.fetch(channelId).catch(() => null);
+		if (!channel?.isTextBased() || channel.isDMBased()) {
+			throw new Error(`Discord thread ${channelId} is missing or cannot fetch messages`);
+		}
+		const result: DiscordInboundMessage[] = [];
+		let cursor = afterId;
+		for (let page = 0; page < 100; page++) {
+			const messages = await channel.messages.fetch({ after: cursor, limit: 100 });
+			const ordered = [...messages.values()].sort((left, right) => left.createdTimestamp - right.createdTimestamp);
+			if (ordered.length === 0) break;
+			for (const message of ordered) {
+				result.push({
+					id: message.id,
+					channelId: message.channelId,
+					content: message.content,
+					authorBot: message.author.bot,
+				});
+			}
+			cursor = ordered.at(-1)!.id;
+			if (ordered.length < 100) break;
+		}
+		return result;
 	}
 
 	async sendText(channelId: string, text: string): Promise<void> {
