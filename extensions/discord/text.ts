@@ -67,24 +67,27 @@ export function assistantText(message: {
 	return text || undefined;
 }
 
-const INTERACTIVE_PREFIX = "🖥️ **";
-const INTERACTIVE_SUFFIX = "**";
-const DISCORD_MARKDOWN_CHARACTERS = new Set(["\\", "`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "-", ".", "!", "|", ">", "~"]);
+const INTERACTIVE_HEADER = "──────────── 👨‍💻 ────────────";
+const INTERACTIVE_FOOTER = "──────────────────────────────";
+const INTERACTIVE_PREFIX = `${INTERACTIVE_HEADER}\n`;
+const INTERACTIVE_SUFFIX = `\n${INTERACTIVE_FOOTER}`;
+const MAX_UTF16_CODE_POINT_LENGTH = 2;
 
 export function interactiveUserChunks(text: string, maximum = SAFE_MESSAGE_LIMIT): string[] {
-	const payloadLimit = maximum - INTERACTIVE_PREFIX.length - INTERACTIVE_SUFFIX.length;
-	if (!Number.isInteger(maximum) || payloadLimit < 1 || maximum > DISCORD_MESSAGE_LIMIT) {
-		throw new Error(`Formatted Discord message limit must be between ${INTERACTIVE_PREFIX.length + INTERACTIVE_SUFFIX.length + 1} and ${DISCORD_MESSAGE_LIMIT}`);
+	const frameLength = INTERACTIVE_PREFIX.length + INTERACTIVE_SUFFIX.length;
+	const payloadLimit = maximum - frameLength;
+	const minimum = frameLength + MAX_UTF16_CODE_POINT_LENGTH;
+	if (!Number.isInteger(maximum) || maximum < minimum || maximum > DISCORD_MESSAGE_LIMIT) {
+		throw new Error(`Formatted Discord message limit must be between ${minimum} and ${DISCORD_MESSAGE_LIMIT}`);
 	}
 	const payloads: string[] = [];
 	let payload = "";
 	for (const character of text) {
-		const escaped = DISCORD_MARKDOWN_CHARACTERS.has(character) ? `\\${character}` : character;
-		if (payload && payload.length + escaped.length > payloadLimit) {
+		if (payload && payload.length + character.length > payloadLimit) {
 			payloads.push(payload);
 			payload = "";
 		}
-		payload += escaped;
+		payload += character;
 	}
 	if (payload) payloads.push(payload);
 	return payloads.map((chunk) => `${INTERACTIVE_PREFIX}${chunk}${INTERACTIVE_SUFFIX}`);

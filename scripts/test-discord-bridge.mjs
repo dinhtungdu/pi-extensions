@@ -323,20 +323,35 @@ try {
 	const chunks = splitDiscordText("a".repeat(4_100));
 	assert.equal(chunks.join(""), "a".repeat(4_100));
 	assert.ok(chunks.every((chunk) => chunk.length <= 1_900));
-	assert.deepEqual(interactiveUserChunks("ordinary input"), ["🖥️ **ordinary input**"]);
-	assert.deepEqual(interactiveUserChunks("line one\nline two"), ["🖥️ **line one\nline two**"]);
+	const interactivePrefix = "──────────── 👨‍💻 ────────────\n";
+	const interactiveSuffix = "\n──────────────────────────────";
+	const framedInteractive = (body) => `${interactivePrefix}${body}${interactiveSuffix}`;
+	const interactiveBodies = (messages) => messages.map((message) => message.slice(interactivePrefix.length, -interactiveSuffix.length));
+	assert.deepEqual(interactiveUserChunks("ordinary input"), [framedInteractive("ordinary input")]);
+	assert.deepEqual(interactiveUserChunks("line one\nline two"), [framedInteractive("line one\nline two")]);
 	assert.deepEqual(
 		interactiveUserChunks("**bold** _under_ `code` \\ slash"),
-		["🖥️ **\\*\\*bold\\*\\* \\_under\\_ \\`code\\` \\\\ slash**"],
+		[framedInteractive("**bold** _under_ `code` \\ slash")],
+		"interactive Markdown must remain byte-for-byte unchanged in the frame body",
 	);
+	assert.deepEqual(interactiveUserChunks(""), []);
+	assert.deepEqual(interactiveUserChunks(" \n "), [framedInteractive(" \n ")], "whitespace-only interactive input must be preserved");
+	const interactiveCapacity = 1_900 - interactivePrefix.length - interactiveSuffix.length;
+	assert.equal(interactiveCapacity, 1_837);
+	assert.equal(interactiveUserChunks("a".repeat(interactiveCapacity))[0].length, 1_900);
+	const boundaryUnicodeInput = `${"a".repeat(interactiveCapacity - 1)}😀b`;
+	const boundaryUnicodeChunks = interactiveUserChunks(boundaryUnicodeInput);
+	assert.equal(boundaryUnicodeChunks.length, 2);
+	assert.ok(boundaryUnicodeChunks.every((chunk) => chunk.length <= 1_900));
+	assert.equal(interactiveBodies(boundaryUnicodeChunks).join(""), boundaryUnicodeInput, "UTF-16 surrogate pairs must remain intact across chunks");
+	assert.doesNotMatch(interactiveBodies(boundaryUnicodeChunks)[0], /[\uD800-\uDBFF]$/);
+	assert.doesNotMatch(interactiveBodies(boundaryUnicodeChunks)[1], /^[\uDC00-\uDFFF]/);
+	assert.throws(() => interactiveUserChunks("x", interactivePrefix.length + interactiveSuffix.length + 1), /between 65 and 2000/);
 	const longInteractiveInput = "long *markdown* line\n".repeat(300);
 	const longInteractiveChunks = interactiveUserChunks(longInteractiveInput);
 	assert.ok(longInteractiveChunks.length > 1);
-	assert.ok(longInteractiveChunks.every((chunk) => chunk.startsWith("🖥️ **") && chunk.endsWith("**") && chunk.length <= 1_900));
-	const reconstructedInteractive = longInteractiveChunks
-		.map((chunk) => chunk.slice("🖥️ **".length, -2).replace(/\\([\\`*_{}[\]()#+\-.!|>~])/g, "$1"))
-		.join("");
-	assert.equal(reconstructedInteractive, longInteractiveInput);
+	assert.ok(longInteractiveChunks.every((chunk) => chunk.startsWith(interactivePrefix) && chunk.endsWith(interactiveSuffix) && chunk.length <= 1_900));
+	assert.equal(interactiveBodies(longInteractiveChunks).join(""), longInteractiveInput);
 
 	const previousValidator = (frame) => frame?.type === "outbound" && typeof frame.requestId === "string" &&
 		typeof frame.messageId === "string" && typeof frame.text === "string" && (frame.kind === "user" || frame.kind === "assistant");
@@ -884,15 +899,20 @@ try {
 	assert.equal(FakeGateway.lifecycleReactionEvents.length, localReactionCount, "local/TUI runs must never receive Discord reactions");
 
 	await first.emit("input", { text: "local input", source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === "🖥️ **local input**"), "formatted interactive user send");
+	await waitFor(() => gateway.sent.some((message) => message.text === framedInteractive("local input")), "framed interactive user send");
 	assert.equal(gateway.sent.at(-1).channelId, firstThread);
-	assert.equal(gateway.sent.at(-1).text, "🖥️ **local input**");
+	assert.equal(gateway.sent.at(-1).text, framedInteractive("local input"));
 	await first.emit("input", { text: "line one\nline two", source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === "🖥️ **line one\nline two**"), "formatted multiline interactive send");
+	await waitFor(() => gateway.sent.some((message) => message.text === framedInteractive("line one\nline two")), "framed multiline interactive send");
+	await first.emit("input", { text: " \n ", source: "interactive" });
+	await waitFor(() => gateway.sent.some((message) => message.text === framedInteractive(" \n ")), "framed whitespace-only interactive send");
+	const sentBeforeEmptyInput = gateway.sent.length;
+	await first.emit("input", { text: "", source: "interactive" });
+	assert.equal(gateway.sent.length, sentBeforeEmptyInput, "empty interactive input must not emit a Discord message");
 	const markdownInput = "**bold** _under_ `code` \\ slash";
 	const markdownOutput = interactiveUserChunks(markdownInput)[0];
 	await first.emit("input", { text: markdownInput, source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === markdownOutput), "markdown-safe interactive send");
+	await waitFor(() => gateway.sent.some((message) => message.text === markdownOutput), "unchanged interactive Markdown send");
 	const longStart = gateway.sent.length;
 	await first.emit("input", { text: longInteractiveInput, source: "interactive" });
 	await waitFor(() => gateway.sent.length >= longStart + longInteractiveChunks.length, "chunk-safe long interactive send");

@@ -168,7 +168,7 @@ export class LocalRelayClient {
 	}
 
 	async sendInteractiveUserText(text: string): Promise<void> {
-		if (!text.trim()) return;
+		if (!text) return;
 		for (const chunk of interactiveUserChunks(text)) await this.queueOutbound("user", chunk);
 	}
 
