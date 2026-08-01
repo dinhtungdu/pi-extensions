@@ -8,11 +8,13 @@ import {
 	type SessionThreadMapping,
 } from "./state.js";
 import { lifecycleReaction, type DiscordLifecycleStatus } from "./reactions.js";
+import { resolveProjectIdentity } from "./project-identity.js";
 import { normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
 import type { DiscordInboundMessage, DiscordTransport } from "./transport.js";
 
 export interface RelaySessionRegistration {
 	cwd: string;
+	projectIdentityResolved?: boolean;
 	sessionId: string;
 	sessionName?: string;
 }
@@ -121,7 +123,9 @@ export class DiscordRelayCore {
 		this.reservedSessions.set(registration.sessionId, { clientId, generation });
 		this.catchingUpSessions.add(registration.sessionId);
 		try {
-			const cwd = normalizeCwd(registration.cwd);
+			const cwd = registration.projectIdentityResolved
+				? normalizeCwd(registration.cwd)
+				: await resolveProjectIdentity(registration.cwd);
 			const channelId = await this.state.resolveProjectChannel(cwd, (project) => {
 				return this.transport.ensureProjectChannel({
 					guildId: this.config.guildId,

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -225,6 +225,7 @@ try {
 	const { PACKAGE_FOOTER_STATUS_KEYS } = await importBuilt("extensions/footer-status.js");
 	const { DiscordStateStore } = await importBuilt("extensions/discord/state.js");
 	const { LocalRelayClient } = await importBuilt("extensions/discord/relay-client.js");
+	const { resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
@@ -290,6 +291,25 @@ try {
 	const malformedConfig = join(dataDir, "malformed-config.json");
 	await writeFile(malformedConfig, "{oops");
 	await assert.rejects(() => loadDiscordConfig(malformedConfig, {}), /Cannot read Discord bridge config/);
+	const legacyStateFile = join(dataDir, "legacy-state.json");
+	await writeFile(legacyStateFile, JSON.stringify({
+		version: 1,
+		projects: { "/legacy/project": { channelId: "legacy-channel" } },
+		sessions: {
+			"legacy-session": {
+				cwd: "/legacy/project",
+				channelId: "legacy-channel",
+				threadId: "legacy-thread",
+				lastMessageId: "123",
+				pendingMessages: [],
+			},
+		},
+		recentMessageIds: [],
+	}));
+	const legacyState = await new DiscordStateStore(legacyStateFile).load();
+	assert.equal(legacyState.sessions["legacy-session"].threadCursors["legacy-thread"], "123");
+	assert.deepEqual(legacyState.sessions["legacy-session"].outboundMessages, []);
+	assert.deepEqual(legacyState.sessions["legacy-session"].lifecycleMessages, []);
 	const epochConfig = join(dataDir, "epoch-config.json");
 	await saveDiscordConfig({ token: "one", guildId: "12345" }, epochConfig);
 	const firstEpoch = (await loadDiscordConfig(epochConfig, {})).epoch;
@@ -300,6 +320,122 @@ try {
 	const environmentFirst = await loadDiscordConfig(environmentConfig, { DISCORD_TOKEN: "environment-one" });
 	const environmentSecond = await loadDiscordConfig(environmentConfig, { DISCORD_TOKEN: "environment-two" });
 	assert.ok(environmentSecond.epoch > environmentFirst.epoch, "environment-only effective config changes need an authoritative epoch");
+
+	const gitIdentityDirectory = join(dataDir, "git identity fixtures");
+	const mainCheckout = join(gitIdentityDirectory, "main repository");
+	const linkedWorktree = join(gitIdentityDirectory, "linked worktree");
+	const runGit = (...args) => {
+		const result = spawnSync("git", args, { encoding: "utf8" });
+		assert.equal(result.status, 0, `git ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`);
+	};
+	await mkdir(mainCheckout, { recursive: true });
+	runGit("init", "-q", mainCheckout);
+	runGit("-C", mainCheckout, "config", "user.email", "discord-test@example.com");
+	runGit("-C", mainCheckout, "config", "user.name", "Discord Test");
+	await writeFile(join(mainCheckout, "tracked file"), "initial\n");
+	runGit("-C", mainCheckout, "add", "tracked file");
+	runGit("-C", mainCheckout, "commit", "-qm", "initial");
+	runGit("-C", mainCheckout, "worktree", "add", "-qb", "discord-linked", linkedWorktree);
+	const linkedSubdirectory = join(linkedWorktree, "directory with spaces");
+	await mkdir(linkedSubdirectory);
+	const canonicalMainCheckout = await realpath(mainCheckout);
+	assert.equal(await resolveProjectIdentity(mainCheckout), canonicalMainCheckout, "a normal checkout must identify its repository root");
+	assert.equal(await resolveProjectIdentity(linkedWorktree), canonicalMainCheckout, "a linked worktree must identify its main checkout");
+	assert.equal(await resolveProjectIdentity(linkedSubdirectory), canonicalMainCheckout, "a worktree subdirectory must retain repository identity");
+
+	const submoduleSource = join(gitIdentityDirectory, "submodule source");
+	await mkdir(submoduleSource);
+	runGit("init", "-q", submoduleSource);
+	runGit("-C", submoduleSource, "config", "user.email", "discord-test@example.com");
+	runGit("-C", submoduleSource, "config", "user.name", "Discord Test");
+	await writeFile(join(submoduleSource, "submodule file"), "submodule\n");
+	runGit("-C", submoduleSource, "add", "submodule file");
+	runGit("-C", submoduleSource, "commit", "-qm", "submodule");
+	const submoduleCheckout = join(mainCheckout, "modules", "submodule with spaces");
+	runGit("-c", "protocol.file.allow=always", "-C", mainCheckout, "submodule", "add", "-q", submoduleSource, "modules/submodule with spaces");
+	assert.equal(
+		await resolveProjectIdentity(submoduleCheckout),
+		await realpath(submoduleCheckout),
+		"a submodule must use its working tree instead of internal parent-repository metadata",
+	);
+
+	const bareRepository = join(gitIdentityDirectory, "bare repository.git");
+	runGit("init", "--bare", "-q", bareRepository);
+	assert.equal(await resolveProjectIdentity(bareRepository), await realpath(bareRepository), "a bare repository must remain a stable project identity");
+
+	const sameBasenameOne = join(gitIdentityDirectory, "one", "shared");
+	const sameBasenameTwo = join(gitIdentityDirectory, "two", "shared");
+	await mkdir(sameBasenameOne, { recursive: true });
+	await mkdir(sameBasenameTwo, { recursive: true });
+	runGit("init", "-q", sameBasenameOne);
+	runGit("init", "-q", sameBasenameTwo);
+	assert.notEqual(
+		await resolveProjectIdentity(sameBasenameOne),
+		await resolveProjectIdentity(sameBasenameTwo),
+		"unrelated same-basename repositories must not collapse to one identity",
+	);
+	const nonGitDirectory = join(gitIdentityDirectory, "ordinary directory");
+	await mkdir(nonGitDirectory);
+	assert.equal(await resolveProjectIdentity(nonGitDirectory), resolve(nonGitDirectory), "non-Git paths must retain normalized cwd identity");
+	assert.equal(
+		await resolveProjectIdentity(nonGitDirectory, { gitExecutable: join(gitIdentityDirectory, "missing git") }),
+		resolve(nonGitDirectory),
+		"missing Git must fall back to normalized cwd",
+	);
+	const malformedGit = join(gitIdentityDirectory, "malformed git");
+	await writeFile(malformedGit, "#!/bin/sh\nprintf 'not-an-absolute-path\\nextra-output\\n'\n");
+	await chmod(malformedGit, 0o755);
+	assert.equal(
+		await resolveProjectIdentity(nonGitDirectory, { gitExecutable: malformedGit }),
+		resolve(nonGitDirectory),
+		"malformed Git output must fall back to normalized cwd",
+	);
+	const hangingGit = join(gitIdentityDirectory, "hanging git");
+	await writeFile(hangingGit, "#!/bin/sh\nwhile :; do :; done\n");
+	await chmod(hangingGit, 0o755);
+	const hangingStarted = Date.now();
+	assert.equal(
+		await resolveProjectIdentity(nonGitDirectory, { gitExecutable: hangingGit, timeoutMs: 25 }),
+		resolve(nonGitDirectory),
+		"timed-out Git must fall back to normalized cwd",
+	);
+	assert.ok(Date.now() - hangingStarted < 1_000, "Git project identity resolution must be bounded");
+
+	const identityState = new DiscordStateStore(join(dataDir, "project-identity-state.json"));
+	const canonicalChannel = await identityState.resolveProjectChannel(await resolveProjectIdentity(mainCheckout), async () => "canonical-project-channel");
+	assert.equal(
+		await identityState.resolveProjectChannel(await resolveProjectIdentity(linkedWorktree), async (request) => request.existingChannelId),
+		canonicalChannel,
+		"main and linked worktree registrations must converge on one project channel",
+	);
+	const firstIdentityThread = await identityState.resolveSessionThread("identity-main-session", canonicalMainCheckout, canonicalChannel, async () => "identity-thread-main");
+	const linkedIdentityThread = await identityState.resolveSessionThread("identity-linked-session", canonicalMainCheckout, canonicalChannel, async () => "identity-thread-linked");
+	assert.notEqual(firstIdentityThread.threadId, linkedIdentityThread.threadId, "worktree Pi sessions must retain separate threads");
+	await identityState.resolveProjectChannel(linkedWorktree, async () => "legacy-worktree-channel");
+	const identityProjects = (await identityState.load()).projects;
+	assert.ok(identityProjects[canonicalMainCheckout]);
+	assert.ok(identityProjects[resolve(linkedWorktree)], "legacy cwd mappings must remain stored without destructive migration");
+
+	const rollingIdentityState = new DiscordStateStore(join(dataDir, "rolling-project-identity-state.json"));
+	const rollingIdentityGateway = new FakeGateway();
+	const rollingIdentityCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		rollingIdentityState,
+		rollingIdentityGateway,
+	);
+	await rollingIdentityCore.start();
+	const legacyMainRegistration = await rollingIdentityCore.prepareRegistration("legacy-main-client", "legacy-main-generation", {
+		cwd: mainCheckout,
+		sessionId: "legacy-main-session",
+	});
+	const legacyLinkedRegistration = await rollingIdentityCore.prepareRegistration("legacy-linked-client", "legacy-linked-generation", {
+		cwd: linkedWorktree,
+		sessionId: "legacy-linked-session",
+	});
+	assert.equal(legacyLinkedRegistration.channelId, legacyMainRegistration.channelId, "a new relay must canonicalize registrations from rolling older clients");
+	assert.notEqual(legacyLinkedRegistration.threadId, legacyMainRegistration.threadId);
+	assert.equal(Object.keys((await rollingIdentityState.load()).projects).length, 1);
+	await rollingIdentityCore.stop();
 
 	assert.equal(projectChannelName("/one/My Project"), "my-project");
 	assert.equal(projectChannelName("/one/project"), projectChannelName("/two/project"));
@@ -353,6 +489,19 @@ try {
 	assert.ok(longInteractiveChunks.every((chunk) => chunk.startsWith(interactivePrefix) && chunk.endsWith(interactiveSuffix) && chunk.length <= 1_900));
 	assert.equal(interactiveBodies(longInteractiveChunks).join(""), longInteractiveInput);
 
+	const resolvedRegistrationFrame = {
+		type: "register",
+		token: "token",
+		clientId: "client",
+		generation: "generation",
+		configFingerprint: "fingerprint",
+		configEpoch: 1,
+		cwd: canonicalMainCheckout,
+		projectIdentityResolved: true,
+		sessionId: "session",
+	};
+	assert.equal(isClientFrame(resolvedRegistrationFrame), true);
+	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, projectIdentityResolved: "true" }), false);
 	const previousValidator = (frame) => frame?.type === "outbound" && typeof frame.requestId === "string" &&
 		typeof frame.messageId === "string" && typeof frame.text === "string" && (frame.kind === "user" || frame.kind === "assistant");
 	compatibilityDirectory = await mkdtemp(join(tmpdir(), "dc-ipc-"));

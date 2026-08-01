@@ -12,6 +12,7 @@ import { DiscordStateStore } from "./state.js";
 import { DiscordJsTransport, type DiscordTransport } from "./transport.js";
 import { runRelayChild } from "./relay-child.js";
 import { launchRelayChild } from "./relay-launcher.js";
+import { resolveProjectIdentity } from "./project-identity.js";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 
 const STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.discord;
@@ -58,9 +59,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		let operation: Promise<void> = Promise.resolve();
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
 
-		function sessionFrom(ctx: ExtensionContext): BridgeSession {
+		async function sessionFrom(ctx: ExtensionContext): Promise<BridgeSession> {
 			return {
-				cwd: ctx.cwd,
+				cwd: await resolveProjectIdentity(ctx.cwd),
+				projectIdentityResolved: true,
 				sessionId: ctx.sessionManager.getSessionId(),
 				sessionName: pi.getSessionName(),
 			};
@@ -98,7 +100,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 			const candidate = new DiscordBridge(
 				config,
-				sessionFrom(ctx),
+				await sessionFrom(ctx),
 				{
 					onUserText(text) {
 						if (ctx.isIdle()) pi.sendUserMessage(text);

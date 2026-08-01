@@ -226,6 +226,7 @@ export class LocalRelayHost {
 			this.zeroClientTimer = undefined;
 			const prepared = await this.options.core.prepareRegistration(parsed.clientId, parsed.generation, {
 				cwd: parsed.cwd,
+				projectIdentityResolved: parsed.projectIdentityResolved,
 				sessionId: parsed.sessionId,
 				sessionName: parsed.sessionName,
 			});

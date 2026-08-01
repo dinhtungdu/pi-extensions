@@ -8,6 +8,7 @@ const ONE = "\u200c";
 
 export interface BridgeSession {
 	cwd: string;
+	projectIdentityResolved?: boolean;
 	sessionId: string;
 	sessionName?: string;
 }

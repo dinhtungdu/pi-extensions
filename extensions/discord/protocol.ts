@@ -44,7 +44,9 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 	if (frame.type === "register") {
 		return ["token", "clientId", "generation", "configFingerprint", "cwd", "sessionId"].every(
 			(key) => typeof frame[key] === "string",
-		) && typeof frame.configEpoch === "number" && (frame.sessionName === undefined || typeof frame.sessionName === "string");
+		) && typeof frame.configEpoch === "number" &&
+			(frame.projectIdentityResolved === undefined || typeof frame.projectIdentityResolved === "boolean") &&
+			(frame.sessionName === undefined || typeof frame.sessionName === "string");
 	}
 	if (frame.type === "outbound") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string" && typeof frame.text === "string" &&
