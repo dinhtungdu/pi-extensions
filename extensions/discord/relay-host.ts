@@ -241,6 +241,7 @@ export class LocalRelayHost {
 				channelId: prepared.channelId,
 				threadId: prepared.threadId,
 				leaderPid: this.options.lease.pid,
+				leaderNonce: this.options.lease.nonce,
 				lifecycleReactions: true,
 			})) throw new Error("Local Discord relay response queue is full");
 			await this.options.core.activateRegistration(parsed.clientId, parsed.generation, parsed.sessionId, (message) => {

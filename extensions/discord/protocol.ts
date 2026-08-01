@@ -14,7 +14,7 @@ export type ClientFrame =
 	| { type: "ping" };
 
 export type ServerFrame =
-	| { type: "registered"; channelId: string; threadId: string; leaderPid: number; lifecycleReactions?: true }
+	| { type: "registered"; channelId: string; threadId: string; leaderPid: number; leaderNonce?: string; lifecycleReactions?: true }
 	| { type: "inbound"; messageId: string; text: string }
 	| { type: "inbound_acked"; requestId: string; messageId: string }
 	| { type: "outbound_queued"; requestId: string; messageId: string }
@@ -64,6 +64,7 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 	const frame = value as Record<string, unknown>;
 	if (frame.type === "registered") {
 		return typeof frame.channelId === "string" && typeof frame.threadId === "string" && typeof frame.leaderPid === "number" &&
+			(frame.leaderNonce === undefined || (typeof frame.leaderNonce === "string" && frame.leaderNonce.length > 0)) &&
 			(frame.lifecycleReactions === undefined || frame.lifecycleReactions === true);
 	}
 	if (frame.type === "inbound") return typeof frame.messageId === "string" && typeof frame.text === "string";

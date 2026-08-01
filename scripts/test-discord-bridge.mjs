@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:net";
-import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -230,7 +230,7 @@ try {
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { isClientFrame } = await importBuilt("extensions/discord/protocol.js");
-	const { tryAcquireLeader } = await importBuilt("extensions/discord/leader.js");
+	const { restartOwnedRelay, tryAcquireLeader } = await importBuilt("extensions/discord/leader.js");
 	const {
 		assistantText,
 		collidingProjectChannelName,
@@ -571,6 +571,58 @@ try {
 	assert.equal(await fencedLease.heartbeat(), true);
 	await fencedLease.release();
 
+	const restartPaths = relayPaths(join(dataDir, "restart-ownership"));
+	const restartLease = await tryAcquireLeader(restartPaths);
+	assert.ok(restartLease);
+	const restartOwner = JSON.parse(await readFile(restartPaths.leaderLock, "utf8"));
+	const signalledPids = [];
+	assert.deepEqual(await restartOwnedRelay(restartPaths, process.pid, restartOwner.nonce, {
+		lookupProcessIdentity: async () => restartOwner.processIdentity,
+		signalProcess: (pid) => signalledPids.push(pid),
+	}), { pid: process.pid, nonce: restartOwner.nonce });
+	assert.deepEqual(signalledPids, [process.pid], "verified ownership must signal only its exact relay PID");
+	await assert.rejects(() => restartOwnedRelay(restartPaths, process.pid, "stale-connected-lease", {
+		lookupProcessIdentity: async () => restartOwner.processIdentity,
+		signalProcess: () => assert.fail("stale lease evidence must not signal"),
+	}), /lease changed after this client connected/);
+	await restartLease.release();
+
+	const missingRestartPaths = relayPaths(join(dataDir, "missing-restart-ownership"));
+	await assert.rejects(() => restartOwnedRelay(missingRestartPaths, process.pid, undefined, {
+		lookupProcessIdentity: async () => "unused",
+		signalProcess: () => assert.fail("missing ownership must not signal"),
+	}), /ownership record .* is missing/);
+	await mkdir(missingRestartPaths.directory, { recursive: true });
+	await writeFile(missingRestartPaths.leaderLock, "{oops");
+	await assert.rejects(() => restartOwnedRelay(missingRestartPaths, process.pid, undefined, {
+		lookupProcessIdentity: async () => "unused",
+		signalProcess: () => assert.fail("malformed ownership must not signal"),
+	}), /ownership record .* is malformed/);
+
+	const inaccessibleRestartPaths = relayPaths(join(dataDir, "inaccessible-restart-ownership"));
+	await mkdir(inaccessibleRestartPaths.leaderLock, { recursive: true });
+	await assert.rejects(() => restartOwnedRelay(inaccessibleRestartPaths, process.pid, undefined, {
+		lookupProcessIdentity: async () => "unused",
+		signalProcess: () => assert.fail("inaccessible ownership must not signal"),
+	}), /ownership record .* cannot be read/);
+
+	const reusedRestartPaths = relayPaths(join(dataDir, "reused-restart-ownership"));
+	await mkdir(reusedRestartPaths.directory, { recursive: true });
+	await writeFile(reusedRestartPaths.leaderLock, JSON.stringify({
+		pid: process.pid,
+		nonce: "prior-package-lease",
+		createdAt: 1,
+		processIdentity: "prior-relay-process",
+	}));
+	await assert.rejects(() => restartOwnedRelay(reusedRestartPaths, process.pid, "prior-package-lease", {
+		lookupProcessIdentity: async () => "reused-unrelated-process",
+		signalProcess: () => assert.fail("a reused PID must not be signalled"),
+	}), /PID .* was reused by another process/);
+	await assert.rejects(() => restartOwnedRelay(reusedRestartPaths, process.pid + 1, undefined, {
+		lookupProcessIdentity: async () => "prior-relay-process",
+		signalProcess: () => assert.fail("changed ownership must not signal"),
+	}), /ownership changed from connected PID/);
+
 	const remapState = new DiscordStateStore(join(dataDir, "remap-state.json"));
 	await remapState.resolveProjectChannel("/old", async () => "old-channel");
 	await remapState.resolveSessionThread("remapped-session", "/old", "old-channel", async () => "old-thread");
@@ -687,12 +739,21 @@ try {
 	const relayDirectory = join(dataDir, "shared-relay");
 	const paths = relayPaths(relayDirectory);
 	const stateFile = join(relayDirectory, "state.json");
+	let injectedRestartFailure;
+	let requestedRestartPid;
+	let requestedRestartNonce;
 	const extension = createDiscordExtension({
 		paths,
 		loadConfig: async () => ({ token: "token", guildId: "12345", categoryId: "67890", epoch: 1 }),
 		saveConfig: async () => {},
 		createStateStore: () => new DiscordStateStore(stateFile),
 		createTransport: () => new FakeGateway(),
+		async restartRelay(expectedPid, expectedNonce) {
+			requestedRestartPid = expectedPid;
+			requestedRestartNonce = expectedNonce;
+			if (injectedRestartFailure) throw injectedRestartFailure;
+			FakeGateway.instances.at(-1).terminal();
+		},
 	});
 	const first = createExtensionHarness(extension, {
 		cwd: "/work/one",
@@ -732,7 +793,16 @@ try {
 	assert.notEqual(firstThread, secondThread);
 	await first.runCommand("discord", "status");
 	assert.match(first.notifications.at(-1)[0], new RegExp(`Project channel: ${firstChannel}\\nSession thread: ${firstThread}$`), "command status must retain detailed diagnostics");
+	assert.ok(first.commands.get("discord").getArgumentCompletions("r").some(({ value }) => value === "restart"));
 	let gateway = FakeGateway.instances[0];
+	const gatewayCountBeforeClientReconnect = FakeGateway.instances.length;
+	await first.runCommand("discord", "reconnect");
+	assert.equal(FakeGateway.instances.length, gatewayCountBeforeClientReconnect, "/discord reconnect must not replace the shared relay");
+	injectedRestartFailure = new Error("Discord relay ownership record is malformed");
+	await first.runCommand("discord", "restart");
+	assert.deepEqual(first.notifications.at(-1), ["Discord relay restart failed: Discord relay ownership record is malformed", "error"]);
+	assert.equal(gateway.connected, true, "failed restart verification must leave the relay untouched");
+	injectedRestartFailure = undefined;
 	second.setIdle(false);
 	const routedSecond = second.nextUserMessage();
 	await gateway.emit({ id: "10", channelId: secondThread, content: "route to second", authorBot: false });
@@ -884,8 +954,11 @@ try {
 	const preReconnectGateway = gateway;
 	const gatewayCountBeforeReconnect = FakeGateway.instances.length;
 	FakeGateway.lifecycleReactions.delete("19");
-	gateway.terminal();
-	await waitFor(() => FakeGateway.instances.length > gatewayCountBeforeReconnect, "reaction relay reconnect");
+	await second.runCommand("discord", "restart");
+	assert.equal(requestedRestartPid, process.pid);
+	assert.equal(typeof requestedRestartNonce, "string", "current relays must provide authenticated lease evidence");
+	assert.match(second.notifications.at(-1)[0], /^Discord relay restarted: PID \d+ replaced by PID \d+$/);
+	await waitFor(() => FakeGateway.instances.length > gatewayCountBeforeReconnect, "command relay restart");
 	gateway = FakeGateway.instances.at(-1);
 	await waitFor(() => FakeGateway.lifecycleReactionEvents.some((event) =>
 		event.messageId === "19" && event.reaction === "🤔" && event.gateway === gateway), "lifecycle replay after reconnect");

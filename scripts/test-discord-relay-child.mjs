@@ -59,6 +59,14 @@ function startClient(token, sessionId) {
 		async ready() {
 			await waitFor(() => stdout.includes("READY\n"), `${sessionId} ready`);
 		},
+		async restart() {
+			const offset = stdout.length;
+			child.kill("SIGUSR1");
+			await waitFor(() => stdout.slice(offset).includes("RESTARTED ") || stdout.slice(offset).includes("RESTART_ERROR "), `${sessionId} restart result`);
+			const result = stdout.slice(offset);
+			assert.doesNotMatch(result, /RESTART_ERROR /);
+			return result;
+		},
 		async stop() {
 			if (child.exitCode !== null) return;
 			child.kill("SIGTERM");
@@ -117,8 +125,33 @@ try {
 	assert.equal((await events()).filter((event) => event.event === "connect").length - (await events()).filter((event) => event.event === "disconnect").length, 2,
 		"SIGKILL leaves one unmatched historical connect plus exactly one live replacement");
 
-	await Promise.all([first.stop(), second.stop(), third.stop(), suspendedContender.stop()]);
-	await waitFor(async () => (await events()).some((event) => event.event === "disconnect" && event.pid === recovered.pid), "zero-client child shutdown");
+	const activeClients = [first, second, third, suspendedContender];
+	await waitFor(() => activeClients.every((client) => client.stdout().trim().split("\n").at(-1) === "STATUS connected"),
+		"all clients connected to crash replacement");
+	const outputOffsets = activeClients.map((client) => client.stdout().length);
+	const restartEventOffset = (await events()).length;
+	const restartResult = await first.restart();
+	assert.match(restartResult, new RegExp(`RESTARTED ${recovered.pid} \\d+`));
+	await waitFor(async () => {
+		const recent = (await events()).slice(restartEventOffset);
+		return recent.some((event) => event.event === "disconnect" && event.pid === recovered.pid) &&
+			recent.some((event) => event.event === "connect" && event.pid !== recovered.pid);
+	}, "deliberate detached relay replacement");
+	for (let index = 0; index < activeClients.length; index++) {
+		await waitFor(() => /STATUS disconnected[\s\S]*STATUS connected/.test(activeClients[index].stdout().slice(outputOffsets[index])),
+			`client ${index + 1} convergence after relay restart`);
+	}
+	await new Promise((resolveWait) => setTimeout(resolveWait, 1_000));
+	const restartEvents = (await events()).slice(restartEventOffset);
+	const replacementConnects = restartEvents.filter((event) => event.event === "connect");
+	assert.equal(replacementConnects.length, 1, "all reconnecting clients must converge on exactly one replacement gateway");
+	assert.equal(restartEvents.filter((event) => event.event === "disconnect" && event.pid === recovered.pid).length, 1,
+		"the prior gateway must shut down gracefully exactly once");
+	const replacementPid = replacementConnects[0].pid;
+	relayPids.add(replacementPid);
+
+	await Promise.all(activeClients.map((client) => client.stop()));
+	await waitFor(async () => (await events()).some((event) => event.event === "disconnect" && event.pid === replacementPid), "zero-client child shutdown");
 	await waitFor(async () => {
 		try {
 			await access(join(directory, "relay.sock"));
@@ -129,7 +162,7 @@ try {
 	}, "relay socket cleanup");
 	await waitFor(() => {
 		try {
-			process.kill(recovered.pid, 0);
+			process.kill(replacementPid, 0);
 			return false;
 		} catch {
 			return true;

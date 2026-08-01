@@ -119,10 +119,13 @@ The bridge ignores bot messages and duplicate Discord IDs, and extension-injecte
 Commands:
 
 ```text
-/discord setup
-/discord status
-/discord reconnect
+/discord setup       # configure the bridge
+/discord status      # inspect this client's connection
+/discord reconnect   # reconnect only this Pi client to the existing relay
+/discord restart     # safely replace the detached relay for every active client
 ```
+
+`/discord restart` gracefully signals only the relay whose PID and process identity still match the authenticated connection and ownership lease. It refuses malformed, missing, inaccessible, changed, or PID-reused ownership records rather than risking another process. Shutdown and replacement waiting are bounded; it never escalates to a destructive forced kill. All active Pi clients reconnect automatically and converge on one replacement gateway.
 
 There is intentionally no user or app allowlist. Discord channel/thread permissions are the access boundary, so restrict them appropriately.
 

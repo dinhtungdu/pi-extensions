@@ -29,6 +29,7 @@ export interface DiscordExtensionDependencies {
 	createStateStore?: () => DiscordStateStore;
 	createTransport?: () => DiscordTransport;
 	launchRelay?: () => Promise<void>;
+	restartRelay?: (expectedPid: number, expectedNonce?: string) => Promise<void>;
 }
 
 function errorMessage(error: unknown): string {
@@ -118,6 +119,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					paths,
 					reloadConfig: async () => (await loadConfig()) ?? config!,
 					launchRelay,
+					...(dependencies.restartRelay ? { restartRelay: dependencies.restartRelay } : {}),
 				},
 			);
 			const acceptedIds = ctx.sessionManager.getBranch()
@@ -141,6 +143,21 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			const next = operation.then(action, action);
 			operation = next.catch(() => {});
 			return next;
+		}
+
+		async function restartRelay(ctx: ExtensionCommandContext): Promise<void> {
+			const active = bridge;
+			const previousPid = active?.status().leaderPid;
+			if (!active || !previousPid) {
+				ctx.ui.notify("Discord relay restart failed: bridge is disconnected; run /discord reconnect first", "error");
+				return;
+			}
+			try {
+				const status = await active.restartRelay();
+				ctx.ui.notify(`Discord relay restarted: PID ${previousPid} replaced by PID ${status.leaderPid}`, "info");
+			} catch (error) {
+				ctx.ui.notify(`Discord relay restart failed: ${errorMessage(error)}`, "error");
+			}
 		}
 
 		async function setup(ctx: ExtensionCommandContext): Promise<void> {
@@ -266,7 +283,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		pi.registerCommand("discord", {
 			description: "Configure or inspect the automatic Discord project/session bridge",
 			getArgumentCompletions: (prefix) => {
-				const values = ["setup", "status", "reconnect"];
+				const values = ["setup", "status", "reconnect", "restart"];
 				const matches = values.filter((value) => value.startsWith(prefix));
 				return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 			},
@@ -280,6 +297,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					await serialize(() => startBridge(ctx, true));
 					return;
 				}
+				if (command === "restart") {
+					await serialize(() => restartRelay(ctx));
+					return;
+				}
 				if (command === "status") {
 					const status = bridge?.status();
 					ctx.ui.notify(
@@ -290,7 +311,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					);
 					return;
 				}
-				ctx.ui.notify("Usage: /discord [setup|status|reconnect]", "warning");
+				ctx.ui.notify("Usage: /discord [setup|status|reconnect|restart]", "warning");
 			},
 		});
 	};

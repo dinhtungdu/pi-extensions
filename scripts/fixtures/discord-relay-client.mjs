@@ -15,6 +15,7 @@ const loadConfig = async () => {
 };
 const childFixture = resolve(import.meta.dirname, "discord-relay-child.mjs");
 let stopping = false;
+let restarting = false;
 
 const client = new LocalRelayClient(
 	await loadConfig(),
@@ -48,8 +49,23 @@ async function stop() {
 	process.exit(0);
 }
 
+async function restart() {
+	if (stopping || restarting) return;
+	restarting = true;
+	const previousPid = client.status().leaderPid;
+	try {
+		const status = await client.restartRelay();
+		process.stdout.write(`RESTARTED ${previousPid} ${status.leaderPid}\n`);
+	} catch (error) {
+		process.stdout.write(`RESTART_ERROR ${error instanceof Error ? error.message : String(error)}\n`);
+	} finally {
+		restarting = false;
+	}
+}
+
 process.on("SIGINT", () => void stop());
 process.on("SIGTERM", () => void stop());
+process.on("SIGUSR1", () => void restart());
 await client.start();
 process.stdout.write("READY\n");
 setInterval(() => {}, 60_000);

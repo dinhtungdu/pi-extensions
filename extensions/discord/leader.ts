@@ -22,6 +22,16 @@ export interface LeaderInspection {
 	probeRelay(path: string): Promise<boolean>;
 }
 
+export interface RelayRestartInspection {
+	lookupProcessIdentity(pid: number): Promise<string | undefined>;
+	signalProcess(pid: number): void;
+}
+
+export interface RelayRestartResult {
+	pid: number;
+	nonce: string;
+}
+
 export interface LeaderLease {
 	pid: number;
 	nonce: string;
@@ -32,9 +42,10 @@ export interface LeaderLease {
 function parseMetadata(value: string): LeaderMetadata | undefined {
 	try {
 		const parsed = JSON.parse(value) as Partial<LeaderMetadata>;
-		if (typeof parsed.pid !== "number" || typeof parsed.nonce !== "string" || typeof parsed.createdAt !== "number" ||
-			typeof parsed.processIdentity !== "string") return undefined;
-		return { pid: parsed.pid, nonce: parsed.nonce, createdAt: parsed.createdAt, processIdentity: parsed.processIdentity };
+		if (!Number.isSafeInteger(parsed.pid) || parsed.pid! <= 0 || typeof parsed.nonce !== "string" || !parsed.nonce ||
+			typeof parsed.createdAt !== "number" || !Number.isFinite(parsed.createdAt) ||
+			typeof parsed.processIdentity !== "string" || !parsed.processIdentity) return undefined;
+		return { pid: parsed.pid!, nonce: parsed.nonce, createdAt: parsed.createdAt, processIdentity: parsed.processIdentity };
 	} catch {
 		return undefined;
 	}
@@ -103,6 +114,11 @@ const defaultInspection: LeaderInspection = {
 	probeRelay: protocolReachable,
 };
 
+const defaultRestartInspection: RelayRestartInspection = {
+	lookupProcessIdentity: processIdentity,
+	signalProcess: (pid) => process.kill(pid, "SIGTERM"),
+};
+
 async function currentMetadata(paths: RelayPaths): Promise<LeaderMetadata | undefined> {
 	try {
 		return parseMetadata(await readFile(paths.leaderLock, "utf8"));
@@ -162,6 +178,69 @@ async function recoverStaleLeader(paths: RelayPaths, inspection: LeaderInspectio
 			if (error.code !== "ENOENT") throw error;
 		});
 	}
+}
+
+async function restartMetadata(paths: RelayPaths): Promise<LeaderMetadata> {
+	let value: string;
+	try {
+		value = await readFile(paths.leaderLock, "utf8");
+	} catch (error) {
+		const reason = (error as NodeJS.ErrnoException).code === "ENOENT"
+			? "is missing"
+			: `cannot be read: ${error instanceof Error ? error.message : String(error)}`;
+		throw new Error(`Discord relay ownership record ${paths.leaderLock} ${reason}`);
+	}
+	const metadata = parseMetadata(value);
+	if (!metadata) throw new Error(`Discord relay ownership record ${paths.leaderLock} is malformed`);
+	return metadata;
+}
+
+function sameMetadata(left: LeaderMetadata, right: LeaderMetadata): boolean {
+	return left.pid === right.pid && left.nonce === right.nonce && left.createdAt === right.createdAt &&
+		left.processIdentity === right.processIdentity;
+}
+
+export async function restartOwnedRelay(
+	paths: RelayPaths,
+	expectedPid: number,
+	expectedNonce?: string,
+	inspectionOverrides: Partial<RelayRestartInspection> = {},
+): Promise<RelayRestartResult> {
+	if (!Number.isSafeInteger(expectedPid) || expectedPid <= 0) {
+		throw new Error("Discord bridge has no valid connected relay PID to restart");
+	}
+	const inspection: RelayRestartInspection = { ...defaultRestartInspection, ...inspectionOverrides };
+	const metadata = await restartMetadata(paths);
+	if (metadata.pid !== expectedPid) {
+		throw new Error(`Discord relay ownership changed from connected PID ${expectedPid} to PID ${metadata.pid}; refusing to signal either process`);
+	}
+	if (expectedNonce && metadata.nonce !== expectedNonce) {
+		throw new Error("Discord relay lease changed after this client connected; refusing to signal its owner");
+	}
+	const identity = await inspection.lookupProcessIdentity(metadata.pid);
+	if (!identity) {
+		throw new Error(`Cannot verify Discord relay PID ${metadata.pid} identity; refusing to signal it`);
+	}
+	if (identity !== metadata.processIdentity) {
+		throw new Error(`Discord relay PID ${metadata.pid} was reused by another process; refusing to signal it`);
+	}
+	const rechecked = await restartMetadata(paths);
+	if (!sameMetadata(metadata, rechecked)) {
+		throw new Error("Discord relay ownership changed during restart verification; refusing to signal it");
+	}
+	const finalIdentity = await inspection.lookupProcessIdentity(metadata.pid);
+	if (!finalIdentity) {
+		throw new Error(`Cannot reverify Discord relay PID ${metadata.pid} identity; refusing to signal it`);
+	}
+	if (finalIdentity !== metadata.processIdentity) {
+		throw new Error(`Discord relay PID ${metadata.pid} was reused during restart verification; refusing to signal it`);
+	}
+	try {
+		inspection.signalProcess(metadata.pid);
+	} catch (error) {
+		throw new Error(`Cannot request shutdown of Discord relay PID ${metadata.pid}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	return { pid: metadata.pid, nonce: metadata.nonce };
 }
 
 export async function tryAcquireLeader(

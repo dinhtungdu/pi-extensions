@@ -7,6 +7,7 @@ import { configFingerprint, encodeFrame, isServerFrame, MAX_IPC_FRAME_BYTES, par
 import type { RelaySessionRegistration } from "./relay-core.js";
 import { interactiveUserChunks } from "./text.js";
 import type { DiscordLifecycleStatus } from "./reactions.js";
+import { restartOwnedRelay } from "./leader.js";
 
 const CONNECT_RETRY_MIN_MS = 25;
 const CONNECT_RETRY_MAX_MS = 500;
@@ -14,11 +15,13 @@ const INITIAL_CONNECT_ATTEMPTS = 120;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ACK_TIMEOUT_MS = 2_000;
 const SHUTDOWN_TIMEOUT_MS = 2_000;
+const RESTART_RECONNECT_TIMEOUT_MS = 10_000;
 const MAX_DESIRED_LIFECYCLE_STATUSES = 256;
 
 export interface RelayClientStatus {
 	connected: boolean;
 	leaderPid?: number;
+	leaderNonce?: string;
 	channelId?: string;
 	threadId?: string;
 }
@@ -33,6 +36,7 @@ export interface RelayClientDependencies {
 	paths: RelayPaths;
 	launchRelay(): Promise<void>;
 	reloadConfig?: () => Promise<DiscordBridgeConfig>;
+	restartRelay?: (expectedPid: number, expectedNonce?: string) => Promise<void>;
 }
 
 interface PendingRequest {
@@ -138,6 +142,25 @@ export class LocalRelayClient {
 
 	status(): RelayClientStatus {
 		return { ...this.currentStatus };
+	}
+
+	async restartRelay(): Promise<RelayClientStatus> {
+		if (this.stopped) throw new Error("Discord bridge is stopped; connect it before restarting the relay");
+		const originalSocket = this.socket;
+		const leaderPid = this.currentStatus.connected ? this.currentStatus.leaderPid : undefined;
+		const leaderNonce = this.currentStatus.connected ? this.currentStatus.leaderNonce : undefined;
+		if (!originalSocket || !leaderPid) throw new Error("Discord bridge is disconnected; reconnect it before restarting the relay");
+		const restart = this.dependencies.restartRelay ?? (async (expectedPid: number, expectedNonce?: string) => {
+			await restartOwnedRelay(this.dependencies.paths, expectedPid, expectedNonce);
+		});
+		await restart(leaderPid, leaderNonce);
+		const deadline = Date.now() + RESTART_RECONNECT_TIMEOUT_MS;
+		while (!this.stopped && Date.now() < deadline) {
+			if (this.socket && this.socket !== originalSocket && this.currentStatus.connected) return this.status();
+			await delay(CONNECT_RETRY_MIN_MS);
+		}
+		if (this.stopped) throw new Error("Discord bridge stopped while waiting for its replacement relay");
+		throw new Error(`Timed out after ${RESTART_RECONNECT_TIMEOUT_MS}ms waiting for the replacement Discord relay`);
 	}
 
 	async sendUserText(text: string): Promise<void> {
@@ -316,6 +339,7 @@ export class LocalRelayClient {
 			waiter.resolve({
 				connected: true,
 				leaderPid: frame.leaderPid,
+				...(frame.leaderNonce ? { leaderNonce: frame.leaderNonce } : {}),
 				channelId: frame.channelId,
 				threadId: frame.threadId,
 			});
