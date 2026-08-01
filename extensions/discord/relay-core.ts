@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import type { DiscordBridgeConfig } from "./config.js";
-import { DiscordStateStore, type OutboundMessage, type QueuedDiscordMessage, type SessionThreadMapping } from "./state.js";
+import {
+	DiscordStateStore,
+	type DiscordLifecycleMessage,
+	type OutboundMessage,
+	type QueuedDiscordMessage,
+	type SessionThreadMapping,
+} from "./state.js";
+import { lifecycleReaction, type DiscordLifecycleStatus } from "./reactions.js";
 import { normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
 import type { DiscordInboundMessage, DiscordTransport } from "./transport.js";
 
@@ -24,6 +31,24 @@ interface ActiveSession {
 
 const OUTBOUND_RETRY_MIN_MS = 100;
 const OUTBOUND_RETRY_MAX_MS = 5_000;
+const REACTION_TIMEOUT_MS = 2_000;
+const MAX_PENDING_LIFECYCLE_UPDATES = 256;
+const MAX_DESIRED_REACTIONS = 2_000;
+
+async function boundedReaction(operation: Promise<void>): Promise<boolean> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			operation.then(() => true),
+			new Promise<false>((resolve) => {
+				timer = setTimeout(() => resolve(false), REACTION_TIMEOUT_MS);
+				timer.unref();
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
 
 export class DiscordRelayCore {
 	private readonly activeSessions = new Map<string, ActiveSession>();
@@ -37,6 +62,11 @@ export class DiscordRelayCore {
 	private outboundDrainRequested = false;
 	private readonly outboundRetryAttempts = new Map<string, number>();
 	private readonly outboundRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly pendingLifecycleUpdates: Array<{ sessionId: string; messageId: string; status: DiscordLifecycleStatus }> = [];
+	private readonly reactionQueues = new Map<string, Promise<void>>();
+	private readonly queuedReactionStatuses = new Map<string, DiscordLifecycleStatus>();
+	private readonly desiredReactions = new Map<string, DiscordLifecycleMessage>();
+	private drainingLifecycleUpdates = false;
 	private started = false;
 
 	constructor(
@@ -73,6 +103,10 @@ export class DiscordRelayCore {
 		for (const timer of this.outboundRetryTimers.values()) clearTimeout(timer);
 		this.outboundRetryTimers.clear();
 		this.outboundRetryAttempts.clear();
+		this.pendingLifecycleUpdates.length = 0;
+		this.reactionQueues.clear();
+		this.queuedReactionStatuses.clear();
+		this.desiredReactions.clear();
 		await this.transport.disconnect();
 	}
 
@@ -128,7 +162,12 @@ export class DiscordRelayCore {
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
 			throw new Error(`Pi session ${sessionId} was not reserved by client ${clientId}`);
 		}
-		const pending = await this.state.pendingMessages(sessionId);
+		const mapping = await this.state.getSession(sessionId);
+		const pending = mapping?.pendingMessages ?? [];
+		for (const message of pending) {
+			const lifecycle = mapping?.lifecycleMessages.find((candidate) => candidate.messageId === message.id);
+			if (lifecycle) this.scheduleReaction(lifecycle);
+		}
 		this.reservedSessions.delete(sessionId);
 		const active: ActiveSession = { clientId, generation, deliver, deliveredIds: new Set() };
 		this.activeSessions.set(sessionId, active);
@@ -168,6 +207,27 @@ export class DiscordRelayCore {
 		await this.state.acknowledgeMessage(sessionId, messageId);
 	}
 
+	queueLifecycleUpdate(
+		clientId: string,
+		generation: string,
+		sessionId: string,
+		messageId: string,
+		status: DiscordLifecycleStatus,
+	): void {
+		this.assertClientSession(clientId, generation, sessionId);
+		let pendingStatus: DiscordLifecycleStatus | undefined;
+		for (let index = this.pendingLifecycleUpdates.length - 1; index >= 0; index--) {
+			const update = this.pendingLifecycleUpdates[index]!;
+			if (update.sessionId === sessionId && update.messageId === messageId) {
+				pendingStatus = update.status;
+				break;
+			}
+		}
+		if (pendingStatus === status || this.pendingLifecycleUpdates.length >= MAX_PENDING_LIFECYCLE_UPDATES) return;
+		this.pendingLifecycleUpdates.push({ sessionId, messageId, status });
+		void this.drainLifecycleUpdates();
+	}
+
 	async queueOutbound(
 		clientId: string,
 		generation: string,
@@ -192,6 +252,60 @@ export class DiscordRelayCore {
 		};
 		await this.state.enqueueOutbound(sessionId, message);
 		void this.drainOutbound().catch(this.onTerminalError);
+	}
+
+	private async drainLifecycleUpdates(): Promise<void> {
+		if (this.drainingLifecycleUpdates || !this.started) return;
+		this.drainingLifecycleUpdates = true;
+		try {
+			while (this.started) {
+				const update = this.pendingLifecycleUpdates.shift();
+				if (!update) return;
+				try {
+					const lifecycle = await this.state.updateLifecycleStatus(update.sessionId, update.messageId, update.status);
+					if (lifecycle && this.started) this.scheduleReaction(lifecycle);
+				} catch {
+					// Lifecycle status is best-effort and must not interfere with relay traffic.
+				}
+			}
+		} finally {
+			this.drainingLifecycleUpdates = false;
+			if (this.started && this.pendingLifecycleUpdates.length > 0) void this.drainLifecycleUpdates();
+		}
+	}
+
+	private scheduleReaction(message: DiscordLifecycleMessage, force = false): void {
+		const key = `${message.channelId}\0${message.messageId}`;
+		if (this.desiredReactions.has(key)) this.desiredReactions.delete(key);
+		this.desiredReactions.set(key, message);
+		while (this.desiredReactions.size > MAX_DESIRED_REACTIONS) {
+			this.desiredReactions.delete(this.desiredReactions.keys().next().value!);
+		}
+		if (!force && this.queuedReactionStatuses.get(key) === message.status) return;
+		this.queuedReactionStatuses.set(key, message.status);
+		const previous = this.reactionQueues.get(key) ?? Promise.resolve();
+		const next = previous
+			.catch(() => {})
+			.then(async () => {
+				if (!this.started) return;
+				const operation = this.transport.setLifecycleReaction(
+					message.channelId,
+					message.messageId,
+					lifecycleReaction(message.status),
+				);
+				if (await boundedReaction(operation)) return;
+				void operation.catch(() => {}).finally(() => {
+					const desired = this.desiredReactions.get(key);
+					if (this.started && desired) this.scheduleReaction(desired, true);
+				});
+			})
+			.catch(() => {});
+		this.reactionQueues.set(key, next);
+		void next.finally(() => {
+			if (this.reactionQueues.get(key) !== next) return;
+			this.reactionQueues.delete(key);
+			if (this.queuedReactionStatuses.get(key) === message.status) this.queuedReactionStatuses.delete(key);
+		});
 	}
 
 	private async drainOutbound(): Promise<void> {
@@ -273,6 +387,7 @@ export class DiscordRelayCore {
 		advanceCursor = !this.catchingUpSessions.has(sessionId),
 	): Promise<void> {
 		const result = await this.state.recordDiscordMessage(sessionId, message, advanceCursor);
+		if (result.lifecycle) this.scheduleReaction(result.lifecycle);
 		if (!result.queued || !result.message || !deliver) return;
 		const active = this.activeSessions.get(sessionId);
 		if (active) this.deliverMessage(active, result.message);

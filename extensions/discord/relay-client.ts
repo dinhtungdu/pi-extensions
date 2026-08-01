@@ -6,6 +6,7 @@ import { BoundedSocketWriter } from "./ipc-writer.js";
 import { configFingerprint, encodeFrame, isServerFrame, MAX_IPC_FRAME_BYTES, parseFrame, type ClientFrame, type ServerFrame } from "./protocol.js";
 import type { RelaySessionRegistration } from "./relay-core.js";
 import { interactiveUserChunks } from "./text.js";
+import type { DiscordLifecycleStatus } from "./reactions.js";
 
 const CONNECT_RETRY_MIN_MS = 25;
 const CONNECT_RETRY_MAX_MS = 500;
@@ -13,6 +14,7 @@ const INITIAL_CONNECT_ATTEMPTS = 120;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ACK_TIMEOUT_MS = 2_000;
 const SHUTDOWN_TIMEOUT_MS = 2_000;
+const MAX_DESIRED_LIFECYCLE_STATUSES = 256;
 
 export interface RelayClientStatus {
 	connected: boolean;
@@ -81,6 +83,10 @@ export class LocalRelayClient {
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private lastRelayLaunchAt = 0;
 	private readonly pendingRequests = new Map<string, PendingRequest>();
+	private readonly desiredLifecycleStatuses = new Map<string, { status: DiscordLifecycleStatus; sentGeneration?: string }>();
+	private readonly pendingLifecycleFrames: Array<{ messageId: string; status: DiscordLifecycleStatus }> = [];
+	private lifecycleGeneration: string | undefined;
+	private lifecycleSupported = false;
 	private currentStatus: RelayClientStatus = { connected: false };
 	private stopped = true;
 
@@ -112,6 +118,10 @@ export class LocalRelayClient {
 		this.socket = undefined;
 		this.connectingSocket = undefined;
 		this.writer = undefined;
+		this.lifecycleGeneration = undefined;
+		this.lifecycleSupported = false;
+		this.desiredLifecycleStatuses.clear();
+		this.pendingLifecycleFrames.length = 0;
 		connectingSocket?.destroy();
 		if (socket && !socket.destroyed) {
 			const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
@@ -145,6 +155,24 @@ export class LocalRelayClient {
 
 	async acknowledgeInbound(messageId: string): Promise<void> {
 		await this.sendRequest({ type: "ack_inbound", requestId: randomUUID(), messageId }, ACK_TIMEOUT_MS);
+	}
+
+	updateLifecycle(messageId: string, status: DiscordLifecycleStatus): void {
+		if (this.stopped) return;
+		const existing = this.desiredLifecycleStatuses.get(messageId);
+		if (existing?.status === status) {
+			this.flushLifecycleStatuses();
+			return;
+		}
+		if (existing) this.desiredLifecycleStatuses.delete(messageId);
+		this.desiredLifecycleStatuses.set(messageId, { status });
+		if (this.pendingLifecycleFrames.length < MAX_DESIRED_LIFECYCLE_STATUSES) {
+			this.pendingLifecycleFrames.push({ messageId, status });
+		}
+		while (this.desiredLifecycleStatuses.size > MAX_DESIRED_LIFECYCLE_STATUSES) {
+			this.desiredLifecycleStatuses.delete(this.desiredLifecycleStatuses.keys().next().value!);
+		}
+		this.flushLifecycleStatuses();
 	}
 
 	private ensureConnected(): Promise<void> {
@@ -188,8 +216,10 @@ export class LocalRelayClient {
 		return new Promise<void>((resolve, reject) => {
 			const socket = createConnection(this.dependencies.paths.socket);
 			this.connectingSocket = socket;
-			const writer = new BoundedSocketWriter(socket);
 			const generation = randomUUID();
+			const writer = new BoundedSocketWriter(socket, () => {
+				if (this.writer === writer) this.flushLifecycleStatuses();
+			});
 			socket.setEncoding("utf8");
 			let settled = false;
 			let buffer = "";
@@ -249,7 +279,7 @@ export class LocalRelayClient {
 					buffer = buffer.slice(newline + 1);
 					if (line) {
 						frameQueue = frameQueue
-							.then(() => this.handleServerLine(socket, waiter, line))
+							.then(() => this.handleServerLine(socket, waiter, line, generation))
 							.catch((error) => this.callbacks.onError(asError(error)));
 					}
 					newline = buffer.indexOf("\n");
@@ -265,6 +295,8 @@ export class LocalRelayClient {
 				if (this.socket !== socket) return;
 				this.socket = undefined;
 				this.writer = undefined;
+				this.lifecycleGeneration = undefined;
+				this.lifecycleSupported = false;
 				this.updateStatus({ connected: false });
 				this.rejectPending(new Error("Local Discord relay connection closed"));
 				if (!this.stopped) {
@@ -274,17 +306,20 @@ export class LocalRelayClient {
 		});
 	}
 
-	private async handleServerLine(socket: Socket, waiter: RegistrationWaiter, line: string): Promise<void> {
+	private async handleServerLine(socket: Socket, waiter: RegistrationWaiter, line: string, generation: string): Promise<void> {
 		const parsed = parseFrame(line);
 		if (!isServerFrame(parsed)) throw new Error("Invalid local Discord relay response");
 		const frame: ServerFrame = parsed;
 		if (frame.type === "registered") {
+			this.lifecycleSupported = frame.lifecycleReactions === true;
+			this.lifecycleGeneration = generation;
 			waiter.resolve({
 				connected: true,
 				leaderPid: frame.leaderPid,
 				channelId: frame.channelId,
 				threadId: frame.threadId,
 			});
+			this.flushLifecycleStatuses();
 			return;
 		}
 		if (frame.type === "error") {
@@ -359,6 +394,24 @@ export class LocalRelayClient {
 				reject(new Error("Local Discord relay request queue is full"));
 			}
 		});
+	}
+
+	private flushLifecycleStatuses(): void {
+		const writer = this.writer;
+		const generation = this.lifecycleGeneration;
+		if (!this.lifecycleSupported || !generation || !writer || !this.currentStatus.connected) return;
+		while (this.pendingLifecycleFrames.length > 0) {
+			const pending = this.pendingLifecycleFrames[0]!;
+			if (!writer.writeBestEffort(encodeFrame({ type: "lifecycle", ...pending }))) return;
+			this.pendingLifecycleFrames.shift();
+			const desired = this.desiredLifecycleStatuses.get(pending.messageId);
+			if (desired?.status === pending.status) desired.sentGeneration = generation;
+		}
+		for (const [messageId, desired] of this.desiredLifecycleStatuses) {
+			if (desired.sentGeneration === generation) continue;
+			if (!writer.writeBestEffort(encodeFrame({ type: "lifecycle", messageId, status: desired.status }))) return;
+			desired.sentGeneration = generation;
+		}
 	}
 
 	private scheduleReconnect(): void {

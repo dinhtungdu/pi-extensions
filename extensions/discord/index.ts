@@ -207,8 +207,28 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			}),
 		}));
 
-		pi.on("before_agent_start", () => {
-			bridge?.beginAgentRun();
+		pi.on("before_agent_start", (event) => {
+			bridge?.beginAgentRun(inboundMessageId(event.prompt));
+		});
+
+		pi.on("agent_start", () => {
+			bridge?.agentStarted();
+		});
+
+		pi.on("message_start", (event) => {
+			if (event.message.role !== "user") return;
+			const text = typeof event.message.content === "string"
+				? event.message.content
+				: event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+			bridge?.userMessageStarted(inboundMessageId(text));
+		});
+
+		pi.on("tool_execution_start", () => {
+			bridge?.toolStarted();
+		});
+
+		pi.on("agent_end", (event, ctx) => {
+			bridge?.agentEnded(event.messages, ctx.signal?.aborted === true);
 		});
 
 		pi.on("message_end", (event, ctx) => {
@@ -235,6 +255,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		});
 
 		pi.on("agent_settled", async (_event, ctx) => {
+			bridge?.settleAgentRun();
 			try {
 				await bridge?.flushSettledAssistant();
 			} catch (error) {

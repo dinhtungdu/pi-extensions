@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DiscordBridgeConfig } from "./config.js";
 import type { RelaySessionRegistration } from "./relay-core.js";
+import type { DiscordLifecycleStatus } from "./reactions.js";
 
 export const MAX_IPC_FRAME_BYTES = 1_048_576;
 
@@ -8,11 +9,12 @@ export type ClientFrame =
 	| ({ type: "register"; token: string; clientId: string; generation: string; configFingerprint: string; configEpoch: number } & RelaySessionRegistration)
 	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
 	| { type: "ack_inbound"; requestId: string; messageId: string }
+	| { type: "lifecycle"; messageId: string; status: DiscordLifecycleStatus }
 	| { type: "unregister" }
 	| { type: "ping" };
 
 export type ServerFrame =
-	| { type: "registered"; channelId: string; threadId: string; leaderPid: number }
+	| { type: "registered"; channelId: string; threadId: string; leaderPid: number; lifecycleReactions?: true }
 	| { type: "inbound"; messageId: string; text: string }
 	| { type: "inbound_acked"; requestId: string; messageId: string }
 	| { type: "outbound_queued"; requestId: string; messageId: string }
@@ -49,6 +51,11 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(frame.kind === "user" || frame.kind === "assistant");
 	}
 	if (frame.type === "ack_inbound") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
+	if (frame.type === "lifecycle") {
+		return typeof frame.messageId === "string" &&
+			(frame.status === "accepted" || frame.status === "thinking" || frame.status === "tool" ||
+				frame.status === "succeeded" || frame.status === "failed");
+	}
 	return frame.type === "unregister" || frame.type === "ping";
 }
 
@@ -56,7 +63,8 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const frame = value as Record<string, unknown>;
 	if (frame.type === "registered") {
-		return typeof frame.channelId === "string" && typeof frame.threadId === "string" && typeof frame.leaderPid === "number";
+		return typeof frame.channelId === "string" && typeof frame.threadId === "string" && typeof frame.leaderPid === "number" &&
+			(frame.lifecycleReactions === undefined || frame.lifecycleReactions === true);
 	}
 	if (frame.type === "inbound") return typeof frame.messageId === "string" && typeof frame.text === "string";
 	if (frame.type === "inbound_acked") return typeof frame.requestId === "string" && typeof frame.messageId === "string";

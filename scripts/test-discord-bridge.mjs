@@ -32,6 +32,12 @@ async function waitFor(predicate, description) {
 	throw new Error(`Timed out waiting for ${description}`);
 }
 
+function reactionSequence(messageId) {
+	return FakeGateway.lifecycleReactionEvents
+		.filter((event) => event.messageId === messageId)
+		.map((event) => event.reaction);
+}
+
 class FakeGateway {
 	static instances = [];
 	static activeConnections = 0;
@@ -43,6 +49,10 @@ class FakeGateway {
 	static sendAttempts = new Map();
 	static sendAttemptTimes = new Map();
 	static deletedThreads = new Set();
+	static lifecycleReactions = new Map();
+	static lifecycleReactionEvents = [];
+	static failLifecycleOnce = new Set();
+	static hangLifecycleFor = new Set();
 
 	connected = false;
 	listeners = new Set();
@@ -97,6 +107,15 @@ class FakeGateway {
 				return message.id > afterId;
 			}
 		});
+	}
+
+	async setLifecycleReaction(channelId, messageId, reaction) {
+		const key = `${messageId}:${reaction}`;
+		if (FakeGateway.hangLifecycleFor.has(key)) return new Promise(() => {});
+		if (FakeGateway.failLifecycleOnce.delete(key)) throw new Error("injected Discord reaction failure");
+		if (FakeGateway.lifecycleReactions.get(messageId) === reaction) return;
+		FakeGateway.lifecycleReactions.set(messageId, reaction);
+		FakeGateway.lifecycleReactionEvents.push({ channelId, messageId, reaction, gateway: this });
 	}
 
 	async sendText(channelId, text, nonce) {
@@ -220,7 +239,12 @@ try {
 		sessionThreadName,
 		splitDiscordText,
 	} = await importBuilt("extensions/discord/text.js");
-	const { assertConfiguredCategory, collectChronologicalMessages, reuseSessionThread } = await importBuilt("extensions/discord/transport.js");
+	const {
+		assertConfiguredCategory,
+		collectChronologicalMessages,
+		replaceOwnLifecycleReaction,
+		reuseSessionThread,
+	} = await importBuilt("extensions/discord/transport.js");
 
 	assert.deepEqual(parseDiscordConfig({ token: " token ", guildId: "12345", categoryId: "" }), {
 		token: "token",
@@ -240,6 +264,20 @@ try {
 		() => assertConfiguredCategory({ type: ChannelType.GuildText, guildId: "12345" }, "67890", "12345"),
 		/Configured Discord category 67890.*not a category/,
 	);
+	const removedReactions = [];
+	const addedReactions = [];
+	await replaceOwnLifecycleReaction([
+		{ emoji: { name: "👀" }, me: true, users: { async remove(id) { removedReactions.push(["👀", id]); } } },
+		{ emoji: { name: "🤔" }, me: false, users: { async remove(id) { removedReactions.push(["🤔", id]); } } },
+		{ emoji: { name: "🎉" }, me: true, users: { async remove(id) { removedReactions.push(["🎉", id]); } } },
+	], "bot-user", "⚙️", async (reaction) => { addedReactions.push(reaction); });
+	assert.deepEqual(removedReactions, [["👀", "bot-user"]], "only the bot's prior lifecycle reaction may be removed");
+	assert.deepEqual(addedReactions, ["⚙️"]);
+	let addedAfterRemoveFailure = false;
+	await assert.rejects(() => replaceOwnLifecycleReaction([
+		{ emoji: { name: "🤔" }, me: true, users: { async remove() { throw new Error("Missing Permissions"); } } },
+	], "bot-user", "✅", async () => { addedAfterRemoveFailure = true; }), /Missing Permissions/);
+	assert.equal(addedAfterRemoveFailure, false, "a replacement must not add until removal succeeds");
 	let reopened = false;
 	assert.equal(await reuseSessionThread({
 		id: "thread-1",
@@ -350,6 +388,7 @@ try {
 		{ paths: compatibilityPaths, launchRelay: async () => {} },
 	);
 	await compatibilityClient.start();
+	compatibilityClient.updateLifecycle("compatibility-inbound", "thinking");
 	await compatibilityClient.sendInteractiveUserText("hot **reload**");
 	assert.equal(previousHostFrames.length, 1);
 	assert.equal(previousHostFrames[0].kind, "user", "interactive presentation must retain the pre-7c01263 outbound kind");
@@ -381,6 +420,7 @@ try {
 	let capacitySignals = 0;
 	const boundedWriter = new BoundedSocketWriter(slowSocket, () => { capacitySignals++; });
 	assert.equal(boundedWriter.write("initial\n"), true);
+	assert.equal(boundedWriter.writeBestEffort("lifecycle\n"), false, "best-effort IPC must not consume normal queue capacity");
 	for (let index = 0; index < MAX_QUEUED_IPC_FRAMES; index++) {
 		assert.equal(boundedWriter.write(`queued-${index}\n`), true);
 	}
@@ -639,6 +679,10 @@ try {
 	FakeGateway.activeConnections = 0;
 	FakeGateway.maximumActiveConnections = 0;
 	FakeGateway.nonceResults.clear();
+	FakeGateway.lifecycleReactions.clear();
+	FakeGateway.lifecycleReactionEvents.length = 0;
+	FakeGateway.failLifecycleOnce.clear();
+	FakeGateway.hangLifecycleFor.clear();
 
 	const relayDirectory = join(dataDir, "shared-relay");
 	const paths = relayPaths(relayDirectory);
@@ -675,7 +719,8 @@ try {
 	}
 	assert.deepEqual([...first.commands.keys()], ["discord"]);
 	assert.ok(first.events.has("agent_settled"));
-	assert.equal(first.events.has("agent_end"), false);
+	assert.ok(first.events.has("agent_end"));
+	assert.ok(first.events.has("tool_execution_start"));
 
 	assert.deepEqual(first.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
 	assert.deepEqual(second.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
@@ -687,7 +732,7 @@ try {
 	assert.notEqual(firstThread, secondThread);
 	await first.runCommand("discord", "status");
 	assert.match(first.notifications.at(-1)[0], new RegExp(`Project channel: ${firstChannel}\\nSession thread: ${firstThread}$`), "command status must retain detailed diagnostics");
-	const gateway = FakeGateway.instances[0];
+	let gateway = FakeGateway.instances[0];
 	second.setIdle(false);
 	const routedSecond = second.nextUserMessage();
 	await gateway.emit({ id: "10", channelId: secondThread, content: "route to second", authorBot: false });
@@ -706,6 +751,67 @@ try {
 	assert.equal(second.userMessages.length, 1, "duplicate Discord IDs must not deliver twice");
 	await gateway.emit({ id: "11", channelId: secondThread, content: "bot", authorBot: true });
 	assert.equal(second.userMessages.length, 1, "bot output must not loop back into Pi");
+
+	await waitFor(() => FakeGateway.lifecycleReactions.get("10") === "👀", "accepted lifecycle reaction");
+	await second.emit("before_agent_start", { prompt: routedSecondMessage.text });
+	await second.emit("agent_start", {});
+	await second.emit("message_start", { message: { role: "user", content: [{ type: "text", text: routedSecondMessage.text }] } });
+	await waitFor(() => FakeGateway.lifecycleReactions.get("10") === "🤔", "thinking lifecycle reaction");
+	await second.emit("tool_execution_start", { toolCallId: "tool-10", toolName: "read", args: {} });
+	await second.emit("tool_execution_start", { toolCallId: "tool-10-duplicate", toolName: "read", args: {} });
+	await waitFor(() => FakeGateway.lifecycleReactions.get("10") === "⚙️", "tool lifecycle reaction");
+	await second.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+	assert.equal(FakeGateway.lifecycleReactions.get("10"), "⚙️", "success must wait for agent_settled");
+	await second.emit("agent_settled", {});
+	await waitFor(() => FakeGateway.lifecycleReactions.get("10") === "✅", "settled lifecycle reaction");
+	assert.deepEqual(reactionSequence("10"), ["👀", "🤔", "⚙️", "✅"], "duplicate lifecycle events must be idempotent and ordered");
+
+	const toolFreeDelivery = second.nextUserMessage();
+	await gateway.emit({ id: "12", channelId: secondThread, content: "tool free", authorBot: false });
+	const toolFreeMessage = await toolFreeDelivery;
+	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: toolFreeMessage.text }] } });
+	await second.emit("before_agent_start", { prompt: toolFreeMessage.text });
+	await second.emit("agent_start", {});
+	await second.emit("message_start", { message: { role: "user", content: [{ type: "text", text: toolFreeMessage.text }] } });
+	await second.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+	await second.emit("agent_settled", {});
+	await waitFor(() => FakeGateway.lifecycleReactions.get("12") === "✅", "tool-free settled reaction");
+	assert.deepEqual(reactionSequence("12"), ["👀", "🤔", "✅"], "tool-free runs must skip the tool reaction");
+
+	const queuedA = second.nextUserMessage();
+	await gateway.emit({ id: "13", channelId: secondThread, content: "queued a", authorBot: false });
+	const queuedAMessage = await queuedA;
+	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: queuedAMessage.text }] } });
+	const queuedB = second.nextUserMessage();
+	await gateway.emit({ id: "14", channelId: secondThread, content: "queued b", authorBot: false });
+	const queuedBMessage = await queuedB;
+	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: queuedBMessage.text }] } });
+	await second.emit("before_agent_start", { prompt: queuedAMessage.text });
+	await second.emit("agent_start", {});
+	await second.emit("message_start", { message: { role: "user", content: [{ type: "text", text: queuedAMessage.text }] } });
+	await second.emit("tool_execution_start", { toolCallId: "tool-13", toolName: "read", args: {} });
+	await second.emit("message_start", { message: { role: "user", content: [{ type: "text", text: queuedBMessage.text }] } });
+	await second.emit("tool_execution_start", { toolCallId: "tool-14", toolName: "bash", args: {} });
+	await waitFor(() => FakeGateway.lifecycleReactions.get("13") === "⚙️" && FakeGateway.lifecycleReactions.get("14") === "⚙️", "queued prompt tool reactions");
+	await second.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "unrelated local follow-up" }] } });
+	const reactionsBeforeLocalTool = reactionSequence("14").length;
+	await second.emit("tool_execution_start", { toolCallId: "local-tool", toolName: "read", args: {} });
+	await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+	assert.equal(reactionSequence("14").length, reactionsBeforeLocalTool, "local follow-up tools must not react to a Discord prompt");
+	await second.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+	await second.emit("agent_settled", {});
+	await waitFor(() => FakeGateway.lifecycleReactions.get("13") === "✅" && FakeGateway.lifecycleReactions.get("14") === "✅", "queued prompt terminal reactions");
+	assert.deepEqual(reactionSequence("13"), ["👀", "🤔", "⚙️", "✅"]);
+	assert.deepEqual(reactionSequence("14"), ["👀", "🤔", "⚙️", "✅"]);
+
+	const localReactionCount = FakeGateway.lifecycleReactionEvents.length;
+	await second.emit("before_agent_start", { prompt: "ordinary local prompt" });
+	await second.emit("agent_start", {});
+	await second.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "ordinary local prompt" }] } });
+	await second.emit("tool_execution_start", { toolCallId: "local-only-tool", toolName: "read", args: {} });
+	await second.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+	await second.emit("agent_settled", {});
+	assert.equal(FakeGateway.lifecycleReactionEvents.length, localReactionCount, "local/TUI runs must never receive Discord reactions");
 
 	await first.emit("input", { text: "local input", source: "interactive" });
 	await waitFor(() => gateway.sent.some((message) => message.text === "🖥️ **local input**"), "formatted interactive user send");
@@ -726,7 +832,7 @@ try {
 	const sentBeforeLoopCheck = gateway.sent.length;
 	await first.emit("input", { text: "Discord echo", source: "extension" });
 	assert.equal(gateway.sent.length, sentBeforeLoopCheck, "Discord-origin extension input must not loop back to Discord");
-	await first.emit("before_agent_start", {});
+	await first.emit("before_agent_start", { prompt: "local assistant mirror" });
 	await first.emit("message_end", {
 		message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "final only" }] },
 	});
@@ -734,6 +840,59 @@ try {
 	await first.emit("agent_settled", {});
 	await waitFor(() => gateway.sent.some((message) => message.text === "final only"), "durable final assistant send");
 	assert.equal(gateway.sent.at(-1)?.text, "final only", "assistant output must wait for agent_settled");
+
+	async function runTerminalLifecycle(id, stopReason) {
+		const delivery = second.nextUserMessage();
+		await gateway.emit({ id, channelId: secondThread, content: `terminal ${id}`, authorBot: false });
+		const message = await delivery;
+		await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: message.text }] } });
+		await waitFor(() => FakeGateway.lifecycleReactions.get(id) === "👀", `${id} accepted reaction`);
+		await second.emit("before_agent_start", { prompt: message.text });
+		await second.emit("agent_start", {});
+		await second.emit("message_start", { message: { role: "user", content: [{ type: "text", text: message.text }] } });
+		await second.emit("agent_end", { messages: [{ role: "assistant", stopReason }] });
+		await second.emit("agent_settled", {});
+		await waitFor(() => FakeGateway.lifecycleReactions.get(id) === "❌", `${id} failed reaction`);
+	}
+	await runTerminalLifecycle("16", "error");
+	await runTerminalLifecycle("17", "aborted");
+	assert.deepEqual(reactionSequence("16"), ["👀", "🤔", "❌"]);
+	assert.deepEqual(reactionSequence("17"), ["👀", "🤔", "❌"]);
+
+	FakeGateway.failLifecycleOnce.add("18:👀");
+	const reactionFailureDelivery = second.nextUserMessage();
+	await gateway.emit({ id: "18", channelId: secondThread, content: "reaction API failure", authorBot: false });
+	const reactionFailureMessage = await reactionFailureDelivery;
+	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: reactionFailureMessage.text }] } });
+	await second.emit("before_agent_start", { prompt: reactionFailureMessage.text });
+	await second.emit("agent_start", {});
+	await second.emit("message_start", { message: { role: "user", content: [{ type: "text", text: reactionFailureMessage.text }] } });
+	await second.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+	await second.emit("agent_settled", {});
+	await waitFor(() => FakeGateway.lifecycleReactions.get("18") === "✅", "progress after reaction API failure");
+	assert.equal(stripInboundMarker(reactionFailureMessage.text), "reaction API failure", "reaction failure must not block Pi delivery");
+	assert.deepEqual(reactionSequence("18"), ["🤔", "✅"], "later statuses must recover from a reaction API failure");
+
+	const reconnectDelivery = second.nextUserMessage();
+	await gateway.emit({ id: "19", channelId: secondThread, content: "survive reconnect", authorBot: false });
+	const reconnectMessage = await reconnectDelivery;
+	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: reconnectMessage.text }] } });
+	await second.emit("before_agent_start", { prompt: reconnectMessage.text });
+	await second.emit("agent_start", {});
+	await second.emit("message_start", { message: { role: "user", content: [{ type: "text", text: reconnectMessage.text }] } });
+	await waitFor(() => FakeGateway.lifecycleReactions.get("19") === "🤔", "pre-reconnect thinking reaction");
+	const preReconnectGateway = gateway;
+	const gatewayCountBeforeReconnect = FakeGateway.instances.length;
+	FakeGateway.lifecycleReactions.delete("19");
+	gateway.terminal();
+	await waitFor(() => FakeGateway.instances.length > gatewayCountBeforeReconnect, "reaction relay reconnect");
+	gateway = FakeGateway.instances.at(-1);
+	await waitFor(() => FakeGateway.lifecycleReactionEvents.some((event) =>
+		event.messageId === "19" && event.reaction === "🤔" && event.gateway === gateway), "lifecycle replay after reconnect");
+	assert.notEqual(gateway, preReconnectGateway);
+	await second.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+	await second.emit("agent_settled", {});
+	await waitFor(() => FakeGateway.lifecycleReactions.get("19") === "✅", "post-reconnect settled reaction");
 
 	const failedInjection = createExtensionHarness(extension, {
 		cwd: "/work/failing",
@@ -743,6 +902,7 @@ try {
 	await failedInjection.emit("session_start", { reason: "startup" });
 	const failedThread = (await new DiscordStateStore(stateFile).getSession("session-44444444")).threadId;
 	failedInjection.setInjectionError(true);
+	FakeGateway.hangLifecycleFor.add("15:👀");
 	await gateway.emit({ id: "15", channelId: failedThread, content: "must remain pending", authorBot: false });
 	await waitFor(() => failedInjection.notifications.some(([text]) => text.includes("injected Pi acceptance failure")), "Pi injection failure");
 	assert.deepEqual(failedInjection.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "⚠️"]);
@@ -766,7 +926,7 @@ try {
 	await retriedInjection.emit("session_shutdown", { reason: "quit" });
 
 	await first.emit("session_shutdown", { reason: "quit" });
-	assert.equal(FakeGateway.instances.length, 1, "relay child must survive the Pi client that launched it");
+	assert.equal(gateway.connected, true, "relay child must survive the Pi client that launched it");
 	assert.equal(FakeGateway.activeConnections, 1);
 	assert.equal(FakeGateway.maximumActiveConnections, 1);
 	const failoverGateway = gateway;

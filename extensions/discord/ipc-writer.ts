@@ -38,6 +38,14 @@ export class BoundedSocketWriter {
 		return true;
 	}
 
+	writeBestEffort(data: string): boolean {
+		if (this.closed || this.socket.destroyed || this.blocked || this.queue.length > 0) return false;
+		const bytes = Buffer.byteLength(data);
+		if (bytes > MAX_QUEUED_IPC_BYTES) return false;
+		this.blocked = !this.socket.write(data);
+		return true;
+	}
+
 	close(): void {
 		if (this.closed) return;
 		this.closed = true;

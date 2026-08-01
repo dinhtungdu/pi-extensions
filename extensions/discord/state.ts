@@ -3,9 +3,11 @@ import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/
 import { dirname } from "node:path";
 import { DISCORD_STATE_FILE } from "./config.js";
 import { collidingProjectChannelName, normalizeCwd, projectChannelName } from "./text.js";
+import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reactions.js";
 
 const STATE_VERSION = 1;
 const MAX_RECENT_MESSAGE_IDS = 2_000;
+const MAX_LIFECYCLE_MESSAGES_PER_SESSION = 2_000;
 const LOCK_STALE_MS = 120_000;
 const LOCK_RETRIES = 600;
 const LOCK_RETRY_MS = 50;
@@ -18,6 +20,12 @@ export interface ProjectChannelMapping {
 export interface QueuedDiscordMessage {
 	id: string;
 	content: string;
+}
+
+export interface DiscordLifecycleMessage {
+	messageId: string;
+	channelId: string;
+	status: DiscordLifecycleStatus;
 }
 
 export interface OutboundChunk {
@@ -42,6 +50,7 @@ export interface SessionThreadMapping {
 	threadCursors: Record<string, string>;
 	pendingMessages: QueuedDiscordMessage[];
 	outboundMessages: OutboundMessage[];
+	lifecycleMessages: DiscordLifecycleMessage[];
 }
 
 export interface DiscordBridgeState {
@@ -87,6 +96,23 @@ function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: s
 			chunks,
 		};
 	});
+}
+
+function parseLifecycleMessages(value: unknown, file: string): DiscordLifecycleMessage[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) throw new Error(`Discord bridge state ${file} has an invalid lifecycle message list`);
+	return value.map((message) => {
+		if (!isRecord(message) || typeof message.messageId !== "string" || typeof message.channelId !== "string" ||
+			(message.status !== "accepted" && message.status !== "thinking" && message.status !== "tool" &&
+				message.status !== "succeeded" && message.status !== "failed")) {
+			throw new Error(`Discord bridge state ${file} has an invalid lifecycle message`);
+		}
+		return {
+			messageId: message.messageId,
+			channelId: message.channelId,
+			status: message.status as DiscordLifecycleStatus,
+		};
+	}).slice(-MAX_LIFECYCLE_MESSAGES_PER_SESSION);
 }
 
 function parsePendingMessages(value: unknown, file: string): QueuedDiscordMessage[] {
@@ -149,6 +175,7 @@ function parseState(value: unknown, file: string): DiscordBridgeState {
 			threadCursors,
 			pendingMessages: parsePendingMessages(mapping.pendingMessages, file),
 			outboundMessages: parseOutboundMessages(mapping.outboundMessages, file, mapping.threadId),
+			lifecycleMessages: parseLifecycleMessages(mapping.lifecycleMessages, file),
 		};
 	}
 
@@ -238,6 +265,7 @@ export class DiscordStateStore {
 				threadCursors: existing?.threadCursors ?? {},
 				pendingMessages: existing?.pendingMessages ?? [],
 				outboundMessages,
+				lifecycleMessages: existing?.lifecycleMessages ?? [],
 			};
 			state.sessions[sessionId] = mapping;
 			return structuredClone(mapping);
@@ -261,7 +289,7 @@ export class DiscordStateStore {
 		sessionId: string,
 		message: { id: string; channelId: string; content: string; authorBot: boolean },
 		advanceCursor = true,
-	): Promise<{ queued: boolean; message?: QueuedDiscordMessage }> {
+	): Promise<{ queued: boolean; message?: QueuedDiscordMessage; lifecycle?: DiscordLifecycleMessage }> {
 		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) return { queued: false };
@@ -277,12 +305,28 @@ export class DiscordStateStore {
 			if (!session.pendingMessages.some((candidate) => candidate.id === message.id)) {
 				session.pendingMessages.push(queued);
 			}
-			return { queued: true, message: queued };
+			const lifecycle = { messageId: message.id, channelId: message.channelId, status: "accepted" as const };
+			session.lifecycleMessages.push(lifecycle);
+			session.lifecycleMessages = session.lifecycleMessages.slice(-MAX_LIFECYCLE_MESSAGES_PER_SESSION);
+			return { queued: true, message: queued, lifecycle };
 		});
 	}
 
 	async pendingMessages(sessionId: string): Promise<QueuedDiscordMessage[]> {
 		return (await this.getSession(sessionId))?.pendingMessages ?? [];
+	}
+
+	async updateLifecycleStatus(
+		sessionId: string,
+		messageId: string,
+		status: DiscordLifecycleStatus,
+	): Promise<DiscordLifecycleMessage | undefined> {
+		return this.mutate(async (state) => {
+			const lifecycle = state.sessions[sessionId]?.lifecycleMessages.find((message) => message.messageId === messageId);
+			if (!lifecycle || !canAdvanceLifecycleStatus(lifecycle.status, status)) return undefined;
+			lifecycle.status = status;
+			return structuredClone(lifecycle);
+		});
 	}
 
 	async acknowledgeMessage(sessionId: string, messageId: string): Promise<void> {

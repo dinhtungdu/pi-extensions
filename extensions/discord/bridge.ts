@@ -50,6 +50,10 @@ export class DiscordBridge {
 	private finalAssistantText: string | undefined;
 	private readonly submittedInboundIds = new Set<string>();
 	private readonly acceptedInboundIds = new Set<string>();
+	private readonly runInboundIds = new Set<string>();
+	private initialInboundId: string | undefined;
+	private activeInboundId: string | undefined;
+	private terminalRunFailed = false;
 
 	constructor(
 		config: DiscordBridgeConfig,
@@ -76,6 +80,7 @@ export class DiscordBridge {
 
 	async stop(): Promise<void> {
 		this.finalAssistantText = undefined;
+		this.resetAgentRun();
 		await this.relay.stop();
 	}
 
@@ -98,8 +103,36 @@ export class DiscordBridge {
 		await this.relay.acknowledgeInbound(messageId);
 	}
 
-	beginAgentRun(): void {
+	beginAgentRun(messageId?: string): void {
 		this.finalAssistantText = undefined;
+		this.resetAgentRun();
+		this.initialInboundId = messageId;
+		this.activeInboundId = messageId;
+	}
+
+	agentStarted(): void {
+		if (!this.initialInboundId) return;
+		this.associateInbound(this.initialInboundId);
+	}
+
+	userMessageStarted(messageId?: string): void {
+		this.activeInboundId = messageId;
+		if (messageId) this.associateInbound(messageId);
+	}
+
+	toolStarted(): void {
+		if (this.activeInboundId) this.relay.updateLifecycle(this.activeInboundId, "tool");
+	}
+
+	agentEnded(messages: Array<{ role?: string; stopReason?: string }>, aborted = false): void {
+		const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+		this.terminalRunFailed = aborted || lastAssistant?.stopReason === "aborted" || lastAssistant?.stopReason === "error";
+	}
+
+	settleAgentRun(): void {
+		const status = this.terminalRunFailed ? "failed" : "succeeded";
+		for (const messageId of this.runInboundIds) this.relay.updateLifecycle(messageId, status);
+		this.resetAgentRun();
 	}
 
 	captureAssistantMessage(message: { role?: string; content?: unknown; stopReason?: string }): void {
@@ -112,6 +145,19 @@ export class DiscordBridge {
 		if (!text) return;
 		await this.relay.sendAssistantText(text);
 		if (this.finalAssistantText === text) this.finalAssistantText = undefined;
+	}
+
+	private associateInbound(messageId: string): void {
+		this.activeInboundId = messageId;
+		this.runInboundIds.add(messageId);
+		this.relay.updateLifecycle(messageId, "thinking");
+	}
+
+	private resetAgentRun(): void {
+		this.runInboundIds.clear();
+		this.initialInboundId = undefined;
+		this.activeInboundId = undefined;
+		this.terminalRunFailed = false;
 	}
 
 	private async receiveInbound(messageId: string, text: string): Promise<void> {

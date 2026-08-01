@@ -8,6 +8,7 @@ import {
 	type TextChannel,
 } from "discord.js";
 import type { DiscordBridgeConfig } from "./config.js";
+import { DISCORD_LIFECYCLE_REACTIONS, type DiscordLifecycleReaction } from "./reactions.js";
 
 const READY_TIMEOUT_MS = 30_000;
 
@@ -39,7 +40,33 @@ export interface DiscordTransport {
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
 	sendText(channelId: string, text: string, nonce: string): Promise<string>;
+	setLifecycleReaction(channelId: string, messageId: string, reaction: DiscordLifecycleReaction): Promise<void>;
 	onTerminalError(listener: (error: Error) => void): () => void;
+}
+
+interface LifecycleReactionState {
+	emoji: { name: string | null };
+	me: boolean;
+	users: { remove(userId: string): Promise<unknown> };
+}
+
+export async function replaceOwnLifecycleReaction(
+	reactions: Iterable<LifecycleReactionState>,
+	botUserId: string,
+	next: DiscordLifecycleReaction,
+	add: (reaction: DiscordLifecycleReaction) => Promise<unknown>,
+): Promise<void> {
+	let hasNext = false;
+	for (const reaction of reactions) {
+		if (reaction.emoji.name === next) {
+			hasNext ||= reaction.me;
+			continue;
+		}
+		if (reaction.me && DISCORD_LIFECYCLE_REACTIONS.includes(reaction.emoji.name as DiscordLifecycleReaction)) {
+			await reaction.users.remove(botUserId);
+		}
+	}
+	if (!hasNext) await add(next);
 }
 
 export function assertConfiguredCategory(
@@ -224,6 +251,21 @@ export class DiscordJsTransport implements DiscordTransport {
 			allowedMentions: { parse: [] },
 		});
 		return message.id;
+	}
+
+	async setLifecycleReaction(channelId: string, messageId: string, reaction: DiscordLifecycleReaction): Promise<void> {
+		const client = this.readyClient();
+		const channel = await client.channels.fetch(channelId).catch(() => null);
+		if (!channel?.isTextBased() || channel.isDMBased()) {
+			throw new Error(`Discord thread ${channelId} is missing or cannot manage reactions`);
+		}
+		const message = await channel.messages.fetch(messageId);
+		await replaceOwnLifecycleReaction(
+			message.reactions.cache.values(),
+			client.user.id,
+			reaction,
+			(next) => message.react(next),
+		);
 	}
 
 	onTerminalError(listener: (error: Error) => void): () => void {
