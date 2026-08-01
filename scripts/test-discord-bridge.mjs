@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { createServer } from "node:net";
 import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -12,6 +13,7 @@ import { ChannelType } from "discord.js";
 const root = resolve(import.meta.dirname, "..");
 const output = await mkdtemp(join(root, ".discord-bridge-test-"));
 const dataDir = await mkdtemp(join(tmpdir(), "pi-discord-bridge-data-"));
+let compatibilityDirectory;
 
 function compileExtensions() {
 	const compile = spawnSync(
@@ -199,10 +201,12 @@ try {
 		saveDiscordConfig,
 	} = await importBuilt("extensions/discord/config.js");
 	const { DiscordStateStore } = await importBuilt("extensions/discord/state.js");
+	const { LocalRelayClient } = await importBuilt("extensions/discord/relay-client.js");
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
+	const { isClientFrame } = await importBuilt("extensions/discord/protocol.js");
 	const { tryAcquireLeader } = await importBuilt("extensions/discord/leader.js");
 	const {
 		assistantText,
@@ -291,6 +295,74 @@ try {
 		.map((chunk) => chunk.slice("🖥️ **".length, -2).replace(/\\([\\`*_{}[\]()#+\-.!|>~])/g, "$1"))
 		.join("");
 	assert.equal(reconstructedInteractive, longInteractiveInput);
+
+	const previousValidator = (frame) => frame?.type === "outbound" && typeof frame.requestId === "string" &&
+		typeof frame.messageId === "string" && typeof frame.text === "string" && (frame.kind === "user" || frame.kind === "assistant");
+	compatibilityDirectory = await mkdtemp(join(tmpdir(), "dc-ipc-"));
+	const compatibilityPaths = relayPaths(compatibilityDirectory);
+	const previousHostFrames = [];
+	let rejectOutbound = false;
+	const compatibilityServer = createServer((socket) => {
+		socket.setEncoding("utf8");
+		let buffer = "";
+		socket.on("data", (data) => {
+			buffer += data;
+			let newline = buffer.indexOf("\n");
+			while (newline >= 0) {
+				const line = buffer.slice(0, newline);
+				buffer = buffer.slice(newline + 1);
+				if (line) {
+					const frame = JSON.parse(line);
+					if (frame.type === "register") {
+						socket.write(`${JSON.stringify({ type: "registered", channelId: "compat-channel", threadId: "compat-thread", leaderPid: process.pid })}\n`);
+					} else if (frame.type === "outbound") {
+						previousHostFrames.push(frame);
+						if (!previousValidator(frame)) {
+							socket.write(`${JSON.stringify({ type: "error", message: "Invalid local Discord relay IPC frame" })}\n`);
+						} else if (rejectOutbound) {
+							socket.write(`${JSON.stringify({ type: "error", message: "injected correlated rejection", requestId: frame.requestId })}\n`);
+						} else {
+							socket.write(`${JSON.stringify({ type: "outbound_queued", requestId: frame.requestId, messageId: frame.messageId })}\n`);
+						}
+					} else if (frame.type === "unregister") socket.end();
+				}
+				newline = buffer.indexOf("\n");
+			}
+		});
+	});
+	await new Promise((resolveListen, rejectListen) => {
+		compatibilityServer.once("error", rejectListen);
+		compatibilityServer.listen(compatibilityPaths.socket, resolveListen);
+	});
+	const compatibilityErrors = [];
+	const compatibilityClient = new LocalRelayClient(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		{ cwd: "/compatibility", sessionId: "compatibility-session" },
+		{
+			onInbound() {},
+			onError(error) { compatibilityErrors.push(error); },
+			onStatus() {},
+		},
+		{ paths: compatibilityPaths, launchRelay: async () => {} },
+	);
+	await compatibilityClient.start();
+	await compatibilityClient.sendInteractiveUserText("hot **reload**");
+	assert.equal(previousHostFrames.length, 1);
+	assert.equal(previousHostFrames[0].kind, "user", "interactive presentation must retain the pre-7c01263 outbound kind");
+	assert.equal(previousHostFrames[0].text, interactiveUserChunks("hot **reload**")[0]);
+	assert.equal(previousValidator(previousHostFrames[0]), true);
+	assert.equal(isClientFrame(previousHostFrames[0]), true);
+	assert.equal(isClientFrame({ ...previousHostFrames[0], kind: "interactive" }), false, "unknown outbound kinds must remain invalid");
+	assert.equal(compatibilityErrors.length, 0);
+	rejectOutbound = true;
+	const rejectionStarted = Date.now();
+	await assert.rejects(() => compatibilityClient.sendUserText("reject once"), /injected correlated rejection/);
+	assert.ok(Date.now() - rejectionStarted < 1_000, "correlated request failures must reject without the 30s request timeout");
+	assert.equal(previousHostFrames.filter((frame) => frame.text === "reject once").length, 1, "declared request failures must not retry forever");
+	await compatibilityClient.stop();
+	await new Promise((resolveClose) => compatibilityServer.close(resolveClose));
+	await rm(compatibilityDirectory, { recursive: true, force: true });
+	compatibilityDirectory = undefined;
 
 	class SlowSocket extends EventEmitter {
 		destroyed = false;
@@ -788,6 +860,7 @@ try {
 
 	console.log("[discord bridge test] passed");
 } finally {
+	if (compatibilityDirectory) await rm(compatibilityDirectory, { recursive: true, force: true });
 	await rm(output, { recursive: true, force: true });
 	await rm(dataDir, { recursive: true, force: true }).catch(() => {});
 }

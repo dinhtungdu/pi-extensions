@@ -29,6 +29,7 @@ export interface OutboundChunk {
 
 export interface OutboundMessage {
 	id: string;
+	// "interactive" is retained only to drain state written by the short-lived 7c01263 protocol.
 	kind: "user" | "interactive" | "assistant";
 	threadId: string;
 	chunks: OutboundChunk[];

@@ -5,6 +5,7 @@ import { loadOrCreateRelayToken, publishRelayConfigIntent } from "./config.js";
 import { BoundedSocketWriter } from "./ipc-writer.js";
 import { configFingerprint, encodeFrame, isServerFrame, MAX_IPC_FRAME_BYTES, parseFrame, type ClientFrame, type ServerFrame } from "./protocol.js";
 import type { RelaySessionRegistration } from "./relay-core.js";
+import { interactiveUserChunks } from "./text.js";
 
 const CONNECT_RETRY_MIN_MS = 25;
 const CONNECT_RETRY_MAX_MS = 500;
@@ -52,6 +53,7 @@ function asError(error: unknown): Error {
 }
 
 class FatalRelayConnectionError extends Error {}
+class RelayRequestError extends Error {}
 
 async function bounded<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -133,7 +135,8 @@ export class LocalRelayClient {
 	}
 
 	async sendInteractiveUserText(text: string): Promise<void> {
-		await this.queueOutbound("interactive", text);
+		if (!text.trim()) return;
+		for (const chunk of interactiveUserChunks(text)) await this.queueOutbound("user", chunk);
 	}
 
 	async sendAssistantText(text: string): Promise<void> {
@@ -285,7 +288,16 @@ export class LocalRelayClient {
 			return;
 		}
 		if (frame.type === "error") {
-			const error = frame.fatal ? new FatalRelayConnectionError(frame.message) : new Error(frame.message);
+			const error = frame.fatal ? new FatalRelayConnectionError(frame.message) : new RelayRequestError(frame.message);
+			if (frame.requestId) {
+				const pending = this.pendingRequests.get(frame.requestId);
+				if (pending) {
+					clearTimeout(pending.timer);
+					this.pendingRequests.delete(frame.requestId);
+					pending.reject(error);
+					return;
+				}
+			}
 			if (!this.currentStatus.connected || frame.fatal) waiter.reject(error);
 			else this.callbacks.onError(error);
 			return;
@@ -313,7 +325,7 @@ export class LocalRelayClient {
 		}
 	}
 
-	private async queueOutbound(kind: "user" | "interactive" | "assistant", text: string): Promise<void> {
+	private async queueOutbound(kind: "user" | "assistant", text: string): Promise<void> {
 		if (!text.trim()) return;
 		const messageId = randomUUID();
 		for (;;) {
@@ -322,7 +334,7 @@ export class LocalRelayClient {
 				await this.sendRequest({ type: "outbound", requestId: randomUUID(), messageId, kind, text }, REQUEST_TIMEOUT_MS);
 				return;
 			} catch (error) {
-				if (this.stopped) throw error;
+				if (this.stopped || error instanceof RelayRequestError) throw error;
 				await this.ensureConnected();
 				await delay(CONNECT_RETRY_MIN_MS);
 			}

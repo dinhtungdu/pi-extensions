@@ -6,7 +6,7 @@ export const MAX_IPC_FRAME_BYTES = 1_048_576;
 
 export type ClientFrame =
 	| ({ type: "register"; token: string; clientId: string; generation: string; configFingerprint: string; configEpoch: number } & RelaySessionRegistration)
-	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "interactive" | "assistant"; text: string }
+	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
 	| { type: "ack_inbound"; requestId: string; messageId: string }
 	| { type: "unregister" }
 	| { type: "ping" };
@@ -18,7 +18,7 @@ export type ServerFrame =
 	| { type: "outbound_queued"; requestId: string; messageId: string }
 	| { type: "pong" }
 	| { type: "replacing"; configEpoch: number }
-	| { type: "error"; message: string; fatal?: boolean };
+	| { type: "error"; message: string; fatal?: boolean; requestId?: string };
 
 export function configFingerprint(config: DiscordBridgeConfig): string {
 	return createHash("sha256")
@@ -46,7 +46,7 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 	}
 	if (frame.type === "outbound") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string" && typeof frame.text === "string" &&
-			(frame.kind === "user" || frame.kind === "interactive" || frame.kind === "assistant");
+			(frame.kind === "user" || frame.kind === "assistant");
 	}
 	if (frame.type === "ack_inbound") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	return frame.type === "unregister" || frame.type === "ping";
@@ -61,7 +61,9 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 	if (frame.type === "inbound") return typeof frame.messageId === "string" && typeof frame.text === "string";
 	if (frame.type === "inbound_acked") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	if (frame.type === "outbound_queued") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
-	if (frame.type === "error") return typeof frame.message === "string";
+	if (frame.type === "error") {
+		return typeof frame.message === "string" && (frame.requestId === undefined || typeof frame.requestId === "string");
+	}
 	if (frame.type === "replacing") return typeof frame.configEpoch === "number";
 	return frame.type === "pong";
 }

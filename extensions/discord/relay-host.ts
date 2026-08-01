@@ -257,12 +257,22 @@ export class LocalRelayHost {
 		const sessionId = state.sessionId!;
 		if (parsed.type === "register") throw new Error("Local Discord relay client is already registered");
 		if (parsed.type === "ack_inbound") {
-			await this.options.core.acknowledge(clientId, generation, sessionId, parsed.messageId);
+			try {
+				await this.options.core.acknowledge(clientId, generation, sessionId, parsed.messageId);
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
+				return;
+			}
 			this.write(state, { type: "inbound_acked", requestId: parsed.requestId, messageId: parsed.messageId });
 			return;
 		}
 		if (parsed.type === "outbound") {
-			await this.options.core.queueOutbound(clientId, generation, sessionId, parsed.messageId, parsed.kind, parsed.text);
+			try {
+				await this.options.core.queueOutbound(clientId, generation, sessionId, parsed.messageId, parsed.kind, parsed.text);
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
+				return;
+			}
 			this.write(state, { type: "outbound_queued", requestId: parsed.requestId, messageId: parsed.messageId });
 			return;
 		}
@@ -286,8 +296,8 @@ export class LocalRelayHost {
 		return state.writer.write(encodeFrame(frame));
 	}
 
-	private fail(socket: Socket, state: SocketState, message: string, fatal: boolean): void {
-		this.write(state, { type: "error", message, fatal });
+	private fail(socket: Socket, state: SocketState, message: string, fatal: boolean, requestId?: string): void {
+		this.write(state, { type: "error", message, fatal, ...(requestId ? { requestId } : {}) });
 		if (fatal) socket.end();
 	}
 }
