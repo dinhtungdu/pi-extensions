@@ -1,7 +1,7 @@
 {
 	"name": "pi-extensions",
 	"version": "0.1.1",
-	"description": "Pi extensions for macOS themes, Codemode orchestration, persisted goals, and local hands-free voice.",
+	"description": "Pi extensions for macOS themes, Codemode orchestration, persisted goals, Discord bridging, and local hands-free voice.",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -20,6 +20,7 @@
 		"dark-mode",
 		"codemode",
 		"goal",
+		"discord",
 		"voice",
 		"speech-to-text",
 		"text-to-speech"
@@ -29,22 +30,26 @@
 			"./extensions/auto-dark-mode.ts",
 			"./extensions/code-mode.ts",
 			"./extensions/goal.ts",
+			"./extensions/discord/index.ts",
 			"./extensions/tool-visibility/index.ts",
 			"./extensions/voice/index.ts"
 		]
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.82.1"
+		"@earendil-works/pi-coding-agent": ">=0.83.0"
 	},
 	"devDependencies": {
 		"@earendil-works/pi-coding-agent": "^0.83.0",
 		"@earendil-works/pi-tui": "^0.83.0",
 		"@types/node": "^24.13.3",
+		"oxlint": "^1.76.0",
 		"typebox": "^1.3.8",
 		"typescript": "^5.8.3"
 	},
 	"scripts": {
 		"check": "tsc --noEmit",
+		"lint": "oxlint extensions/discord scripts/test-discord-bridge.mjs",
+		"test:discord": "node ./scripts/test-discord-bridge.mjs",
 		"test:tool-visibility": "node ./scripts/test-tool-visibility.mjs",
 		"setup:voice": "node ./scripts/setup-voice.mjs",
 		"uninstall:voice": "node ./scripts/uninstall-voice.mjs",
@@ -53,5 +58,8 @@
 		"test:voice-input": "node ./scripts/test-voice-input.mjs",
 		"test:voice-status": "node ./scripts/test-voice-status.mjs",
 		"test:voice-components": "node ./scripts/test-voice-components.mjs"
+	},
+	"dependencies": {
+		"discord.js": "^14.27.0"
 	}
 }

@@ -5,6 +5,7 @@ Pi extensions:
 - `auto-dark-mode` — macOS dark/light theme switching
 - `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 - `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
+- `discord` — automatic Discord project channels and Pi session threads with bidirectional text mirroring
 - `tool-visibility` — hide/show all tool execution rows without changing tools, messages, or session history
 - `voice` — local hands-free STT/TTS for Apple Silicon with streaming speech and deterministic keyboard interruption
 
@@ -23,7 +24,7 @@ Selected extensions only:
 	"packages": [
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
-			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
+			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/discord/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
 			"skills": [],
 			"prompts": [],
 			"themes": []
@@ -40,6 +41,7 @@ Local development:
 pi -e ./extensions/auto-dark-mode.ts
 pi -e ./extensions/code-mode.ts
 pi -e ./extensions/goal.ts
+pi -e ./extensions/discord/index.ts
 pi -e ./extensions/tool-visibility/index.ts
 pi -e ./extensions/voice/index.ts
 pi install /path/to/pi-extensions
@@ -89,6 +91,38 @@ Notes:
 - Active goals auto-continue with hidden continuation messages until `update_goal({ status: "complete" })`, `/goal pause`, `/goal clear`, budget exhaustion, or a no-tool continuation.
 - Goal state is stored in the pi session branch via custom entries; it survives reload/resume/fork.
 - Objectives should include scope, success criteria, constraints, and verification commands.
+
+## Discord bridge
+
+The Discord extension connects automatically when configured. It keeps one durable text channel per working directory and one durable thread per Pi session. Resuming a session reuses its thread and reopens it when archived; channels and threads are never deleted.
+
+Bot setup:
+
+1. Enable the privileged Message Content intent in the Discord developer portal.
+2. Invite the bot with View Channels, Read Message History, Send Messages, Create Public Threads, Manage Threads, and Manage Channels permissions.
+3. Run `/discord setup`, or create `~/.pi/agent/discord-bridge/config.json`:
+
+```json
+{
+	"token": "...",
+	"guildId": "...",
+	"categoryId": "..."
+}
+```
+
+`categoryId` is optional; omit it to create project channels at the guild root. A configured category that is missing, belongs to another guild, or is not a category fails startup explicitly instead of silently falling back to the root. `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, and `DISCORD_CATEGORY_ID` override file values.
+
+Mappings and recent inbound message IDs are stored in `~/.pi/agent/discord-bridge/state.json`. State writes are atomic and cross-process locked. The bridge ignores bot messages and duplicate Discord IDs, and extension-injected Pi input is not echoed back. Discord messages received while Pi is active use Pi 0.83's normal `followUp` queue. Assistant text is sent only after `agent_settled`; thinking, tools, progress, attachments, and intermediate responses are not forwarded.
+
+Commands:
+
+```text
+/discord setup
+/discord status
+/discord reconnect
+```
+
+There is intentionally no user or app allowlist. Discord channel/thread permissions are the access boundary, so restrict them appropriately.
 
 ## Tool visibility
 
