@@ -14,6 +14,9 @@ import { runRelayChild } from "./relay-child.js";
 import { launchRelayChild } from "./relay-launcher.js";
 
 const STATUS_KEY = "discord-bridge";
+const STATUS_CONNECTED = "💬";
+const STATUS_RECONNECTING = "🔄";
+const STATUS_ERROR = "⚠️";
 const ACCEPTED_INBOUND_ENTRY = "discord-bridge-inbound-accepted";
 
 type ConfigLoader = () => Promise<DiscordBridgeConfig | null>;
@@ -65,7 +68,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			const status = bridge?.status();
 			ctx.ui.setStatus(
 				STATUS_KEY,
-				status?.connected ? `Discord relay ${status.channelId}/${status.threadId}` : undefined,
+				status?.connected ? STATUS_CONNECTED : undefined,
 			);
 		}
 
@@ -82,7 +85,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			try {
 				config = await loadConfig();
 			} catch (error) {
-				ctx.ui.setStatus(STATUS_KEY, "Discord error");
+				ctx.ui.setStatus(STATUS_KEY, STATUS_ERROR);
 				ctx.ui.notify(errorMessage(error), "error");
 				return;
 			}
@@ -100,13 +103,13 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 						else pi.sendUserMessage(text, { deliverAs: "followUp" });
 					},
 					onError(error) {
-						ctx.ui.setStatus(STATUS_KEY, "Discord error");
+						ctx.ui.setStatus(STATUS_KEY, STATUS_ERROR);
 						ctx.ui.notify(`Discord bridge: ${error.message}`, "error");
 					},
 					onStatus(status) {
 						ctx.ui.setStatus(
 							STATUS_KEY,
-							status.connected ? `Discord relay ${status.channelId}/${status.threadId}` : "Discord relay reconnecting",
+							status.connected ? STATUS_CONNECTED : STATUS_RECONNECTING,
 						);
 					},
 				},
@@ -128,7 +131,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			} catch (error) {
 				await candidate.stop().catch(() => {});
 				bridge = undefined;
-				ctx.ui.setStatus(STATUS_KEY, "Discord error");
+				ctx.ui.setStatus(STATUS_KEY, STATUS_ERROR);
 				ctx.ui.notify(`Discord bridge failed: ${errorMessage(error)}`, "error");
 			}
 		}

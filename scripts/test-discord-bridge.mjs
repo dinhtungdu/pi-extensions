@@ -188,6 +188,9 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName, entrie
 			for (const handler of events.get(name) ?? []) result = await handler(event, ctx);
 			return result;
 		},
+		async runCommand(name, args = "") {
+			return commands.get(name).handler(args, ctx);
+		},
 	};
 }
 
@@ -673,12 +676,16 @@ try {
 	assert.ok(first.events.has("agent_settled"));
 	assert.equal(first.events.has("agent_end"), false);
 
-	const firstStatus = first.statuses.findLast(([, text]) => text?.startsWith("Discord relay "))[1];
-	const secondStatus = second.statuses.findLast(([, text]) => text?.startsWith("Discord relay "))[1];
-	const [firstChannel, firstThread] = firstStatus.replace("Discord relay ", "").split("/");
-	const [secondChannel, secondThread] = secondStatus.replace("Discord relay ", "").split("/");
+	assert.deepEqual(first.statuses.at(-1), ["discord-bridge", "💬"]);
+	assert.deepEqual(second.statuses.at(-1), ["discord-bridge", "💬"]);
+	const firstMapping = await new DiscordStateStore(stateFile).getSession("session-11111111");
+	const secondMapping = await new DiscordStateStore(stateFile).getSession("session-22222222");
+	const { channelId: firstChannel, threadId: firstThread } = firstMapping;
+	const { channelId: secondChannel, threadId: secondThread } = secondMapping;
 	assert.equal(firstChannel, secondChannel, "sessions in one cwd must share its durable project channel");
 	assert.notEqual(firstThread, secondThread);
+	await first.runCommand("discord", "status");
+	assert.match(first.notifications.at(-1)[0], new RegExp(`Project channel: ${firstChannel}\\nSession thread: ${firstThread}$`), "command status must retain detailed diagnostics");
 	const gateway = FakeGateway.instances[0];
 	second.setIdle(false);
 	const routedSecond = second.nextUserMessage();
@@ -733,10 +740,11 @@ try {
 		sessionName: "Failing injection",
 	});
 	await failedInjection.emit("session_start", { reason: "startup" });
-	const failedThread = failedInjection.statuses.findLast(([, text]) => text?.startsWith("Discord relay "))[1].split("/").at(-1);
+	const failedThread = (await new DiscordStateStore(stateFile).getSession("session-44444444")).threadId;
 	failedInjection.setInjectionError(true);
 	await gateway.emit({ id: "15", channelId: failedThread, content: "must remain pending", authorBot: false });
 	await waitFor(() => failedInjection.notifications.some(([text]) => text.includes("injected Pi acceptance failure")), "Pi injection failure");
+	assert.deepEqual(failedInjection.statuses.at(-1), ["discord-bridge", "⚠️"]);
 	assert.equal(failedInjection.userMessages.length, 0);
 	const shutdownStarted = Date.now();
 	await failedInjection.emit("session_shutdown", { reason: "quit" });
@@ -774,8 +782,7 @@ try {
 		sessionName: "Inactive session",
 	});
 	await inactive.emit("session_start", { reason: "startup" });
-	const inactiveStatus = inactive.statuses.findLast(([, text]) => text?.startsWith("Discord relay "))[1];
-	const inactiveThread = inactiveStatus.split("/").at(-1);
+	const inactiveThread = (await new DiscordStateStore(stateFile).getSession("session-33333333")).threadId;
 	await inactive.emit("session_shutdown", { reason: "quit" });
 	await failoverGateway.emit({ id: "30", channelId: inactiveThread, content: "queued while inactive", authorBot: false });
 	assert.equal(inactive.userMessages.length, 0);
@@ -842,21 +849,29 @@ try {
 	await rolloverB.emit("session_start", { reason: "startup" });
 	await waitFor(
 		() => FakeGateway.instances.length > beforeRolloverCount && FakeGateway.instances.at(-1).config?.token === "environment-two" &&
-			rolloverA.statuses.at(-1)?.[1]?.startsWith("Discord relay ") && rolloverB.statuses.at(-1)?.[1]?.startsWith("Discord relay "),
+			rolloverA.statuses.at(-1)?.[1] === "💬" && rolloverB.statuses.at(-1)?.[1] === "💬",
 		"atomic config epoch rollover with stale-client convergence",
 	);
 	assert.equal(FakeGateway.activeConnections, 1);
 	assert.equal(FakeGateway.maximumActiveConnections, 1);
 	const beforeTerminalCount = FakeGateway.instances.length;
 	FakeGateway.instances.at(-1).terminal();
+	await waitFor(() => rolloverA.statuses.some(([, text]) => text === "🔄") || rolloverB.statuses.some(([, text]) => text === "🔄"), "compact reconnecting status");
 	await waitFor(() => FakeGateway.instances.length > beforeTerminalCount, "terminal gateway replacement");
+	await waitFor(() => rolloverA.statuses.at(-1)?.[1] === "💬" && rolloverB.statuses.at(-1)?.[1] === "💬", "compact reconnected statuses");
 	assert.equal(FakeGateway.activeConnections, 1);
 	assert.equal(FakeGateway.maximumActiveConnections, 1);
 	await rolloverB.emit("session_shutdown", { reason: "quit" });
 	assert.equal(FakeGateway.activeConnections, 1, "newest-config relay must survive its introducing client");
-	assert.ok(rolloverA.statuses.at(-1)?.[1]?.startsWith("Discord relay "));
+	assert.equal(rolloverA.statuses.at(-1)?.[1], "💬");
 	await rolloverA.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "rollover relay shutdown");
+	for (const harness of [first, second, failedInjection, retriedInjection, inactive, resumed, restarted, rolloverA, rolloverB]) {
+		for (const [key, text] of harness.statuses) {
+			assert.equal(key, "discord-bridge");
+			assert.ok(text === undefined || text === "💬" || text === "🔄" || text === "⚠️", `footer status must be compact: ${text}`);
+		}
+	}
 
 	console.log("[discord bridge test] passed");
 } finally {
