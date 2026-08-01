@@ -203,7 +203,7 @@ export class DiscordRelayCore {
 		this.drainingOutbound = true;
 		this.outboundDrainRequested = false;
 		try {
-			const blockedSessions = new Set<string>();
+			const blockedSessions = new Set(this.outboundRetryTimers.keys());
 			for (;;) {
 				const next = await this.state.nextOutbound(new Set(this.activeSessions.keys()), blockedSessions);
 				if (!next) return;

@@ -39,6 +39,7 @@ class FakeGateway {
 	static failSendAt = undefined;
 	static failOnceTexts = new Set();
 	static sendAttempts = new Map();
+	static sendAttemptTimes = new Map();
 	static deletedThreads = new Set();
 
 	connected = false;
@@ -98,6 +99,9 @@ class FakeGateway {
 
 	async sendText(channelId, text, nonce) {
 		FakeGateway.sendAttempts.set(text, (FakeGateway.sendAttempts.get(text) ?? 0) + 1);
+		const attemptTimes = FakeGateway.sendAttemptTimes.get(text) ?? [];
+		attemptTimes.push(Date.now());
+		FakeGateway.sendAttemptTimes.set(text, attemptTimes);
 		if (FakeGateway.failOnceTexts.delete(text)) throw new Error("injected transient Discord send failure");
 		if (FakeGateway.deletedThreads.has(channelId)) throw new Error("Unknown Channel");
 		const existing = FakeGateway.nonceResults.get(nonce);
@@ -428,10 +432,16 @@ try {
 	assert.equal(deletedGateway.sent.find((message) => message.text === "retarget me").channelId, repaired.threadId);
 	assert.equal((await deletedState.getSession("deleted-session")).outboundMessages.length, 0);
 	FakeGateway.failOnceTexts.add("retry without another event");
-	await deletedCore.queueOutbound("healthy-client", "healthy-generation", "healthy-session", "retry-outbound", "assistant", "retry without another event");
+	await deletedCore.queueOutbound("deleted-client", "deleted-generation-2", "deleted-session", "retry-outbound", "assistant", "retry without another event");
+	await waitFor(() => FakeGateway.sendAttempts.get("retry without another event") === 1, "initial transient outbound failure");
+	await deletedCore.queueOutbound("healthy-client", "healthy-generation", "healthy-session", "unrelated-outbound", "assistant", "unrelated healthy traffic");
+	await waitFor(() => deletedGateway.sent.some((message) => message.text === "unrelated healthy traffic"), "unrelated healthy outbound progress");
 	await waitFor(async () => deletedGateway.sent.some((message) => message.text === "retry without another event") &&
-		(await deletedState.getSession("healthy-session")).outboundMessages.length === 0, "automatic transient outbound retry");
+		(await deletedState.getSession("deleted-session")).outboundMessages.length === 0, "automatic transient outbound retry");
 	assert.equal(FakeGateway.sendAttempts.get("retry without another event"), 2);
+	const retryTimes = FakeGateway.sendAttemptTimes.get("retry without another event");
+	assert.ok(retryTimes[1] - retryTimes[0] >= 90, "unrelated traffic must not bypass the 100ms session retry backoff");
+	assert.equal(FakeGateway.sendAttempts.get("unrelated healthy traffic"), 1, "healthy sessions must continue progressing");
 	FakeGateway.deletedThreads.delete(deletedPrepared.threadId);
 	await deletedCore.stop();
 

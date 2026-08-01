@@ -94,7 +94,7 @@ Notes:
 
 ## Discord bridge
 
-The Discord extension connects automatically when configured. The first active Pi process becomes the local relay leader and owns the only Discord gateway connection; other Pi processes register their cwd and session over authenticated local IPC. The relay is bundled in the extension—there is no daemon or system service to install. Leadership fails over when the owner exits. It keeps one durable text channel per working directory and one durable thread per Pi session. Resuming a session reuses its thread and reopens it when archived; channels and threads are never deleted.
+The Discord extension connects automatically when configured. Extension clients race-safely spawn a bundled detached child process, which independently owns the only Discord gateway connection while Pi clients register their cwd and session over authenticated local IPC. No Pi process owns the gateway, and the child survives whichever Pi process launched or reconfigured it. There is no daemon or system service to install or manage; the child exits automatically after every Pi client disconnects. It keeps one durable text channel per working directory and one durable thread per Pi session. Resuming a session reuses its thread and reopens it when archived; channels and threads are never deleted.
 
 Bot setup:
 
