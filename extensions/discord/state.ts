@@ -28,6 +28,7 @@ export interface OutboundChunk {
 export interface OutboundMessage {
 	id: string;
 	kind: "user" | "assistant";
+	threadId: string;
 	chunks: OutboundChunk[];
 }
 
@@ -55,11 +56,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function parseOutboundMessages(value: unknown, file: string): OutboundMessage[] {
+function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: string): OutboundMessage[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) throw new Error(`Discord bridge state ${file} has an invalid outbound queue`);
 	return value.map((message) => {
-		if (!isRecord(message) || typeof message.id !== "string" || (message.kind !== "user" && message.kind !== "assistant") || !Array.isArray(message.chunks)) {
+		if (!isRecord(message) || typeof message.id !== "string" || (message.kind !== "user" && message.kind !== "assistant") ||
+			(message.threadId !== undefined && typeof message.threadId !== "string") || !Array.isArray(message.chunks)) {
 			throw new Error(`Discord bridge state ${file} has an invalid outbound message`);
 		}
 		const chunks = message.chunks.map((chunk) => {
@@ -74,7 +76,12 @@ function parseOutboundMessages(value: unknown, file: string): OutboundMessage[] 
 				...(typeof chunk.discordMessageId === "string" ? { discordMessageId: chunk.discordMessageId } : {}),
 			};
 		});
-		return { id: message.id, kind: message.kind, chunks };
+		return {
+			id: message.id,
+			kind: message.kind,
+			threadId: typeof message.threadId === "string" ? message.threadId : fallbackThreadId,
+			chunks,
+		};
 	});
 }
 
@@ -133,7 +140,7 @@ function parseState(value: unknown, file: string): DiscordBridgeState {
 			threadId: mapping.threadId,
 			threadCursors,
 			pendingMessages: parsePendingMessages(mapping.pendingMessages, file),
-			outboundMessages: parseOutboundMessages(mapping.outboundMessages, file),
+			outboundMessages: parseOutboundMessages(mapping.outboundMessages, file, mapping.threadId),
 		};
 	}
 
@@ -199,13 +206,15 @@ export class DiscordStateStore {
 			const existing = state.sessions[sessionId];
 			const sameParent = existing?.cwd === cwd && existing.channelId === channelId;
 			const threadId = await resolve(sameParent ? existing.threadId : undefined);
+			const outboundMessages = existing?.outboundMessages ?? [];
+			for (const message of outboundMessages) message.threadId = threadId;
 			const mapping: SessionThreadMapping = {
 				cwd,
 				channelId,
 				threadId,
 				threadCursors: existing?.threadCursors ?? {},
 				pendingMessages: existing?.pendingMessages ?? [],
-				outboundMessages: existing?.outboundMessages ?? [],
+				outboundMessages,
 			};
 			state.sessions[sessionId] = mapping;
 			return structuredClone(mapping);
@@ -277,9 +286,13 @@ export class DiscordStateStore {
 		});
 	}
 
-	async nextOutbound(): Promise<{ sessionId: string; mapping: SessionThreadMapping; message: OutboundMessage } | undefined> {
+	async nextOutbound(
+		eligibleSessionIds?: ReadonlySet<string>,
+		excludedSessionIds: ReadonlySet<string> = new Set(),
+	): Promise<{ sessionId: string; mapping: SessionThreadMapping; message: OutboundMessage } | undefined> {
 		const state = await this.load();
 		for (const [sessionId, mapping] of Object.entries(state.sessions)) {
+			if ((eligibleSessionIds && !eligibleSessionIds.has(sessionId)) || excludedSessionIds.has(sessionId)) continue;
 			const message = mapping.outboundMessages[0];
 			if (message) return { sessionId, mapping, message };
 		}

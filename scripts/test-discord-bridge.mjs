@@ -2,7 +2,8 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -36,6 +37,7 @@ class FakeGateway {
 	static catchUpByThread = new Map();
 	static nonceResults = new Map();
 	static failSendAt = undefined;
+	static deletedThreads = new Set();
 
 	connected = false;
 	listeners = new Set();
@@ -77,7 +79,8 @@ class FakeGateway {
 
 	async ensureSessionThread(request) {
 		this.threadRequests.push(request);
-		return request.mappedThreadId ?? `thread-${++this.threadCounter}-${request.name.slice(-8)}`;
+		if (request.mappedThreadId && !FakeGateway.deletedThreads.has(request.mappedThreadId)) return request.mappedThreadId;
+		return `thread-${++this.threadCounter}-${request.name.slice(-8)}`;
 	}
 
 	async fetchMessagesAfter(threadId, afterId) {
@@ -92,6 +95,7 @@ class FakeGateway {
 	}
 
 	async sendText(channelId, text, nonce) {
+		if (FakeGateway.deletedThreads.has(channelId)) throw new Error("Unknown Channel");
 		const existing = FakeGateway.nonceResults.get(nonce);
 		if (existing) return existing;
 		if (FakeGateway.failSendAt === this.sent.length) throw new Error("injected Discord send failure");
@@ -190,6 +194,7 @@ try {
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
+	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { tryAcquireLeader } = await importBuilt("extensions/discord/leader.js");
 	const { assistantText, projectChannelName, sessionThreadName, splitDiscordText } = await importBuilt("extensions/discord/text.js");
 	const { assertConfiguredCategory, collectChronologicalMessages, reuseSessionThread } = await importBuilt("extensions/discord/transport.js");
@@ -229,6 +234,11 @@ try {
 	const firstEpoch = (await loadDiscordConfig(epochConfig, {})).epoch;
 	await saveDiscordConfig({ token: "two", guildId: "12345" }, epochConfig);
 	assert.ok((await loadDiscordConfig(epochConfig, {})).epoch > firstEpoch, "serialized config writes must advance the relay epoch");
+	const environmentConfig = join(dataDir, "environment-config.json");
+	await writeFile(environmentConfig, JSON.stringify({ token: "file-token", guildId: "12345" }));
+	const environmentFirst = await loadDiscordConfig(environmentConfig, { DISCORD_TOKEN: "environment-one" });
+	const environmentSecond = await loadDiscordConfig(environmentConfig, { DISCORD_TOKEN: "environment-two" });
+	assert.ok(environmentSecond.epoch > environmentFirst.epoch, "environment-only effective config changes need an authoritative epoch");
 
 	assert.equal(projectChannelName("/one/My Project"), projectChannelName("/one/My Project"));
 	assert.notEqual(projectChannelName("/one/project"), projectChannelName("/two/project"));
@@ -246,6 +256,32 @@ try {
 	const chunks = splitDiscordText("a".repeat(4_100));
 	assert.equal(chunks.join(""), "a".repeat(4_100));
 	assert.ok(chunks.every((chunk) => chunk.length <= 1_900));
+
+	class SlowSocket extends EventEmitter {
+		destroyed = false;
+		writes = [];
+		writable = false;
+		write(data) {
+			this.writes.push(data);
+			return this.writable;
+		}
+	}
+	const slowSocket = new SlowSocket();
+	let capacitySignals = 0;
+	const boundedWriter = new BoundedSocketWriter(slowSocket, () => { capacitySignals++; });
+	assert.equal(boundedWriter.write("initial\n"), true);
+	for (let index = 0; index < MAX_QUEUED_IPC_FRAMES; index++) {
+		assert.equal(boundedWriter.write(`queued-${index}\n`), true);
+	}
+	assert.equal(boundedWriter.write("overflow\n"), false, "IPC writer must reject frames beyond its memory cap");
+	assert.equal(slowSocket.writes.length, 1, "IPC writer must stop producing while socket.write reports backpressure");
+	assert.equal(boundedWriter.queuedFrameCount(), MAX_QUEUED_IPC_FRAMES);
+	slowSocket.writable = true;
+	slowSocket.emit("drain");
+	assert.equal(slowSocket.writes.length, MAX_QUEUED_IPC_FRAMES + 1);
+	assert.equal(boundedWriter.queuedFrameCount(), 0);
+	assert.equal(capacitySignals, 1, "IPC delivery must resume only after drain");
+	boundedWriter.close();
 
 	const apiMessages = Array.from({ length: 250 }, (_, index) => ({
 		id: String(index + 1),
@@ -311,7 +347,14 @@ try {
 	]);
 	const winningLeases = contenders.filter(Boolean);
 	assert.equal(winningLeases.length, 1, "atomic leader contention must produce exactly one winner");
-	await winningLeases[0].release();
+	const liveLease = winningLeases[0];
+	assert.equal(await tryAcquireLeader(electionPaths, {
+		lookupProcessIdentity: async () => undefined,
+		probeRelay: async () => true,
+		wait: async () => {},
+	}), undefined, "failed process inspection must not steal a live relay lease");
+	assert.equal(await liveLease.heartbeat(), true, "inconclusive inspection must leave the prior owner unfenced");
+	await liveLease.release();
 	await writeFile(electionPaths.leaderLock, JSON.stringify({
 		pid: process.pid,
 		nonce: "stale-reused-pid",
@@ -322,6 +365,22 @@ try {
 	const recoveredLease = await tryAcquireLeader(electionPaths);
 	assert.ok(recoveredLease, "next contender must acquire after stale-owner recovery");
 	await recoveredLease.release();
+
+	const fencedPaths = relayPaths(join(dataDir, "fenced-election"));
+	const fencedLease = await tryAcquireLeader(fencedPaths);
+	assert.ok(fencedLease);
+	const expired = new Date(Date.now() - 10_000);
+	await utimes(fencedPaths.leaderLock, expired, expired);
+	let fenceWaitCompleted = false;
+	assert.equal(await tryAcquireLeader(fencedPaths, {
+		lookupProcessIdentity: async () => undefined,
+		probeRelay: async () => false,
+		wait: async () => { fenceWaitCompleted = true; },
+	}), undefined);
+	assert.equal(fenceWaitCompleted, true, "stale takeover must fence and settle the prior owner before acquisition");
+	const fencedSuccessor = await tryAcquireLeader(fencedPaths);
+	assert.ok(fencedSuccessor);
+	await fencedSuccessor.release();
 
 	const remapState = new DiscordStateStore(join(dataDir, "remap-state.json"));
 	await remapState.resolveProjectChannel("/old", async () => "old-channel");
@@ -337,6 +396,40 @@ try {
 	assert.deepEqual(remapped.pendingMessages, [{ id: "500", content: "preserve across remap" }]);
 	assert.equal(remapped.threadCursors["old-thread"], "500");
 	assert.equal(remapped.threadCursors["new-thread"], undefined);
+
+	const deletedStateFile = join(dataDir, "deleted-thread-state.json");
+	const deletedState = new DiscordStateStore(deletedStateFile);
+	const deletedGateway = new FakeGateway();
+	let deletedTerminalFailures = 0;
+	const deletedCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		deletedState,
+		deletedGateway,
+		() => { deletedTerminalFailures++; },
+	);
+	await deletedCore.start();
+	const deletedRegistration = { cwd: "/deleted", sessionId: "deleted-session", sessionName: "Deleted" };
+	const healthyRegistration = { cwd: "/healthy", sessionId: "healthy-session", sessionName: "Healthy" };
+	const deletedPrepared = await deletedCore.prepareRegistration("deleted-client", "deleted-generation-1", deletedRegistration);
+	await deletedCore.activateRegistration("deleted-client", "deleted-generation-1", "deleted-session", () => true);
+	await deletedCore.prepareRegistration("healthy-client", "healthy-generation", healthyRegistration);
+	await deletedCore.activateRegistration("healthy-client", "healthy-generation", "healthy-session", () => true);
+	FakeGateway.deletedThreads.add(deletedPrepared.threadId);
+	await deletedCore.queueOutbound("deleted-client", "deleted-generation-1", "deleted-session", "deleted-outbound", "assistant", "retarget me");
+	await deletedCore.queueOutbound("healthy-client", "healthy-generation", "healthy-session", "healthy-outbound", "assistant", "must progress");
+	await waitFor(() => deletedGateway.sent.some((message) => message.text === "must progress"), "other-session outbound progress past a deleted thread");
+	assert.equal(deletedTerminalFailures, 0, "deleted thread delivery must not restart the relay");
+	assert.ok((await deletedState.getSession("deleted-session")).outboundMessages.some((message) => message.id === "deleted-outbound"));
+	deletedCore.unregisterClient("deleted-client", "deleted-generation-1");
+	const repaired = await deletedCore.prepareRegistration("deleted-client", "deleted-generation-2", deletedRegistration);
+	assert.notEqual(repaired.threadId, deletedPrepared.threadId);
+	await deletedCore.activateRegistration("deleted-client", "deleted-generation-2", "deleted-session", () => true);
+	await waitFor(() => deletedGateway.sent.some((message) => message.text === "retarget me"), "remapped outbound delivery");
+	assert.equal(deletedGateway.sent.filter((message) => message.text === "retarget me").length, 1);
+	assert.equal(deletedGateway.sent.find((message) => message.text === "retarget me").channelId, repaired.threadId);
+	assert.equal((await deletedState.getSession("deleted-session")).outboundMessages.length, 0);
+	FakeGateway.deletedThreads.delete(deletedPrepared.threadId);
+	await deletedCore.stop();
 
 	const faultStateFile = join(dataDir, "fault-state.json");
 	const faultState = new DiscordStateStore(faultStateFile);
@@ -375,6 +468,8 @@ try {
 		retryGateway,
 	);
 	await retryCore.start();
+	await retryCore.prepareRegistration("retry-client", "retry-generation", faultRegistration);
+	await retryCore.activateRegistration("retry-client", "retry-generation", "fault-session", () => true);
 	await waitFor(async () => !(await new DiscordStateStore(faultStateFile).nextOutbound()), "durable outbound retry completion");
 	const sentChunks = [...faultGateway.sent, ...retryGateway.sent];
 	assert.equal(sentChunks.map((message) => message.text).join(""), longOutbound, "partial retries must send each chunk once");
@@ -401,6 +496,9 @@ try {
 		sessionName: "First session",
 	});
 	await first.emit("session_start", { reason: "startup" });
+	assert.equal(await tryAcquireLeader(paths, {
+		lookupProcessIdentity: async () => undefined,
+	}), undefined, "failed process inspection plus a healthy relay protocol must preserve the live owner");
 	const second = createExtensionHarness(extension, {
 		cwd: "/work/one",
 		sessionId: "session-22222222",
@@ -555,32 +653,31 @@ try {
 	assert.equal(FakeGateway.maximumActiveConnections, 1);
 
 	const rolloverDirectory = join(dataDir, "rollover-relay");
-	let liveConfig = { token: "token-v1", guildId: "12345", epoch: 1 };
 	const rolloverStateFile = join(rolloverDirectory, "state.json");
-	const rolloverExtension = createDiscordExtension({
+	const rolloverDependencies = (config) => ({
 		paths: relayPaths(rolloverDirectory),
-		loadConfig: async () => liveConfig,
+		loadConfig: async () => config,
 		saveConfig: async () => {},
 		createStateStore: () => new DiscordStateStore(rolloverStateFile),
 		createTransport: () => new FakeGateway(),
 	});
-	const rolloverA = createExtensionHarness(rolloverExtension, {
+	const rolloverA = createExtensionHarness(createDiscordExtension(rolloverDependencies(environmentFirst)), {
 		cwd: "/rollover",
 		sessionId: "rollover-a",
 		sessionName: "Rollover A",
 	});
 	await rolloverA.emit("session_start", { reason: "startup" });
 	const beforeRolloverCount = FakeGateway.instances.length;
-	liveConfig = { token: "token-v2", guildId: "12345", epoch: 2 };
-	const rolloverB = createExtensionHarness(rolloverExtension, {
+	const rolloverB = createExtensionHarness(createDiscordExtension(rolloverDependencies(environmentSecond)), {
 		cwd: "/rollover",
 		sessionId: "rollover-b",
 		sessionName: "Rollover B",
 	});
 	await rolloverB.emit("session_start", { reason: "startup" });
 	await waitFor(
-		() => FakeGateway.instances.length > beforeRolloverCount && FakeGateway.instances.at(-1).config?.token === "token-v2",
-		"atomic config epoch rollover",
+		() => FakeGateway.instances.length > beforeRolloverCount && FakeGateway.instances.at(-1).config?.token === "environment-two" &&
+			rolloverA.statuses.at(-1)?.[1]?.startsWith("Discord relay ") && rolloverB.statuses.at(-1)?.[1]?.startsWith("Discord relay "),
+		"atomic config epoch rollover with stale-client convergence",
 	);
 	assert.equal(FakeGateway.activeConnections, 1);
 	assert.equal(FakeGateway.maximumActiveConnections, 1);
@@ -591,6 +688,7 @@ try {
 	assert.equal(FakeGateway.maximumActiveConnections, 1);
 	await rolloverA.emit("session_shutdown", { reason: "quit" });
 	await rolloverB.emit("session_shutdown", { reason: "quit" });
+	await waitFor(() => FakeGateway.activeConnections === 0, "rollover relay shutdown");
 
 	console.log("[discord bridge test] passed");
 } finally {

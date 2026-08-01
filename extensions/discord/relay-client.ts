@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import type { DiscordBridgeConfig, RelayPaths } from "./config.js";
-import { loadOrCreateRelayToken } from "./config.js";
+import { loadOrCreateRelayToken, mayLeadRelayConfig, publishRelayConfigIntent } from "./config.js";
+import { BoundedSocketWriter } from "./ipc-writer.js";
 import type { LeaderLease } from "./leader.js";
 import { tryAcquireLeader } from "./leader.js";
 import { configFingerprint, encodeFrame, isServerFrame, MAX_IPC_FRAME_BYTES, parseFrame, type ClientFrame, type ServerFrame } from "./protocol.js";
@@ -75,6 +76,8 @@ export class LocalRelayClient {
 	private fingerprint: string;
 	private token: string | undefined;
 	private socket: Socket | undefined;
+	private connectingSocket: Socket | undefined;
+	private writer: BoundedSocketWriter | undefined;
 	private ownedHost: LocalRelayHost | undefined;
 	private connecting: Promise<void> | undefined;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -105,14 +108,22 @@ export class LocalRelayClient {
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 		this.reconnectTimer = undefined;
 		const socket = this.socket;
+		const connectingSocket = this.connectingSocket;
+		const writer = this.writer;
 		this.socket = undefined;
+		this.connectingSocket = undefined;
+		this.writer = undefined;
+		connectingSocket?.destroy();
 		if (socket && !socket.destroyed) {
 			const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
-			socket.write(encodeFrame({ type: "unregister" }));
+			writer?.write(encodeFrame({ type: "unregister" }));
 			socket.end();
 			await bounded(closed, SHUTDOWN_TIMEOUT_MS, "Timed out closing local Discord relay socket").catch(() => socket.destroy());
 		}
 		this.rejectPending(new Error("Local Discord relay client stopped"));
+		if (this.connecting) {
+			await bounded(this.connecting.catch(() => {}), SHUTDOWN_TIMEOUT_MS, "Timed out stopping local Discord relay connection").catch(() => {});
+		}
 		const host = this.ownedHost;
 		this.ownedHost = undefined;
 		try {
@@ -155,6 +166,7 @@ export class LocalRelayClient {
 					this.config = await this.dependencies.reloadConfig();
 					this.fingerprint = configFingerprint(this.config);
 				}
+				await publishRelayConfigIntent(this.dependencies.paths, this.config.epoch, this.fingerprint);
 				await this.connectOnce();
 				return;
 			} catch (error) {
@@ -162,12 +174,16 @@ export class LocalRelayClient {
 				if (lastError instanceof FatalRelayConnectionError) throw lastError;
 			}
 
-			if (!this.ownedHost) {
+			if (!this.ownedHost && await mayLeadRelayConfig(this.dependencies.paths, this.config.epoch, this.fingerprint)) {
 				const lease = await tryAcquireLeader(this.dependencies.paths);
 				if (lease) {
 					const host = this.dependencies.createHost(lease, this.token!, this.fingerprint, this.config);
 					try {
 						await host.start();
+						if (this.stopped) {
+							await host.stop();
+							throw new Error("Local Discord relay client stopped during host startup");
+						}
 						this.ownedHost = host;
 					} catch (error) {
 						lastError = asError(error);
@@ -186,6 +202,8 @@ export class LocalRelayClient {
 	private connectOnce(): Promise<void> {
 		return new Promise<void>((resolve, reject) => {
 			const socket = createConnection(this.dependencies.paths.socket);
+			this.connectingSocket = socket;
+			const writer = new BoundedSocketWriter(socket);
 			const generation = randomUUID();
 			socket.setEncoding("utf8");
 			let settled = false;
@@ -197,6 +215,8 @@ export class LocalRelayClient {
 					settled = true;
 					clearTimeout(timeout);
 					this.socket = socket;
+					if (this.connectingSocket === socket) this.connectingSocket = undefined;
+					this.writer = writer;
 					this.updateStatus(status);
 					resolve();
 				},
@@ -204,6 +224,8 @@ export class LocalRelayClient {
 					if (settled) return;
 					settled = true;
 					clearTimeout(timeout);
+					writer.close();
+					if (this.connectingSocket === socket) this.connectingSocket = undefined;
 					socket.destroy();
 					reject(error);
 				},
@@ -222,7 +244,9 @@ export class LocalRelayClient {
 					configEpoch: this.config.epoch,
 					...this.registration,
 				};
-				socket.write(encodeFrame(frame));
+				if (!writer.write(encodeFrame(frame))) {
+					waiter.reject(new Error("Local Discord relay request queue is full during registration"));
+				}
 			});
 			socket.on("data", (data: string) => {
 				buffer += data;
@@ -248,8 +272,10 @@ export class LocalRelayClient {
 					waiter.reject(new Error("Local Discord relay connection closed during registration"));
 					return;
 				}
+				writer.close();
 				if (this.socket !== socket) return;
 				this.socket = undefined;
+				this.writer = undefined;
 				this.updateStatus({ connected: false });
 				this.rejectPending(new Error("Local Discord relay connection closed"));
 				if (!this.stopped) {
@@ -318,6 +344,7 @@ export class LocalRelayClient {
 			} catch (error) {
 				if (this.stopped) throw error;
 				await this.ensureConnected();
+				await delay(CONNECT_RETRY_MIN_MS);
 			}
 		}
 	}
@@ -326,14 +353,19 @@ export class LocalRelayClient {
 		if (this.stopped) throw new Error("Local Discord relay client is stopped");
 		await this.ensureConnected();
 		const socket = this.socket;
-		if (!socket || socket.destroyed) throw new Error("Local Discord relay is disconnected");
+		const writer = this.writer;
+		if (!socket || socket.destroyed || !writer) throw new Error("Local Discord relay is disconnected");
 		await new Promise<void>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pendingRequests.delete(frame.requestId);
 				reject(new Error(`Local Discord relay request timed out after ${timeoutMs}ms`));
 			}, timeoutMs);
 			this.pendingRequests.set(frame.requestId, { resolve, reject, timer });
-			socket.write(encodeFrame(frame));
+			if (!writer.write(encodeFrame(frame))) {
+				clearTimeout(timer);
+				this.pendingRequests.delete(frame.requestId);
+				reject(new Error("Local Discord relay request queue is full"));
+			}
 		});
 	}
 

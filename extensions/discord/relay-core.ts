@@ -18,7 +18,7 @@ export interface PreparedRegistration {
 interface ActiveSession {
 	clientId: string;
 	generation: string;
-	deliver(message: QueuedDiscordMessage): void;
+	deliver(message: QueuedDiscordMessage): boolean;
 	deliveredIds: Set<string>;
 }
 
@@ -31,6 +31,7 @@ export class DiscordRelayCore {
 	private unsubscribeTerminal: (() => void) | undefined;
 	private inboundQueue: Promise<void> = Promise.resolve();
 	private drainingOutbound = false;
+	private outboundDrainRequested = false;
 	private started = false;
 
 	constructor(
@@ -51,7 +52,6 @@ export class DiscordRelayCore {
 			return this.inboundQueue;
 		});
 		this.started = true;
-		void this.drainOutbound().catch(this.onTerminalError);
 	}
 
 	async stop(): Promise<void> {
@@ -114,7 +114,7 @@ export class DiscordRelayCore {
 		clientId: string,
 		generation: string,
 		sessionId: string,
-		deliver: (message: QueuedDiscordMessage) => void,
+		deliver: (message: QueuedDiscordMessage) => boolean,
 	): Promise<void> {
 		const reserved = this.reservedSessions.get(sessionId);
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
@@ -127,7 +127,10 @@ export class DiscordRelayCore {
 		const sessions = this.clientSessions.get(clientId) ?? new Set<string>();
 		sessions.add(sessionId);
 		this.clientSessions.set(clientId, sessions);
-		for (const message of pending) this.deliverMessage(active, message);
+		for (const message of pending) {
+			if (!this.deliverMessage(active, message)) break;
+		}
+		void this.drainOutbound().catch(this.onTerminalError);
 	}
 
 	unregisterClient(clientId: string, generation: string): void {
@@ -139,6 +142,14 @@ export class DiscordRelayCore {
 			if (active?.clientId === clientId && active.generation === generation) this.activeSessions.delete(sessionId);
 		}
 		if (![...this.activeSessions.values()].some((active) => active.clientId === clientId)) this.clientSessions.delete(clientId);
+	}
+
+	async resumeDelivery(sessionId: string): Promise<void> {
+		const active = this.activeSessions.get(sessionId);
+		if (!active) return;
+		for (const message of await this.state.pendingMessages(sessionId)) {
+			if (!this.deliverMessage(active, message)) break;
+		}
 	}
 
 	async acknowledge(clientId: string, generation: string, sessionId: string, messageId: string): Promise<void> {
@@ -156,9 +167,12 @@ export class DiscordRelayCore {
 	): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
 		if (!text.trim()) return;
+		const mapping = await this.state.getSession(sessionId);
+		if (!mapping) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
 		const message: OutboundMessage = {
 			id: messageId,
 			kind,
+			threadId: mapping.threadId,
 			chunks: splitDiscordText(text).map((content, index) => ({
 				index,
 				content,
@@ -170,21 +184,39 @@ export class DiscordRelayCore {
 	}
 
 	private async drainOutbound(): Promise<void> {
-		if (this.drainingOutbound || !this.started) return;
+		if (!this.started) return;
+		if (this.drainingOutbound) {
+			this.outboundDrainRequested = true;
+			return;
+		}
 		this.drainingOutbound = true;
+		this.outboundDrainRequested = false;
 		try {
+			const blockedSessions = new Set<string>();
 			for (;;) {
-				const next = await this.state.nextOutbound();
+				const next = await this.state.nextOutbound(new Set(this.activeSessions.keys()), blockedSessions);
 				if (!next) return;
+				let deliveryFailed = false;
 				for (const chunk of next.message.chunks) {
 					if (chunk.discordMessageId) continue;
-					const discordMessageId = await this.transport.sendText(next.mapping.threadId, chunk.content, chunk.nonce);
+					let discordMessageId: string;
+					try {
+						discordMessageId = await this.transport.sendText(next.message.threadId, chunk.content, chunk.nonce);
+					} catch {
+						blockedSessions.add(next.sessionId);
+						deliveryFailed = true;
+						break;
+					}
 					await this.state.markOutboundChunkSent(next.sessionId, next.message.id, chunk.index, discordMessageId);
 				}
-				await this.state.completeOutbound(next.sessionId, next.message.id);
+				if (!deliveryFailed) await this.state.completeOutbound(next.sessionId, next.message.id);
 			}
 		} finally {
 			this.drainingOutbound = false;
+			if (this.outboundDrainRequested && this.started) {
+				this.outboundDrainRequested = false;
+				void this.drainOutbound().catch(this.onTerminalError);
+			}
 		}
 	}
 
@@ -211,10 +243,11 @@ export class DiscordRelayCore {
 		if (active) this.deliverMessage(active, result.message);
 	}
 
-	private deliverMessage(active: ActiveSession, message: QueuedDiscordMessage): void {
-		if (active.deliveredIds.has(message.id)) return;
+	private deliverMessage(active: ActiveSession, message: QueuedDiscordMessage): boolean {
+		if (active.deliveredIds.has(message.id)) return true;
+		if (!active.deliver(message)) return false;
 		active.deliveredIds.add(message.id);
-		active.deliver(message);
+		return true;
 	}
 
 	private assertClientSession(clientId: string, generation: string, sessionId: string): void {

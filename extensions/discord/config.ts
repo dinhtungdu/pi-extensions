@@ -1,7 +1,7 @@
 import { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 export interface DiscordBridgeConfig {
 	token: string;
@@ -14,12 +14,17 @@ export const DISCORD_BRIDGE_DIR = join(homedir(), ".pi", "agent", "discord-bridg
 export const DISCORD_CONFIG_FILE = join(DISCORD_BRIDGE_DIR, "config.json");
 export const DISCORD_STATE_FILE = join(DISCORD_BRIDGE_DIR, "state.json");
 
+const CONFIG_SOURCE_ID = randomUUID();
+const CONFIG_AUTHORITY_VERSION = 1;
+const MAX_CONFIG_SOURCES = 256;
+
 export interface RelayPaths {
 	directory: string;
 	socket: string;
 	leaderLock: string;
 	recoveryLock: string;
 	authToken: string;
+	configIntent: string;
 }
 
 export function relayPaths(directory = DISCORD_BRIDGE_DIR): RelayPaths {
@@ -31,6 +36,7 @@ export function relayPaths(directory = DISCORD_BRIDGE_DIR): RelayPaths {
 		leaderLock: join(directory, "relay-owner.json"),
 		recoveryLock: join(directory, "relay-recovery.lock"),
 		authToken: join(directory, "relay-token"),
+		configIntent: join(directory, "relay-config-intent.json"),
 	};
 }
 
@@ -67,6 +73,123 @@ export async function loadOrCreateRelayToken(paths: RelayPaths): Promise<string>
 		await wait(25);
 	}
 	throw new Error(`Local Discord relay token ${paths.authToken} is invalid`);
+}
+
+interface ConfigAuthorityState {
+	version: 1;
+	currentFingerprint: string;
+	currentEpoch: number;
+	sources: Record<string, { fingerprint: string; epoch: number; updatedAt: number }>;
+}
+
+async function withExclusiveLock<T>(lockFile: string, operation: () => Promise<T>): Promise<T> {
+	let lock;
+	for (let attempt = 0; !lock && attempt < 200; attempt++) {
+		try {
+			lock = await open(lockFile, "wx", 0o600);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const lockStat = await stat(lockFile).catch(() => undefined);
+			if (lockStat && Date.now() - lockStat.mtimeMs > 30_000) await unlink(lockFile).catch(() => {});
+			await wait(25);
+		}
+	}
+	if (!lock) throw new Error(`Timed out waiting for Discord bridge lock ${lockFile}`);
+	try {
+		return await operation();
+	} finally {
+		await lock.close();
+		await unlink(lockFile).catch(() => {});
+	}
+}
+
+function effectiveFingerprint(config: Omit<DiscordBridgeConfig, "epoch">): string {
+	return createHash("sha256")
+		.update(`${config.token}\0${config.guildId}\0${config.categoryId ?? ""}`)
+		.digest("hex");
+}
+
+async function authoritativeEpoch(
+	file: string,
+	config: Omit<DiscordBridgeConfig, "epoch">,
+	seedEpoch: number,
+): Promise<number> {
+	await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+	const authorityFile = `${file}.authority.json`;
+	return withExclusiveLock(`${authorityFile}.lock`, async () => {
+		let authority: ConfigAuthorityState | undefined;
+		try {
+			const candidate = JSON.parse(await readFile(authorityFile, "utf8")) as Partial<ConfigAuthorityState>;
+			if (candidate.version === CONFIG_AUTHORITY_VERSION && typeof candidate.currentFingerprint === "string" &&
+				Number.isSafeInteger(candidate.currentEpoch) && candidate.currentEpoch! >= 0 && candidate.sources && typeof candidate.sources === "object") {
+				authority = candidate as ConfigAuthorityState;
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		const fingerprint = effectiveFingerprint(config);
+		const previous = authority?.sources[CONFIG_SOURCE_ID];
+		let epoch = previous?.epoch;
+		if (!authority) {
+			epoch = Math.max(0, seedEpoch);
+			authority = { version: CONFIG_AUTHORITY_VERSION, currentFingerprint: fingerprint, currentEpoch: epoch, sources: {} };
+		} else if (authority.currentFingerprint === fingerprint) {
+			epoch = authority.currentEpoch;
+		} else if (!previous || previous.fingerprint !== fingerprint) {
+			epoch = Math.max(authority.currentEpoch + 1, seedEpoch);
+			authority.currentEpoch = epoch;
+			authority.currentFingerprint = fingerprint;
+		}
+		epoch ??= authority.currentEpoch;
+		authority.sources[CONFIG_SOURCE_ID] = { fingerprint, epoch, updatedAt: Date.now() };
+		const sources = Object.entries(authority.sources)
+			.sort((left, right) => right[1].updatedAt - left[1].updatedAt)
+			.slice(0, MAX_CONFIG_SOURCES);
+		authority.sources = Object.fromEntries(sources);
+		const temporary = `${authorityFile}.${process.pid}.${randomUUID()}.tmp`;
+		await writeFile(temporary, `${JSON.stringify(authority)}\n`, { mode: 0o600 });
+		await rename(temporary, authorityFile);
+		return epoch;
+	});
+}
+
+export async function publishRelayConfigIntent(
+	paths: RelayPaths,
+	epoch: number,
+	fingerprint: string,
+): Promise<void> {
+	await mkdir(paths.directory, { recursive: true, mode: 0o700 });
+	await withExclusiveLock(`${paths.configIntent}.lock`, async () => {
+		let current: { epoch: number; fingerprint: string } | undefined;
+		try {
+			const parsed = JSON.parse(await readFile(paths.configIntent, "utf8")) as { epoch?: unknown; fingerprint?: unknown };
+			if (Number.isSafeInteger(parsed.epoch) && typeof parsed.fingerprint === "string") {
+				current = { epoch: Number(parsed.epoch), fingerprint: parsed.fingerprint };
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (current && (current.epoch > epoch || (current.epoch === epoch && current.fingerprint === fingerprint))) return;
+		if (current?.epoch === epoch && current.fingerprint !== fingerprint) {
+			throw new Error(`Discord relay configuration epoch ${epoch} has conflicting fingerprints`);
+		}
+		const temporary = `${paths.configIntent}.${process.pid}.${randomUUID()}.tmp`;
+		await writeFile(temporary, `${JSON.stringify({ epoch, fingerprint })}\n`, { mode: 0o600 });
+		await rename(temporary, paths.configIntent);
+	});
+}
+
+export async function mayLeadRelayConfig(paths: RelayPaths, epoch: number, fingerprint: string): Promise<boolean> {
+	try {
+		const intent = JSON.parse(await readFile(paths.configIntent, "utf8")) as { epoch?: unknown; fingerprint?: unknown };
+		if (!Number.isSafeInteger(intent.epoch) || typeof intent.fingerprint !== "string") {
+			throw new Error(`Discord relay configuration intent ${paths.configIntent} is invalid`);
+		}
+		return Number(intent.epoch) < epoch || (intent.epoch === epoch && intent.fingerprint === fingerprint);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+		throw error;
+	}
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -129,7 +252,9 @@ export async function loadDiscordConfig(
 
 	if (!token && !guildId && !categoryId) return null;
 	const configuredEpoch = Number.isSafeInteger(fromFile.epoch) ? Number(fromFile.epoch) : 0;
-	return parseDiscordConfig({ token, guildId, categoryId, epoch: Math.max(configuredEpoch, fileEpoch) });
+	const effective = parseDiscordConfig({ token, guildId, categoryId, epoch: 0 });
+	const epoch = await authoritativeEpoch(file, effective, Math.max(configuredEpoch, fileEpoch));
+	return { ...effective, epoch };
 }
 
 export async function saveDiscordConfig(config: Omit<DiscordBridgeConfig, "epoch"> | DiscordBridgeConfig, file = DISCORD_CONFIG_FILE): Promise<void> {
