@@ -145,6 +145,9 @@ class FakeGateway {
 	}
 
 	async sendText(channelId, text, nonce) {
+		if (typeof nonce !== "string" || !nonce || nonce.length > 25) {
+			throw new Error("Discord API error 50035: NONCE_TYPE_TOO_LONG");
+		}
 		FakeGateway.sendAttempts.set(text, (FakeGateway.sendAttempts.get(text) ?? 0) + 1);
 		const attemptTimes = FakeGateway.sendAttemptTimes.get(text) ?? [];
 		attemptTimes.push(Date.now());
@@ -255,7 +258,7 @@ try {
 		saveDiscordConfig,
 	} = await importBuilt("extensions/discord/config.js");
 	const { PACKAGE_FOOTER_STATUS_KEYS } = await importBuilt("extensions/footer-status.js");
-	const { DiscordStateStore } = await importBuilt("extensions/discord/state.js");
+	const { DiscordStateStore, MAX_DISCORD_NONCE_LENGTH } = await importBuilt("extensions/discord/state.js");
 	const { LocalRelayClient } = await importBuilt("extensions/discord/relay-client.js");
 	const { resolveProjectContext, resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
 	const { discoverTaskTitle, parseTaskTitle } = await importBuilt("extensions/discord/task-title.js");
@@ -595,10 +598,22 @@ try {
 		sessionId: "summary-session",
 	});
 	await summaryCore.activateRegistration("summary-client", "summary-generation", "summary-session", () => true);
+	await summaryState.setProjectSummaryDesired("summary-session", "summary one");
+	const initialPendingSummary = await summaryState.prepareProjectSummarySend("/the-manager");
+	const overlongSummaryState = JSON.parse(await readFile(summaryStateFile, "utf8"));
+	overlongSummaryState.projects["/the-manager"].summary.pendingSend.nonce = "x".repeat(36);
+	await writeFile(summaryStateFile, `${JSON.stringify(overlongSummaryState)}\n`);
+	const repairedPendingSummary = await summaryState.prepareProjectSummarySend("/the-manager");
+	assert.ok(repairedPendingSummary.nonce.length <= MAX_DISCORD_NONCE_LENGTH, "persisted summary nonce must fit Discord's limit");
+	assert.notEqual(repairedPendingSummary.nonce, initialPendingSummary.nonce, "an overlong legacy nonce must be replaced before retry");
+	assert.equal((await summaryState.prepareProjectSummarySend("/the-manager")).nonce, repairedPendingSummary.nonce,
+		"a repaired nonce must remain durable for idempotent retries");
 	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary one");
 	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary one", "initial parent-channel summary");
 	const initialSummaryId = FakeGateway.channelMessages.get("summary-channel").at(-1).id;
 	assert.equal(summaryGateway.sent.at(-1).channelId, "summary-channel", "summary must target the mapped project parent channel");
+	assert.ok(summaryGateway.sent.every((message) => message.nonce.length <= MAX_DISCORD_NONCE_LENGTH),
+		"the fake gateway must enforce Discord's nonce-length contract");
 
 	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary two");
 	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary two", "latest summary edit");

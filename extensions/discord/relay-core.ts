@@ -306,8 +306,10 @@ export class DiscordRelayCore {
 			if (!project) return;
 			const { mapping, summary } = project;
 			if (summary.pendingSend) {
-				const messageId = await this.transport.sendText(mapping.channelId, summary.pendingSend.content, summary.pendingSend.nonce);
-				await this.state.recordProjectSummarySent(cwd, summary.pendingSend.nonce, messageId);
+				const pending = await this.state.prepareProjectSummarySend(cwd);
+				if (!pending) continue;
+				const messageId = await this.transport.sendText(mapping.channelId, pending.content, pending.nonce);
+				await this.state.recordProjectSummarySent(cwd, pending.nonce, messageId);
 				continue;
 			}
 			if (!summary.delivery) {

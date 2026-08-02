@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { DISCORD_STATE_FILE } from "./config.js";
@@ -11,6 +11,16 @@ const MAX_LIFECYCLE_MESSAGES_PER_SESSION = 2_000;
 const LOCK_STALE_MS = 120_000;
 const LOCK_RETRIES = 600;
 const LOCK_RETRY_MS = 50;
+export const MAX_DISCORD_NONCE_LENGTH = 25;
+
+function projectSummaryNonce(): string {
+	// 144 random bits, encoded without padding, stay below Discord's 25-character limit.
+	return randomBytes(18).toString("base64url");
+}
+
+function isValidDiscordNonce(nonce: string): boolean {
+	return nonce.length > 0 && nonce.length <= MAX_DISCORD_NONCE_LENGTH;
+}
 
 export interface ProjectSummaryState {
 	desiredText: string;
@@ -341,7 +351,11 @@ export class DiscordStateStore {
 		return this.mutate(async (state) => {
 			const summary = state.projects[cwd]?.summary;
 			if (!summary || summary.delivery) return undefined;
-			if (!summary.pendingSend) summary.pendingSend = { nonce: randomUUID(), content: summary.desiredText };
+			if (!summary.pendingSend) summary.pendingSend = { nonce: projectSummaryNonce(), content: summary.desiredText };
+			else if (!isValidDiscordNonce(summary.pendingSend.nonce)) {
+				// Previous versions persisted UUID nonces that Discord rejected as too long.
+				summary.pendingSend.nonce = projectSummaryNonce();
+			}
 			return structuredClone(summary.pendingSend);
 		});
 	}
