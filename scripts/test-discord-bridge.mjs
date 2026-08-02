@@ -560,13 +560,15 @@ try {
 	}], "completed"), [], "ask targets must include only current active manager tasks");
 	const managerDefinition = managerCommandDefinition();
 	assert.equal(managerDefinition.name, "manager");
-	assert.deepEqual(managerDefinition.options.map((option) => option.name), ["handoff", "takeback", "archive", "merge-and-archive", "ask"]);
-	for (const option of managerDefinition.options.slice(0, 4)) {
+	assert.deepEqual(managerDefinition.options.map((option) => option.name), [
+		"handoff", "takeback", "archive", "merge-and-archive", "reconcile-pr", "ask",
+	]);
+	for (const option of managerDefinition.options.slice(0, 5)) {
 		assert.deepEqual(option.options.map(({ name, required, autocomplete }) => ({ name, required, autocomplete })), [
 			{ name: "task", required: true, autocomplete: true },
 		], `${option.name} must retain exactly one required dynamic task option`);
 	}
-	assert.deepEqual(managerDefinition.options[4].options.map(({ name, required, autocomplete, maxLength }) => ({
+	assert.deepEqual(managerDefinition.options[5].options.map(({ name, required, autocomplete, maxLength }) => ({
 		name, required, autocomplete, maxLength,
 	})), [{ name: "target", required: true, autocomplete: true, maxLength: undefined }, {
 		name: "request", required: true, autocomplete: undefined, maxLength: 2_000,
@@ -616,6 +618,25 @@ try {
 	});
 	assert.equal(managerInteractionReplies[0].content, "✅ settled");
 	await timerTransport.executeManagerControlInteraction({
+		id: "reconcile-manager-control",
+		channelId: "timer-manager-thread",
+		async deferReply() {},
+		options: {
+			getSubcommand: () => "reconcile-pr",
+			getString: (name, required) => {
+				assert.deepEqual([name, required], ["task", true]);
+				return "timer-task";
+			},
+		},
+		async editReply(reply) { managerInteractionReplies.push(reply); },
+	});
+	assert.deepEqual(timerRequest, {
+		requestId: "reconcile-manager-control",
+		channelId: "timer-manager-thread",
+		action: "reconcile-pr",
+		taskId: "timer-task",
+	}, "Discord reconcile-pr interactions must retain dynamic task selection");
+	await timerTransport.executeManagerControlInteraction({
 		id: "ask-manager-control",
 		channelId: "timer-manager-thread",
 		async deferReply() {},
@@ -632,7 +653,7 @@ try {
 		target: "project:pi-extensions",
 		request: "Inspect it",
 	}, "Discord ask interactions must route both required options without task coercion");
-	assert.equal(managerInteractionReplies[1].content, "✅ settled");
+	assert.equal(managerInteractionReplies[2].content, "✅ settled");
 
 	let managerStatus = {
 		...focusedManagerStatus,
@@ -728,6 +749,7 @@ try {
 	};
 	const managerProcessCalls = [];
 	let managerProcessFailure;
+	let reconcileOutput = { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "not-found", archived: false };
 	const managerRun = async (executable, args, options) => {
 		managerProcessCalls.push({ executable, args, options });
 		if (args.at(-1) === "validate") return { code: 0, stdout: '{"valid":true}\n', stderr: "" };
@@ -735,6 +757,7 @@ try {
 		if (managerProcessFailure) return managerProcessFailure;
 		const command = args[1];
 		const taskId = args[args.indexOf("--task") + 1].split("/").at(-1).replace(/\.md$/, "");
+		if (command === "task-reconcile-pr") return { code: 0, stdout: `${JSON.stringify(reconcileOutput)}\n`, stderr: "" };
 		const output = command === "handoff-start"
 			? { ok: true, command, task_id: taskId, state: "direct", worker_session: "mgr-worker", replay: false }
 			: command === "handoff-return"
@@ -776,13 +799,47 @@ try {
 	for (const action of ["handoff", "takeback", "archive", "merge-and-archive"]) {
 		assert.equal((await managerExecutor.execute({ requestId: `executor-${action}`, action, taskId: "safe-task" }, executorCatalogue)).ok, true);
 	}
+	const reconcileCases = [{
+		output: reconcileOutput,
+		message: "No pull request found for @safe-task.",
+	}, {
+		output: { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "open", archived: false,
+			url: "https://github.com/acme/repo/pull/12", number: 12 },
+		message: "PR #12 is open: https://github.com/acme/repo/pull/12",
+	}, {
+		output: { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "closed", archived: false,
+			url: "https://github.com/acme/repo/pull/12", number: 12 },
+		message: "PR #12 is closed: https://github.com/acme/repo/pull/12",
+	}, {
+		output: { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "merged", archived: true,
+			url: "https://github.com/acme/repo/pull/12", number: 12, merged_at: "2026-08-02T14:00:00Z",
+			merge_commit: "a".repeat(40), checkout_mode: "repository", slot_state: null, replay: false },
+		message: "PR #12 merged; @safe-task archived without local merge.",
+	}];
+	for (const [index, reconcileCase] of reconcileCases.entries()) {
+		reconcileOutput = reconcileCase.output;
+		assert.deepEqual(await managerExecutor.execute({
+			requestId: `executor-reconcile-${index}`, action: "reconcile-pr", taskId: "safe-task",
+		}, executorCatalogue), { ok: true, message: reconcileCase.message });
+	}
+	reconcileOutput = {
+		ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "merged", archived: true,
+		url: "https://github.com/acme/repo/pull/12", number: 12, merged_at: "2026-08-02T14:00:00Z", merge_commit: "a".repeat(40),
+	};
+	assert.equal((await managerExecutor.execute({
+		requestId: "executor-reconcile-optional-cleanup", action: "reconcile-pr", taskId: "safe-task",
+	}, executorCatalogue)).ok, true, "documented optional merged cleanup fields may be absent");
 	const managerActionCalls = managerProcessCalls.filter((call) => call.args.at(-1) !== "validate");
 	assert.deepEqual(managerActionCalls.map((call) => call.args[1]), [
 		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive",
+		"task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr",
 	], "Discord controls must route only through canonical manager CLI composites");
 	assert.ok(managerActionCalls[2].args.includes("--completion-authorized"), "archive must carry explicit non-merge completion authorization");
 	assert.equal(managerActionCalls[3].args.includes("--completion-authorized"), false,
 		"merge-and-archive must use only its dedicated canonical composite");
+	assert.deepEqual(managerActionCalls[4].args, [join(managerExecutorRoot, "bin", "manager.mjs"), "task-reconcile-pr",
+		"--root", managerExecutorRoot, "--task", join(managerExecutorRoot, "data", "tasks", "safe-task.md")],
+	"reconcile-pr must delegate only to the canonical manager composite without bridge policy arguments");
 	assert.equal(managerActionCalls.every((call) => call.executable === process.execPath && call.options.cwd === managerExecutorRoot), true);
 	assert.equal(managerActionCalls.every((call) => call.args.includes(join(managerExecutorRoot, "data", "tasks", "safe-task.md"))), true,
 		"task selection must resolve only to the canonical active task path");
@@ -928,8 +985,9 @@ try {
 	canonicalExecutorStatus = validCanonicalExecutorStatus;
 	assert.equal(deliveredAskRequests.length, deliveredBeforeCanonicalAdversaries,
 		"canonical stale/removed target refusals must never call deliverAsk");
-	assert.equal(managerProcessCalls.filter((call) => ["handoff-start", "handoff-return", "task-archive", "task-merge-and-archive"].includes(call.args[1])).length, 4,
-		"ask must not invoke or mutate manager lifecycle state");
+	assert.equal(managerProcessCalls.filter((call) => [
+		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive", "task-reconcile-pr",
+	].includes(call.args[1])).length, 9, "ask must not invoke or mutate manager lifecycle state");
 	const callsBeforeStale = managerProcessCalls.length;
 	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-stale", action: "archive", taskId: "missing-task" }, executorCatalogue), {
 		ok: false,
@@ -951,6 +1009,37 @@ try {
 		ok: false,
 		message: "canonical manager safety refusal",
 	}, "canonical manager CLI safety refusals must be preserved and never inferred as success");
+	managerProcessFailure = undefined;
+	const validMergedReconcileOutput = reconcileCases[3].output;
+	const conflictingReconcileOutputs = [
+		{ ...reconcileCases[0].output, ok: false },
+		{ ...reconcileCases[0].output, command: "task-archive" },
+		{ ...reconcileCases[0].output, task_id: "other-task" },
+		{ ...reconcileCases[0].output, state: "unknown" },
+		{ ...reconcileCases[0].output, archived: true },
+		{ ...reconcileCases[0].output, url: "https://github.com/acme/repo/pull/12" },
+		{ ...reconcileCases[1].output, number: 0 },
+		{ ...reconcileCases[1].output, merged_at: "2026-08-02T14:00:00Z" },
+		{ ...reconcileCases[2].output, archived: true },
+		{ ...validMergedReconcileOutput, merged_at: "not-a-time" },
+		{ ...validMergedReconcileOutput, merge_commit: "bad" },
+		{ ...validMergedReconcileOutput, replay: "false" },
+		{ ...validMergedReconcileOutput, checkout_mode: 42 },
+		{ ...validMergedReconcileOutput, unexpected: true },
+	];
+	for (const [index, output] of conflictingReconcileOutputs.entries()) {
+		reconcileOutput = output;
+		assert.deepEqual(await managerExecutor.execute({
+			requestId: `executor-reconcile-conflict-${index}`, action: "reconcile-pr", taskId: "safe-task",
+		}, executorCatalogue), { ok: false, message: "reconcile-pr returned conflicting manager output." },
+		`reconcile-pr success schema adversary ${index} must fail closed`);
+	}
+	managerProcessFailure = { code: 4, stdout: "", stderr: "GitHub authorization required" };
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "executor-reconcile-refused", action: "reconcile-pr", taskId: "safe-task",
+	}, executorCatalogue), { ok: false, message: "GitHub authorization required" },
+	"reconcile-pr must surface canonical external-gate failures without querying GitHub itself");
+	managerProcessFailure = undefined;
 
 	const epochConfig = join(dataDir, "epoch-config.json");
 	await saveDiscordConfig({ token: "one", guildId: "12345" }, epochConfig);
@@ -1270,6 +1359,15 @@ try {
 	]), [{ ok: true, message: "handoff safe-task" }, { ok: true, message: "handoff safe-task" }]);
 	assert.equal(executedManagerControls.length, 1, "Discord retries must execute each manager mutation once");
 	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "relay-reconcile-pr",
+		channelId: managerControlPrepared.threadId,
+		action: "reconcile-pr",
+		taskId: "safe-task",
+	}), { ok: true, message: "reconcile-pr safe-task" }, "relay must route reconcile-pr through current task authorization");
+	assert.deepEqual(executedManagerControls.at(-1), {
+		requestId: "relay-reconcile-pr", action: "reconcile-pr", taskId: "safe-task",
+	});
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
 		requestId: "relay-ask-task",
 		channelId: managerControlPrepared.threadId,
 		action: "ask",
@@ -1560,7 +1658,7 @@ try {
 	assert.equal(isServerFrame({ type: "inbound_images_released", requestId: "release-1", messageId: "message-1" }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "high" } }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "turbo" } }), false);
-	for (const action of ["handoff", "takeback", "archive", "merge-and-archive"]) {
+	for (const action of ["handoff", "takeback", "archive", "merge-and-archive", "reconcile-pr"]) {
 		assert.equal(isServerFrame({ type: "manager_control", requestId: `manager-${action}`, action, taskId: "safe-task" }), true);
 	}
 	assert.equal(isServerFrame({

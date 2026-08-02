@@ -71,6 +71,37 @@ function failureMessage(result: ManagerProcessResult, fallback: string): string 
 	return (result.stderr.trim() || fallback).slice(0, 2_000);
 }
 
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	const actual = Object.keys(value);
+	return actual.length === keys.length && actual.every((key) => keys.includes(key));
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	return Object.keys(value).every((key) => keys.includes(key));
+}
+
+function isPullRequestNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isReconcilePullRequestSuccess(output: Record<string, unknown>, taskId: string): boolean {
+	if (output.ok !== true || output.command !== "task-reconcile-pr" || output.task_id !== taskId) return false;
+	const baseKeys = ["ok", "command", "task_id", "state", "archived"] as const;
+	if (output.state === "not-found") return output.archived === false && hasExactKeys(output, baseKeys);
+	if (output.state === "open" || output.state === "closed") {
+		return output.archived === false && typeof output.url === "string" && output.url.length > 0 &&
+			isPullRequestNumber(output.number) && hasExactKeys(output, [...baseKeys, "url", "number"]);
+	}
+	if (output.state !== "merged" || output.archived !== true) return false;
+	return typeof output.url === "string" && output.url.length > 0 && isPullRequestNumber(output.number) &&
+		typeof output.merged_at === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(output.merged_at) &&
+		typeof output.merge_commit === "string" && /^[a-f0-9]{40,64}$/i.test(output.merge_commit) &&
+		(output.checkout_mode === undefined || typeof output.checkout_mode === "string" && output.checkout_mode.length > 0) &&
+		(output.slot_state === undefined || output.slot_state === null || typeof output.slot_state === "string") &&
+		(output.replay === undefined || typeof output.replay === "boolean") &&
+		hasOnlyKeys(output, [...baseKeys, "url", "number", "merged_at", "merge_commit", "checkout_mode", "slot_state", "replay"]);
+}
+
 function isProtectedManagerEnvironment(environment: NodeJS.ProcessEnv): boolean {
 	return environment.HERDR_ENV === "1" && environment.THE_MANAGER_ROLE !== "worker" &&
 		typeof environment.HERDR_WORKSPACE_ID === "string" && HERDR_LOCATOR.test(environment.HERDR_WORKSPACE_ID) &&
@@ -121,11 +152,22 @@ export class ManagerControlExecutor {
 				: request.action === "merge-and-archive"
 					? [manager, "task-merge-and-archive", "--root", this.root, "--task", taskPath, "--activity-clear", "yes",
 						"--evidence", `User explicitly merged ${task.project} task ${task.taskId} locally and archived it via Discord manager command.`]
-					: [manager, request.action === "handoff" ? "handoff-start" : "handoff-return",
-						"--root", this.root, "--task", taskPath];
+					: request.action === "reconcile-pr"
+						? [manager, "task-reconcile-pr", "--root", this.root, "--task", taskPath]
+						: [manager, request.action === "handoff" ? "handoff-start" : "handoff-return",
+							"--root", this.root, "--task", taskPath];
 			const result = await this.run(process.execPath, args, { cwd: this.root, timeout: CONTROL_TIMEOUT_MS });
 			if (result.code !== 0) return boundedControlResult({ ok: false, message: failureMessage(result, `${request.action} failed with exit ${result.code}.`) });
 			const output = parseJson(result.stdout, request.action);
+			if (request.action === "reconcile-pr") {
+				if (!isReconcilePullRequestSuccess(output, task.taskId)) {
+					return { ok: false, message: "reconcile-pr returned conflicting manager output." };
+				}
+				const message = output.state === "merged" ? `PR #${output.number} merged; @${task.taskId} archived without local merge.`
+					: output.state === "not-found" ? `No pull request found for @${task.taskId}.`
+						: `PR #${output.number} is ${output.state}: ${output.url}`;
+				return { ok: true, message };
+			}
 			const expectedCommand = request.action === "handoff" ? "handoff-start"
 				: request.action === "takeback" ? "handoff-return"
 					: request.action === "archive" ? "task-archive" : "task-merge-and-archive";

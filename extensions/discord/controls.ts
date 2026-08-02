@@ -55,8 +55,10 @@ export interface DiscordModelChoice {
 }
 
 export const MANAGER_LIFECYCLE_ACTIONS = ["handoff", "takeback", "archive", "merge-and-archive"] as const;
-export const MANAGER_CONTROL_ACTIONS = [...MANAGER_LIFECYCLE_ACTIONS, "ask"] as const;
+export const MANAGER_TASK_ACTIONS = [...MANAGER_LIFECYCLE_ACTIONS, "reconcile-pr"] as const;
+export const MANAGER_CONTROL_ACTIONS = [...MANAGER_TASK_ACTIONS, "ask"] as const;
 export type ManagerLifecycleAction = typeof MANAGER_LIFECYCLE_ACTIONS[number];
+export type ManagerTaskAction = typeof MANAGER_TASK_ACTIONS[number];
 export type ManagerControlAction = typeof MANAGER_CONTROL_ACTIONS[number];
 const MANAGER_ACTIVE_TASK_STATUSES = new Set(["planning", "active", "needs-input", "ready"]);
 
@@ -72,7 +74,7 @@ export interface ManagerProjectCatalogueEntry {
 }
 
 export type PiManagerControlRequest = { requestId: string } & (
-	| { action: ManagerLifecycleAction; taskId: string }
+	| { action: ManagerTaskAction; taskId: string }
 	| { action: "ask"; target: string; request: string }
 );
 
@@ -86,6 +88,10 @@ export function isManagerControlAction(value: unknown): value is ManagerControlA
 
 export function isManagerLifecycleAction(value: unknown): value is ManagerLifecycleAction {
 	return typeof value === "string" && (MANAGER_LIFECYCLE_ACTIONS as readonly string[]).includes(value);
+}
+
+export function isManagerTaskAction(value: unknown): value is ManagerTaskAction {
+	return typeof value === "string" && (MANAGER_TASK_ACTIONS as readonly string[]).includes(value);
 }
 
 export function isManagerTaskCatalogue(value: unknown): value is ManagerTaskCatalogueEntry[] {
@@ -124,7 +130,7 @@ export function isPiManagerControlRequest(value: unknown): value is PiManagerCon
 			request.target.length <= 108 && typeof request.request === "string" && request.request.length > 0 &&
 			request.request.length <= MAX_SESSION_CONTROL_TEXT_LENGTH;
 	}
-	return isManagerLifecycleAction(request.action) && typeof request.taskId === "string" &&
+	return isManagerTaskAction(request.action) && typeof request.taskId === "string" &&
 		request.taskId.length <= 100 && MANAGER_TASK_ID.test(request.taskId);
 }
 

@@ -17,7 +17,7 @@ import { DISCORD_LIFECYCLE_REACTIONS, type DiscordLifecycleReaction } from "./re
 import {
 	boundedControlResult,
 	MANAGER_CONTROL_ACTIONS,
-	MANAGER_LIFECYCLE_ACTIONS,
+	MANAGER_TASK_ACTIONS,
 	MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES,
 	MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES,
 	MAX_MODEL_AUTOCOMPLETE_CHOICES,
@@ -160,12 +160,13 @@ export function managerCommandDefinition(): ChatInputApplicationCommandData {
 		takeback: "Request a worker summary and resume manager supervision",
 		archive: "Archive a task without merging",
 		"merge-and-archive": "Fast-forward locally into the landing branch, then archive",
+		"reconcile-pr": "Check the task pull request and archive it if merged",
 	} as const;
 	return {
 		name: MANAGER_COMMAND_NAME,
 		description: "Control tasks and send requests from the live the-manager session",
 		options: [
-			...MANAGER_LIFECYCLE_ACTIONS.map((action) => ({
+			...MANAGER_TASK_ACTIONS.map((action) => ({
 				type: ApplicationCommandOptionType.Subcommand as const,
 				name: action,
 				description: descriptions[action],
