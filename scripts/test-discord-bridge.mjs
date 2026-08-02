@@ -919,34 +919,34 @@ try {
 	const chunks = splitDiscordText("a".repeat(4_100));
 	assert.equal(chunks.join(""), "a".repeat(4_100));
 	assert.ok(chunks.every((chunk) => chunk.length <= 1_900));
-	const interactivePrefix = "──────────── 👨‍💻 ────────────\n";
-	const interactiveSuffix = "\n──────────────────────────────";
-	const framedInteractive = (body) => `${interactivePrefix}${body}${interactiveSuffix}`;
-	const interactiveBodies = (messages) => messages.map((message) => message.slice(interactivePrefix.length, -interactiveSuffix.length));
-	assert.deepEqual(interactiveUserChunks("ordinary input"), [framedInteractive("ordinary input")]);
-	assert.deepEqual(interactiveUserChunks("line one\nline two"), [framedInteractive("line one\nline two")]);
+	const interactivePrefix = "👨‍💻: ";
+	const prefixedInteractive = (body) => `${interactivePrefix}${body}`;
+	const interactiveBodies = (messages) => messages.map((message) => message.slice(interactivePrefix.length));
+	assert.deepEqual(interactiveUserChunks("ordinary input"), [prefixedInteractive("ordinary input")]);
+	assert.deepEqual(interactiveUserChunks("line one\nline two"), [prefixedInteractive("line one\nline two")]);
 	assert.deepEqual(
 		interactiveUserChunks("**bold** _under_ `code` \\ slash"),
-		[framedInteractive("**bold** _under_ `code` \\ slash")],
-		"interactive Markdown must remain byte-for-byte unchanged in the frame body",
+		[prefixedInteractive("**bold** _under_ `code` \\ slash")],
+		"interactive Markdown must remain byte-for-byte unchanged after the prefix",
 	);
 	assert.deepEqual(interactiveUserChunks(""), []);
-	assert.deepEqual(interactiveUserChunks(" \n "), [framedInteractive(" \n ")], "whitespace-only interactive input must be preserved");
-	const interactiveCapacity = 1_900 - interactivePrefix.length - interactiveSuffix.length;
-	assert.equal(interactiveCapacity, 1_837);
+	assert.deepEqual(interactiveUserChunks(" \n "), [prefixedInteractive(" \n ")], "whitespace-only interactive input must be preserved");
+	const interactiveCapacity = 1_900 - interactivePrefix.length;
+	assert.equal(interactiveCapacity, 1_893);
 	assert.equal(interactiveUserChunks("a".repeat(interactiveCapacity))[0].length, 1_900);
 	const boundaryUnicodeInput = `${"a".repeat(interactiveCapacity - 1)}😀b`;
 	const boundaryUnicodeChunks = interactiveUserChunks(boundaryUnicodeInput);
 	assert.equal(boundaryUnicodeChunks.length, 2);
-	assert.ok(boundaryUnicodeChunks.every((chunk) => chunk.length <= 1_900));
+	assert.ok(boundaryUnicodeChunks.every((chunk) => chunk.startsWith(interactivePrefix) && chunk.length <= 1_900));
 	assert.equal(interactiveBodies(boundaryUnicodeChunks).join(""), boundaryUnicodeInput, "UTF-16 surrogate pairs must remain intact across chunks");
 	assert.doesNotMatch(interactiveBodies(boundaryUnicodeChunks)[0], /[\uD800-\uDBFF]$/);
 	assert.doesNotMatch(interactiveBodies(boundaryUnicodeChunks)[1], /^[\uDC00-\uDFFF]/);
-	assert.throws(() => interactiveUserChunks("x", interactivePrefix.length + interactiveSuffix.length + 1), /between 65 and 2000/);
+	assert.throws(() => interactiveUserChunks("x", interactivePrefix.length + 1), /between 9 and 2000/);
 	const longInteractiveInput = "long *markdown* line\n".repeat(300);
 	const longInteractiveChunks = interactiveUserChunks(longInteractiveInput);
 	assert.ok(longInteractiveChunks.length > 1);
-	assert.ok(longInteractiveChunks.every((chunk) => chunk.startsWith(interactivePrefix) && chunk.endsWith(interactiveSuffix) && chunk.length <= 1_900));
+	assert.ok(longInteractiveChunks.every((chunk) => chunk.startsWith(interactivePrefix) && chunk.length <= 1_900));
+	assert.ok(longInteractiveChunks.every((chunk) => !chunk.includes("────")), "interactive chunks must not reintroduce divider lines");
 	assert.equal(interactiveBodies(longInteractiveChunks).join(""), longInteractiveInput);
 
 	const resolvedRegistrationFrame = {
@@ -2272,13 +2272,13 @@ try {
 	assert.equal(FakeGateway.lifecycleReactionEvents.length, localReactionCount, "local/TUI runs must never receive Discord reactions");
 
 	await first.emit("input", { text: "local input", source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === framedInteractive("local input")), "framed interactive user send");
+	await waitFor(() => gateway.sent.some((message) => message.text === prefixedInteractive("local input")), "prefixed interactive user send");
 	assert.equal(gateway.sent.at(-1).channelId, firstThread);
-	assert.equal(gateway.sent.at(-1).text, framedInteractive("local input"));
+	assert.equal(gateway.sent.at(-1).text, prefixedInteractive("local input"));
 	await first.emit("input", { text: "line one\nline two", source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === framedInteractive("line one\nline two")), "framed multiline interactive send");
+	await waitFor(() => gateway.sent.some((message) => message.text === prefixedInteractive("line one\nline two")), "prefixed multiline interactive send");
 	await first.emit("input", { text: " \n ", source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === framedInteractive(" \n ")), "framed whitespace-only interactive send");
+	await waitFor(() => gateway.sent.some((message) => message.text === prefixedInteractive(" \n ")), "prefixed whitespace-only interactive send");
 	const sentBeforeEmptyInput = gateway.sent.length;
 	await first.emit("input", { text: "", source: "interactive" });
 	assert.equal(gateway.sent.length, sentBeforeEmptyInput, "empty interactive input must not emit a Discord message");
@@ -2290,8 +2290,9 @@ try {
 	await first.emit("input", { text: longInteractiveInput, source: "interactive" });
 	await waitFor(() => gateway.sent.length >= longStart + longInteractiveChunks.length, "chunk-safe long interactive send");
 	assert.deepEqual(gateway.sent.slice(longStart).map((message) => message.text), longInteractiveChunks);
-	await first.emit("input", { text: "RPC input", source: "rpc" });
-	await waitFor(() => gateway.sent.some((message) => message.text === "RPC input"), "unchanged non-interactive input send");
+	const rpcInput = " RPC **unchanged**\nline two ";
+	await first.emit("input", { text: rpcInput, source: "rpc" });
+	await waitFor(() => gateway.sent.some((message) => message.text === rpcInput), "byte-for-byte unchanged non-interactive input send");
 	const sentBeforeLoopCheck = gateway.sent.length;
 	await first.emit("input", { text: "Discord echo", source: "extension" });
 	assert.equal(gateway.sent.length, sentBeforeLoopCheck, "Discord-origin extension input must not loop back to Discord");

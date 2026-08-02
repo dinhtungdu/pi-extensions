@@ -67,16 +67,12 @@ export function assistantText(message: {
 	return text || undefined;
 }
 
-const INTERACTIVE_HEADER = "──────────── 👨‍💻 ────────────";
-const INTERACTIVE_FOOTER = "──────────────────────────────";
-const INTERACTIVE_PREFIX = `${INTERACTIVE_HEADER}\n`;
-const INTERACTIVE_SUFFIX = `\n${INTERACTIVE_FOOTER}`;
+const INTERACTIVE_PREFIX = "👨‍💻: ";
 const MAX_UTF16_CODE_POINT_LENGTH = 2;
 
 export function interactiveUserChunks(text: string, maximum = SAFE_MESSAGE_LIMIT): string[] {
-	const frameLength = INTERACTIVE_PREFIX.length + INTERACTIVE_SUFFIX.length;
-	const payloadLimit = maximum - frameLength;
-	const minimum = frameLength + MAX_UTF16_CODE_POINT_LENGTH;
+	const payloadLimit = maximum - INTERACTIVE_PREFIX.length;
+	const minimum = INTERACTIVE_PREFIX.length + MAX_UTF16_CODE_POINT_LENGTH;
 	if (!Number.isInteger(maximum) || maximum < minimum || maximum > DISCORD_MESSAGE_LIMIT) {
 		throw new Error(`Formatted Discord message limit must be between ${minimum} and ${DISCORD_MESSAGE_LIMIT}`);
 	}
@@ -90,7 +86,7 @@ export function interactiveUserChunks(text: string, maximum = SAFE_MESSAGE_LIMIT
 		payload += character;
 	}
 	if (payload) payloads.push(payload);
-	return payloads.map((chunk) => `${INTERACTIVE_PREFIX}${chunk}${INTERACTIVE_SUFFIX}`);
+	return payloads.map((chunk) => `${INTERACTIVE_PREFIX}${chunk}`);
 }
 
 export function splitDiscordText(text: string, maximum = SAFE_MESSAGE_LIMIT): string[] {
