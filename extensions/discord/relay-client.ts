@@ -457,7 +457,9 @@ export class LocalRelayClient {
 			try {
 				const request: PiManagerControlRequest = frame.action === "ask"
 					? { requestId: frame.requestId, action: "ask", target: frame.target, request: frame.request }
-					: { requestId: frame.requestId, action: frame.action, taskId: frame.taskId };
+					: frame.action === "reconcile-pr"
+						? { requestId: frame.requestId, action: "reconcile-pr", ...(frame.taskId ? { taskId: frame.taskId } : {}) }
+						: { requestId: frame.requestId, action: frame.action, taskId: frame.taskId };
 				result = this.callbacks.onManagerControl
 					? boundedControlResult(await this.callbacks.onManagerControl(request))
 					: { ok: false, message: "This Pi client does not support Discord manager controls." };

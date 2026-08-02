@@ -383,7 +383,9 @@ export class LocalRelayHost {
 	private requestManagerControl(state: SocketState, request: PiManagerControlRequest): Promise<PiSessionControlResult> {
 		const frame: Extract<ServerFrame, { type: "manager_control" }> = request.action === "ask"
 			? { type: "manager_control", requestId: request.requestId, action: "ask", target: request.target, request: request.request }
-			: { type: "manager_control", requestId: request.requestId, action: request.action, taskId: request.taskId };
+			: request.action === "reconcile-pr"
+				? { type: "manager_control", requestId: request.requestId, action: "reconcile-pr", ...(request.taskId ? { taskId: request.taskId } : {}) }
+				: { type: "manager_control", requestId: request.requestId, action: request.action, taskId: request.taskId };
 		return this.requestClientControl(state, frame, MANAGER_CONTROL_TIMEOUT_MS);
 	}
 

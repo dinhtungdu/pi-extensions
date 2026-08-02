@@ -74,7 +74,8 @@ export interface ManagerProjectCatalogueEntry {
 }
 
 export type PiManagerControlRequest = { requestId: string } & (
-	| { action: ManagerTaskAction; taskId: string }
+	| { action: ManagerLifecycleAction; taskId: string }
+	| { action: "reconcile-pr"; taskId?: string }
 	| { action: "ask"; target: string; request: string }
 );
 
@@ -130,6 +131,7 @@ export function isPiManagerControlRequest(value: unknown): value is PiManagerCon
 			request.target.length <= 108 && typeof request.request === "string" && request.request.length > 0 &&
 			request.request.length <= MAX_SESSION_CONTROL_TEXT_LENGTH;
 	}
+	if (request.action === "reconcile-pr" && request.taskId === undefined) return true;
 	return isManagerTaskAction(request.action) && typeof request.taskId === "string" &&
 		request.taskId.length <= 100 && MANAGER_TASK_ID.test(request.taskId);
 }

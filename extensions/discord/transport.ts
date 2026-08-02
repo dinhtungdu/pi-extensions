@@ -174,7 +174,7 @@ export function managerCommandDefinition(): ChatInputApplicationCommandData {
 					type: ApplicationCommandOptionType.String as const,
 					name: "task",
 					description: "Managed task",
-					required: true,
+					required: action !== "reconcile-pr",
 					autocomplete: true,
 				}],
 			})),
@@ -565,18 +565,31 @@ export class DiscordJsTransport implements DiscordTransport {
 			const listener = this.managerControlListeners.values().next().value;
 			if (!listener) result = { ok: false, message: "Discord relay is not ready for manager controls." };
 			else {
-				const request: DiscordManagerControlRequest = action === "ask" ? {
-					requestId: command.id,
-					channelId: command.channelId,
-					action: "ask",
-					target: command.options.getString("target", true),
-					request: command.options.getString("request", true),
-				} : {
-					requestId: command.id,
-					channelId: command.channelId,
-					action: action as Exclude<DiscordManagerControlRequest["action"], "ask">,
-					taskId: command.options.getString("task", true),
-				};
+				let request: DiscordManagerControlRequest;
+				if (action === "ask") {
+					request = {
+						requestId: command.id,
+						channelId: command.channelId,
+						action: "ask",
+						target: command.options.getString("target", true),
+						request: command.options.getString("request", true),
+					};
+				} else if (action === "reconcile-pr") {
+					const taskId = command.options.getString("task", false);
+					request = {
+						requestId: command.id,
+						channelId: command.channelId,
+						action: "reconcile-pr",
+						...(taskId ? { taskId } : {}),
+					};
+				} else {
+					request = {
+						requestId: command.id,
+						channelId: command.channelId,
+						action: action as Exclude<DiscordManagerControlRequest["action"], "ask" | "reconcile-pr">,
+						taskId: command.options.getString("task", true),
+					};
+				}
 				result = await Promise.race([
 					listener(request),
 					new Promise<PiSessionControlResult>((resolveResult) => {

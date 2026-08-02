@@ -563,11 +563,14 @@ try {
 	assert.deepEqual(managerDefinition.options.map((option) => option.name), [
 		"handoff", "takeback", "archive", "merge-and-archive", "reconcile-pr", "ask",
 	]);
-	for (const option of managerDefinition.options.slice(0, 5)) {
+	for (const option of managerDefinition.options.slice(0, 4)) {
 		assert.deepEqual(option.options.map(({ name, required, autocomplete }) => ({ name, required, autocomplete })), [
 			{ name: "task", required: true, autocomplete: true },
 		], `${option.name} must retain exactly one required dynamic task option`);
 	}
+	assert.deepEqual(managerDefinition.options[4].options.map(({ name, required, autocomplete }) => ({ name, required, autocomplete })), [
+		{ name: "task", required: false, autocomplete: true },
+	], "reconcile-pr must expose exactly one optional dynamic task option");
 	assert.deepEqual(managerDefinition.options[5].options.map(({ name, required, autocomplete, maxLength }) => ({
 		name, required, autocomplete, maxLength,
 	})), [{ name: "target", required: true, autocomplete: true, maxLength: undefined }, {
@@ -624,7 +627,7 @@ try {
 		options: {
 			getSubcommand: () => "reconcile-pr",
 			getString: (name, required) => {
-				assert.deepEqual([name, required], ["task", true]);
+				assert.deepEqual([name, required], ["task", false]);
 				return "timer-task";
 			},
 		},
@@ -636,6 +639,24 @@ try {
 		action: "reconcile-pr",
 		taskId: "timer-task",
 	}, "Discord reconcile-pr interactions must retain dynamic task selection");
+	await timerTransport.executeManagerControlInteraction({
+		id: "reconcile-manager-all",
+		channelId: "timer-manager-thread",
+		async deferReply() {},
+		options: {
+			getSubcommand: () => "reconcile-pr",
+			getString: (name, required) => {
+				assert.deepEqual([name, required], ["task", false]);
+				return null;
+			},
+		},
+		async editReply(reply) { managerInteractionReplies.push(reply); },
+	});
+	assert.deepEqual(timerRequest, {
+		requestId: "reconcile-manager-all",
+		channelId: "timer-manager-thread",
+		action: "reconcile-pr",
+	}, "taskless Discord reconcile-pr interactions must omit taskId");
 	await timerTransport.executeManagerControlInteraction({
 		id: "ask-manager-control",
 		channelId: "timer-manager-thread",
@@ -653,7 +674,7 @@ try {
 		target: "project:pi-extensions",
 		request: "Inspect it",
 	}, "Discord ask interactions must route both required options without task coercion");
-	assert.equal(managerInteractionReplies[2].content, "✅ settled");
+	assert.equal(managerInteractionReplies[3].content, "✅ settled");
 
 	let managerStatus = {
 		...focusedManagerStatus,
@@ -750,12 +771,31 @@ try {
 	const managerProcessCalls = [];
 	let managerProcessFailure;
 	let reconcileOutput = { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "not-found", archived: false };
+	let reconcileBatchOutput = {
+		ok: true, command: "task-reconcile-pr", scope: "all", scanned: 5,
+		results: [{
+			task_id: "batch-closed", state: "closed", archived: false, url: "https://github.com/acme/repo/pull/11", number: 11,
+		}, {
+			task_id: "batch-failed", state: "error", archived: false, error: "canonical per-task refusal",
+		}, {
+			task_id: "batch-merged", state: "merged", archived: true, url: "https://github.com/acme/repo/pull/12", number: 12,
+			merged_at: "2026-08-02T14:00:00Z", merge_commit: "a".repeat(40), checkout_mode: "repository", slot_state: null, replay: false,
+		}, {
+			task_id: "batch-missing", state: "not-found", archived: false,
+		}, {
+			task_id: "batch-open", state: "open", archived: false, url: "https://github.com/acme/repo/pull/13", number: 13,
+		}],
+		summary: { merged: 1, open: 1, closed: 1, not_found: 1, failed: 1 },
+	};
 	const managerRun = async (executable, args, options) => {
 		managerProcessCalls.push({ executable, args, options });
 		if (args.at(-1) === "validate") return { code: 0, stdout: '{"valid":true}\n', stderr: "" };
 		if (args[1] === "status") return { code: 0, stdout: `${JSON.stringify(canonicalExecutorStatus)}\n`, stderr: "" };
 		if (managerProcessFailure) return managerProcessFailure;
 		const command = args[1];
+		if (command === "task-reconcile-pr" && !args.includes("--task")) {
+			return { code: 0, stdout: `${JSON.stringify(reconcileBatchOutput)}\n`, stderr: "" };
+		}
 		const taskId = args[args.indexOf("--task") + 1].split("/").at(-1).replace(/\.md$/, "");
 		if (command === "task-reconcile-pr") return { code: 0, stdout: `${JSON.stringify(reconcileOutput)}\n`, stderr: "" };
 		const output = command === "handoff-start"
@@ -829,20 +869,46 @@ try {
 	assert.equal((await managerExecutor.execute({
 		requestId: "executor-reconcile-optional-cleanup", action: "reconcile-pr", taskId: "safe-task",
 	}, executorCatalogue)).ok, true, "documented optional merged cleanup fields may be absent");
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "executor-reconcile-batch", action: "reconcile-pr",
+	}, executorCatalogue), {
+		ok: true,
+		message: "Reconciled 5 tasks: 1 merged, 1 open, 1 closed, 1 not found, 1 failed. Failed: @batch-failed.",
+	}, "taskless reconcile-pr must summarize every canonical batch state");
+	const validReconcileBatchOutput = structuredClone(reconcileBatchOutput);
+	const manyFailedResults = Array.from({ length: 12 }, (_, index) => ({
+		task_id: `failed-task-${index + 1}`, state: "error", archived: false, error: `failure ${index + 1}`,
+	}));
+	reconcileBatchOutput = {
+		ok: true, command: "task-reconcile-pr", scope: "all", scanned: manyFailedResults.length,
+		results: manyFailedResults,
+		summary: { merged: 0, open: 0, closed: 0, not_found: 0, failed: manyFailedResults.length },
+	};
+	const boundedBatch = await managerExecutor.execute({
+		requestId: "executor-reconcile-batch-bounded", action: "reconcile-pr",
+	}, executorCatalogue);
+	assert.match(boundedBatch.message, /Failed: @failed-task-1,.*@failed-task-10, … 2 more\.$/,
+		"batch summaries must bound failed task IDs");
+	assert.doesNotMatch(boundedBatch.message, /@failed-task-11/, "bounded batch summaries must omit excess failed task IDs");
 	const managerActionCalls = managerProcessCalls.filter((call) => call.args.at(-1) !== "validate");
 	assert.deepEqual(managerActionCalls.map((call) => call.args[1]), [
 		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive",
 		"task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr",
+		"task-reconcile-pr", "task-reconcile-pr",
 	], "Discord controls must route only through canonical manager CLI composites");
 	assert.ok(managerActionCalls[2].args.includes("--completion-authorized"), "archive must carry explicit non-merge completion authorization");
 	assert.equal(managerActionCalls[3].args.includes("--completion-authorized"), false,
 		"merge-and-archive must use only its dedicated canonical composite");
 	assert.deepEqual(managerActionCalls[4].args, [join(managerExecutorRoot, "bin", "manager.mjs"), "task-reconcile-pr",
 		"--root", managerExecutorRoot, "--task", join(managerExecutorRoot, "data", "tasks", "safe-task.md")],
-	"reconcile-pr must delegate only to the canonical manager composite without bridge policy arguments");
+	"single reconcile-pr must preserve exact canonical task routing");
+	assert.deepEqual(managerActionCalls[9].args, [join(managerExecutorRoot, "bin", "manager.mjs"), "task-reconcile-pr",
+		"--root", managerExecutorRoot],
+	"taskless reconcile-pr must delegate only to the canonical manager composite without task or bridge policy arguments");
 	assert.equal(managerActionCalls.every((call) => call.executable === process.execPath && call.options.cwd === managerExecutorRoot), true);
-	assert.equal(managerActionCalls.every((call) => call.args.includes(join(managerExecutorRoot, "data", "tasks", "safe-task.md"))), true,
-		"task selection must resolve only to the canonical active task path");
+	assert.equal(managerActionCalls.slice(0, 9).every((call) =>
+		call.args.includes(join(managerExecutorRoot, "data", "tasks", "safe-task.md"))), true,
+	"supplied task selection must resolve only to the canonical active task path");
 	const deliveredAskRequests = [];
 	const executorProjects = [{ projectId: "pi-extensions" }, { projectId: "safe-task" }];
 	assert.deepEqual(await managerExecutor.execute({
@@ -987,7 +1053,7 @@ try {
 		"canonical stale/removed target refusals must never call deliverAsk");
 	assert.equal(managerProcessCalls.filter((call) => [
 		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive", "task-reconcile-pr",
-	].includes(call.args[1])).length, 9, "ask must not invoke or mutate manager lifecycle state");
+	].includes(call.args[1])).length, 11, "ask must not invoke or mutate manager lifecycle state");
 	const callsBeforeStale = managerProcessCalls.length;
 	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-stale", action: "archive", taskId: "missing-task" }, executorCatalogue), {
 		ok: false,
@@ -1034,11 +1100,49 @@ try {
 		}, executorCatalogue), { ok: false, message: "reconcile-pr returned conflicting manager output." },
 		`reconcile-pr success schema adversary ${index} must fail closed`);
 	}
+	const emptyBatchSummary = { merged: 0, open: 0, closed: 0, not_found: 0, failed: 0 };
+	const conflictingBatchOutputs = [
+		{ ...validReconcileBatchOutput, ok: false },
+		{ ...validReconcileBatchOutput, command: "wrong-command" },
+		{ ...validReconcileBatchOutput, scope: "project" },
+		{ ...validReconcileBatchOutput, scanned: 51 },
+		{ ...validReconcileBatchOutput, scanned: 4 },
+		{ ...validReconcileBatchOutput, results: "invalid" },
+		{ ...validReconcileBatchOutput, summary: { ...validReconcileBatchOutput.summary, failed: 2 } },
+		{ ...validReconcileBatchOutput, summary: { ...validReconcileBatchOutput.summary, unexpected: 0 } },
+		{ ...validReconcileBatchOutput, results: [...validReconcileBatchOutput.results, validReconcileBatchOutput.results[0]], scanned: 6,
+			summary: { ...validReconcileBatchOutput.summary, closed: 2 } },
+		{ ok: true, command: "task-reconcile-pr", scope: "all", scanned: 1,
+			results: [{ task_id: "bad-open", state: "open", archived: false, url: "https://example.test/pr/1" }],
+			summary: { ...emptyBatchSummary, open: 1 } },
+		{ ok: true, command: "task-reconcile-pr", scope: "all", scanned: 1,
+			results: [{ task_id: "bad-error", state: "error", archived: true, error: "failure" }],
+			summary: { ...emptyBatchSummary, failed: 1 } },
+		{ ok: true, command: "task-reconcile-pr", scope: "all", scanned: 1,
+			results: [{ task_id: "bad-state", state: "pending", archived: false }],
+			summary: emptyBatchSummary },
+		{ ok: true, command: "task-reconcile-pr", scope: "all", scanned: 1,
+			results: [{ ...validReconcileBatchOutput.results[0], ok: true, command: "task-reconcile-pr" }],
+			summary: { ...emptyBatchSummary, closed: 1 } },
+		{ ok: true, command: "task-reconcile-pr", scope: "all", scanned: 0, results: [], summary: emptyBatchSummary, unexpected: true },
+	];
+	for (const [index, output] of conflictingBatchOutputs.entries()) {
+		reconcileBatchOutput = output;
+		assert.deepEqual(await managerExecutor.execute({
+			requestId: `executor-reconcile-batch-conflict-${index}`, action: "reconcile-pr",
+		}, executorCatalogue), { ok: false, message: "reconcile-pr returned conflicting manager output." },
+		`reconcile-pr batch schema adversary ${index} must fail closed`);
+	}
+	managerProcessFailure = { code: 0, stdout: "not-json", stderr: "" };
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "executor-reconcile-batch-malformed", action: "reconcile-pr",
+	}, executorCatalogue), { ok: false, message: "reconcile-pr returned malformed JSON." },
+	"malformed taskless canonical output must fail closed");
 	managerProcessFailure = { code: 4, stdout: "", stderr: "GitHub authorization required" };
 	assert.deepEqual(await managerExecutor.execute({
-		requestId: "executor-reconcile-refused", action: "reconcile-pr", taskId: "safe-task",
+		requestId: "executor-reconcile-refused", action: "reconcile-pr",
 	}, executorCatalogue), { ok: false, message: "GitHub authorization required" },
-	"reconcile-pr must surface canonical external-gate failures without querying GitHub itself");
+	"taskless reconcile-pr must surface canonical external-gate failures without querying GitHub itself");
 	managerProcessFailure = undefined;
 
 	const epochConfig = join(dataDir, "epoch-config.json");
@@ -1368,6 +1472,14 @@ try {
 		requestId: "relay-reconcile-pr", action: "reconcile-pr", taskId: "safe-task",
 	});
 	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "relay-reconcile-pr-all",
+		channelId: managerControlPrepared.threadId,
+		action: "reconcile-pr",
+	}), { ok: true, message: "reconcile-pr undefined" }, "relay must authorize taskless reconciliation only for the verified live manager session");
+	assert.deepEqual(executedManagerControls.at(-1), {
+		requestId: "relay-reconcile-pr-all", action: "reconcile-pr",
+	}, "relay must preserve omitted taskId across authorization and IPC routing");
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
 		requestId: "relay-ask-task",
 		channelId: managerControlPrepared.threadId,
 		action: "ask",
@@ -1404,6 +1516,10 @@ try {
 		ok: false,
 		message: "Select a task from this manager session's current autocomplete catalogue.",
 	});
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "stale-reconcile-task", channelId: managerControlPrepared.threadId, action: "reconcile-pr", taskId: "safe-task",
+	}), { ok: false, message: "Select a task from this manager session's current autocomplete catalogue." },
+	"supplied reconcile-pr tasks must retain stale-catalogue rejection");
 	await managerControlGateway.emit({
 		id: "manager-ordinary-message",
 		channelId: managerControlPrepared.threadId,
@@ -1415,15 +1531,12 @@ try {
 	assert.deepEqual(await managerControlGateway.executeManagerControl({
 		requestId: "offline-manager-control",
 		channelId: managerControlPrepared.threadId,
-		action: "ask",
-		target: "project:wordpress",
-		request: "Do not route",
+		action: "reconcile-pr",
 	}), { ok: false, message: "The manager session mapped to this thread is offline." });
 	assert.deepEqual(await managerControlGateway.executeManagerControl({
 		requestId: "unmapped-manager-control",
 		channelId: "never-mapped-manager",
-		action: "takeback",
-		taskId: "new-task",
+		action: "reconcile-pr",
 	}), { ok: false, message: "This Discord thread is not mapped to a Pi session." });
 	await managerControlCore.stop();
 
@@ -1661,6 +1774,10 @@ try {
 	for (const action of ["handoff", "takeback", "archive", "merge-and-archive", "reconcile-pr"]) {
 		assert.equal(isServerFrame({ type: "manager_control", requestId: `manager-${action}`, action, taskId: "safe-task" }), true);
 	}
+	assert.equal(isServerFrame({ type: "manager_control", requestId: "manager-reconcile-all", action: "reconcile-pr" }), true,
+		"reconcile-pr protocol frames may omit taskId");
+	assert.equal(isServerFrame({ type: "manager_control", requestId: "manager-handoff-all", action: "handoff" }), false,
+		"only reconcile-pr protocol frames may omit taskId");
 	assert.equal(isServerFrame({
 		type: "manager_control",
 		requestId: "manager-ask",

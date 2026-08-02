@@ -373,11 +373,15 @@ export class DiscordRelayCore {
 		if (request.action === "ask" && !active.managerAsk) {
 			return { ok: false, message: "This verified manager client does not support ask; reconnect or reload it." };
 		}
-		const isCurrent = () => request.action === "ask"
-			? request.target.startsWith("project:")
-				? active.managerProjectCatalogue.some((project) => `project:${project.projectId}` === request.target)
-				: active.managerTaskCatalogue.some((task) => isActiveManagerTask(task) && `task:${task.taskId}` === request.target)
-			: active.managerTaskCatalogue.some((task) => task.taskId === request.taskId);
+		const isCurrent = () => {
+			if (request.action === "ask") {
+				return request.target.startsWith("project:")
+					? active.managerProjectCatalogue.some((project) => `project:${project.projectId}` === request.target)
+					: active.managerTaskCatalogue.some((task) => isActiveManagerTask(task) && `task:${task.taskId}` === request.target);
+			}
+			if (request.action === "reconcile-pr" && request.taskId === undefined) return true;
+			return active.managerTaskCatalogue.some((task) => task.taskId === request.taskId);
+		};
 		if (!isCurrent()) {
 			return {
 				ok: false,
@@ -404,7 +408,9 @@ export class DiscordRelayCore {
 			try {
 				const control: PiManagerControlRequest = request.action === "ask"
 					? { requestId: request.requestId, action: "ask", target: request.target, request: request.request }
-					: { requestId: request.requestId, action: request.action, taskId: request.taskId };
+					: request.action === "reconcile-pr"
+						? { requestId: request.requestId, action: "reconcile-pr", ...(request.taskId ? { taskId: request.taskId } : {}) }
+						: { requestId: request.requestId, action: request.action, taskId: request.taskId };
 				return boundedControlResult(await active.executeManagerControl(control));
 			} catch (error) {
 				return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
