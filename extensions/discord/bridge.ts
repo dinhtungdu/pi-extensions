@@ -93,6 +93,10 @@ export class DiscordBridge {
 		return this.relay.restartRelay();
 	}
 
+	async publishProjectSummary(text: string): Promise<boolean> {
+		return this.relay.sendProjectSummary(text);
+	}
+
 	async mirrorUserText(text: string, interactive = false): Promise<void> {
 		if (interactive) await this.relay.sendInteractiveUserText(text);
 		else await this.relay.sendUserText(text);

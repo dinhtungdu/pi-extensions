@@ -36,6 +36,8 @@ const OUTBOUND_RETRY_MAX_MS = 5_000;
 const REACTION_TIMEOUT_MS = 2_000;
 const MAX_PENDING_LIFECYCLE_UPDATES = 256;
 const MAX_DESIRED_REACTIONS = 2_000;
+const SUMMARY_RETRY_MIN_MS = 250;
+const SUMMARY_RETRY_MAX_MS = 30_000;
 
 async function boundedReaction(operation: Promise<void>): Promise<boolean> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -69,6 +71,10 @@ export class DiscordRelayCore {
 	private readonly queuedReactionStatuses = new Map<string, DiscordLifecycleStatus>();
 	private readonly desiredReactions = new Map<string, DiscordLifecycleMessage>();
 	private drainingLifecycleUpdates = false;
+	private readonly summaryReconciliations = new Map<string, Promise<void>>();
+	private readonly summaryReconcileRequested = new Set<string>();
+	private readonly summaryRetryAttempts = new Map<string, number>();
+	private readonly summaryRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private started = false;
 
 	constructor(
@@ -89,6 +95,7 @@ export class DiscordRelayCore {
 			return this.inboundQueue;
 		});
 		this.started = true;
+		for (const { cwd } of await this.state.projectSummaries()) this.scheduleProjectSummaryReconciliation(cwd);
 	}
 
 	async stop(): Promise<void> {
@@ -109,6 +116,12 @@ export class DiscordRelayCore {
 		this.reactionQueues.clear();
 		this.queuedReactionStatuses.clear();
 		this.desiredReactions.clear();
+		for (const timer of this.summaryRetryTimers.values()) clearTimeout(timer);
+		this.summaryRetryTimers.clear();
+		this.summaryRetryAttempts.clear();
+		this.summaryReconcileRequested.clear();
+		await Promise.allSettled(this.summaryReconciliations.values());
+		this.summaryReconciliations.clear();
 		await this.transport.disconnect();
 	}
 
@@ -232,6 +245,18 @@ export class DiscordRelayCore {
 		void this.drainLifecycleUpdates();
 	}
 
+	async queueProjectSummary(
+		clientId: string,
+		generation: string,
+		sessionId: string,
+		text: string,
+	): Promise<void> {
+		this.assertClientSession(clientId, generation, sessionId);
+		if (!text || text.length > 2_000) throw new Error("Discord project summary must contain 1-2000 characters");
+		const cwd = await this.state.setProjectSummaryDesired(sessionId, text);
+		this.scheduleProjectSummaryReconciliation(cwd);
+	}
+
 	async queueOutbound(
 		clientId: string,
 		generation: string,
@@ -256,6 +281,75 @@ export class DiscordRelayCore {
 		};
 		await this.state.enqueueOutbound(sessionId, message);
 		void this.drainOutbound().catch(this.onTerminalError);
+	}
+
+	private scheduleProjectSummaryReconciliation(cwd: string): void {
+		if (!this.started) return;
+		if (this.summaryReconciliations.has(cwd)) {
+			this.summaryReconcileRequested.add(cwd);
+			return;
+		}
+		if (this.summaryRetryTimers.has(cwd)) return;
+		const reconciliation = this.reconcileProjectSummary(cwd)
+			.catch(() => this.scheduleProjectSummaryRetry(cwd))
+			.finally(() => {
+				this.summaryReconciliations.delete(cwd);
+				const requested = this.summaryReconcileRequested.delete(cwd);
+				if (requested && !this.summaryRetryTimers.has(cwd)) this.scheduleProjectSummaryReconciliation(cwd);
+			});
+		this.summaryReconciliations.set(cwd, reconciliation);
+	}
+
+	private async reconcileProjectSummary(cwd: string): Promise<void> {
+		for (let step = 0; step < 16 && this.started; step++) {
+			const project = (await this.state.projectSummaries()).find((candidate) => candidate.cwd === cwd);
+			if (!project) return;
+			const { mapping, summary } = project;
+			if (summary.pendingSend) {
+				const messageId = await this.transport.sendText(mapping.channelId, summary.pendingSend.content, summary.pendingSend.nonce);
+				await this.state.recordProjectSummarySent(cwd, summary.pendingSend.nonce, messageId);
+				continue;
+			}
+			if (!summary.delivery) {
+				await this.state.prepareProjectSummarySend(cwd);
+				continue;
+			}
+			const latestMessageId = await this.transport.latestMessageId(mapping.channelId);
+			if (latestMessageId === summary.delivery.messageId) {
+				if (summary.delivery.content === summary.desiredText) {
+					this.clearProjectSummaryRetry(cwd);
+					return;
+				}
+				await this.transport.editOwnText(mapping.channelId, summary.delivery.messageId, summary.desiredText);
+				await this.state.recordProjectSummaryEdited(cwd, summary.delivery.messageId, summary.desiredText);
+				continue;
+			}
+			// Deletion must complete before replacement send. This intentionally leaves no summary
+			// during a failed replacement rather than creating a duplicate.
+			await this.transport.deleteOwnText(mapping.channelId, summary.delivery.messageId);
+			await this.state.recordProjectSummaryDeleted(cwd, summary.delivery.messageId);
+		}
+		if (this.started) this.scheduleProjectSummaryRetry(cwd);
+	}
+
+	private scheduleProjectSummaryRetry(cwd: string): void {
+		if (!this.started || this.summaryRetryTimers.has(cwd)) return;
+		const attempt = (this.summaryRetryAttempts.get(cwd) ?? 0) + 1;
+		this.summaryRetryAttempts.set(cwd, attempt);
+		const delay = Math.min(SUMMARY_RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 7), SUMMARY_RETRY_MAX_MS);
+		const timer = setTimeout(() => {
+			this.summaryRetryTimers.delete(cwd);
+			this.scheduleProjectSummaryReconciliation(cwd);
+		}, delay);
+		timer.unref();
+		this.summaryRetryTimers.set(cwd, timer);
+	}
+
+	private clearProjectSummaryRetry(cwd: string): void {
+		const timer = this.summaryRetryTimers.get(cwd);
+		if (timer) clearTimeout(timer);
+		this.summaryRetryTimers.delete(cwd);
+		this.summaryRetryAttempts.delete(cwd);
 	}
 
 	private async drainLifecycleUpdates(): Promise<void> {
@@ -380,8 +474,12 @@ export class DiscordRelayCore {
 
 	private async receiveDiscordMessage(message: DiscordInboundMessage): Promise<void> {
 		const matched = await this.state.findSessionByThread(message.channelId);
-		if (!matched) return;
-		await this.recordMessage(matched.sessionId, message, true);
+		if (matched) {
+			await this.recordMessage(matched.sessionId, message, true);
+			return;
+		}
+		const projectCwd = await this.state.findProjectByChannel(message.channelId);
+		if (projectCwd) this.scheduleProjectSummaryReconciliation(projectCwd);
 	}
 
 	private async recordMessage(

@@ -12,9 +12,22 @@ const LOCK_STALE_MS = 120_000;
 const LOCK_RETRIES = 600;
 const LOCK_RETRY_MS = 50;
 
+export interface ProjectSummaryState {
+	desiredText: string;
+	delivery?: {
+		messageId: string;
+		content: string;
+	};
+	pendingSend?: {
+		nonce: string;
+		content: string;
+	};
+}
+
 export interface ProjectChannelMapping {
 	channelId: string;
 	name?: string;
+	summary?: ProjectSummaryState;
 }
 
 export interface QueuedDiscordMessage {
@@ -126,6 +139,32 @@ function parsePendingMessages(value: unknown, file: string): QueuedDiscordMessag
 	});
 }
 
+function parseProjectSummary(value: unknown, file: string): ProjectSummaryState | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value) || typeof value.desiredText !== "string") {
+		throw new Error(`Discord bridge state ${file} has an invalid project summary`);
+	}
+	let delivery: ProjectSummaryState["delivery"];
+	if (value.delivery !== undefined) {
+		if (!isRecord(value.delivery) || typeof value.delivery.messageId !== "string" || typeof value.delivery.content !== "string") {
+			throw new Error(`Discord bridge state ${file} has an invalid project summary delivery`);
+		}
+		delivery = { messageId: value.delivery.messageId, content: value.delivery.content };
+	}
+	let pendingSend: ProjectSummaryState["pendingSend"];
+	if (value.pendingSend !== undefined) {
+		if (!isRecord(value.pendingSend) || typeof value.pendingSend.nonce !== "string" || typeof value.pendingSend.content !== "string") {
+			throw new Error(`Discord bridge state ${file} has an invalid pending project summary`);
+		}
+		pendingSend = { nonce: value.pendingSend.nonce, content: value.pendingSend.content };
+	}
+	return {
+		desiredText: value.desiredText,
+		...(delivery ? { delivery } : {}),
+		...(pendingSend ? { pendingSend } : {}),
+	};
+}
+
 function parseState(value: unknown, file: string): DiscordBridgeState {
 	if (!isRecord(value) || value.version !== STATE_VERSION) {
 		throw new Error(`Discord bridge state ${file} has an unsupported or invalid version`);
@@ -140,9 +179,11 @@ function parseState(value: unknown, file: string): DiscordBridgeState {
 			(mapping.name !== undefined && typeof mapping.name !== "string")) {
 			throw new Error(`Discord bridge state ${file} has an invalid project mapping`);
 		}
+		const summary = parseProjectSummary(mapping.summary, file);
 		projects[cwd] = {
 			channelId: mapping.channelId,
 			...(typeof mapping.name === "string" ? { name: mapping.name } : {}),
+			...(summary ? { summary } : {}),
 		};
 	}
 
@@ -241,7 +282,7 @@ export class DiscordStateStore {
 				...(existing?.channelId ? { existingChannelId: existing.channelId } : {}),
 				name,
 			});
-			state.projects[canonicalCwd] = { channelId, name };
+			state.projects[canonicalCwd] = { channelId, name, ...(existing?.summary ? { summary: existing.summary } : {}) };
 			return channelId;
 		});
 	}
@@ -269,6 +310,62 @@ export class DiscordStateStore {
 			};
 			state.sessions[sessionId] = mapping;
 			return structuredClone(mapping);
+		});
+	}
+
+	async projectSummaries(): Promise<Array<{ cwd: string; mapping: ProjectChannelMapping; summary: ProjectSummaryState }>> {
+		const state = await this.load();
+		return Object.entries(state.projects).flatMap(([cwd, mapping]) => mapping.summary
+			? [{ cwd, mapping: structuredClone(mapping), summary: structuredClone(mapping.summary) }]
+			: []);
+	}
+
+	async findProjectByChannel(channelId: string): Promise<string | undefined> {
+		const state = await this.load();
+		return Object.entries(state.projects).find(([, mapping]) => mapping.channelId === channelId && mapping.summary)?.[0];
+	}
+
+	async setProjectSummaryDesired(sessionId: string, desiredText: string): Promise<string> {
+		return this.mutate(async (state) => {
+			const session = state.sessions[sessionId];
+			if (!session) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
+			const project = state.projects[session.cwd];
+			if (!project || project.channelId !== session.channelId) throw new Error(`Pi session ${sessionId} has no Discord project mapping`);
+			if (project.summary) project.summary.desiredText = desiredText;
+			else project.summary = { desiredText };
+			return session.cwd;
+		});
+	}
+
+	async prepareProjectSummarySend(cwd: string): Promise<ProjectSummaryState["pendingSend"] | undefined> {
+		return this.mutate(async (state) => {
+			const summary = state.projects[cwd]?.summary;
+			if (!summary || summary.delivery) return undefined;
+			if (!summary.pendingSend) summary.pendingSend = { nonce: randomUUID(), content: summary.desiredText };
+			return structuredClone(summary.pendingSend);
+		});
+	}
+
+	async recordProjectSummarySent(cwd: string, nonce: string, messageId: string): Promise<void> {
+		await this.mutate(async (state) => {
+			const summary = state.projects[cwd]?.summary;
+			if (!summary?.pendingSend || summary.pendingSend.nonce !== nonce) return;
+			summary.delivery = { messageId, content: summary.pendingSend.content };
+			delete summary.pendingSend;
+		});
+	}
+
+	async recordProjectSummaryEdited(cwd: string, messageId: string, content: string): Promise<void> {
+		await this.mutate(async (state) => {
+			const delivery = state.projects[cwd]?.summary?.delivery;
+			if (delivery?.messageId === messageId) delivery.content = content;
+		});
+	}
+
+	async recordProjectSummaryDeleted(cwd: string, messageId: string): Promise<void> {
+		await this.mutate(async (state) => {
+			const summary = state.projects[cwd]?.summary;
+			if (summary?.delivery?.messageId === messageId) delete summary.delivery;
 		});
 	}
 

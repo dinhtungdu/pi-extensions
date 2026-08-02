@@ -40,6 +40,9 @@ export interface DiscordTransport {
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
 	sendText(channelId: string, text: string, nonce: string): Promise<string>;
+	latestMessageId(channelId: string): Promise<string | undefined>;
+	editOwnText(channelId: string, messageId: string, text: string): Promise<void>;
+	deleteOwnText(channelId: string, messageId: string): Promise<void>;
 	setLifecycleReaction(channelId: string, messageId: string, reaction: DiscordLifecycleReaction): Promise<void>;
 	onTerminalError(listener: (error: Error) => void): () => void;
 }
@@ -253,6 +256,33 @@ export class DiscordJsTransport implements DiscordTransport {
 		return message.id;
 	}
 
+	async latestMessageId(channelId: string): Promise<string | undefined> {
+		const channel = await this.textChannel(channelId, "inspect messages");
+		return (await channel.messages.fetch({ limit: 1 })).first()?.id;
+	}
+
+	async editOwnText(channelId: string, messageId: string, text: string): Promise<void> {
+		const client = this.readyClient();
+		const channel = await this.textChannel(channelId, "edit messages");
+		const message = await channel.messages.fetch(messageId);
+		if (message.author.id !== client.user.id) throw new Error(`Discord message ${messageId} is not owned by this bot`);
+		await message.edit({ content: text, allowedMentions: { parse: [] } });
+	}
+
+	async deleteOwnText(channelId: string, messageId: string): Promise<void> {
+		const client = this.readyClient();
+		const channel = await this.textChannel(channelId, "delete messages");
+		let message;
+		try {
+			message = await channel.messages.fetch(messageId);
+		} catch (error) {
+			if ((error as { code?: unknown }).code === 10_008) return;
+			throw error;
+		}
+		if (message.author.id !== client.user.id) throw new Error(`Discord message ${messageId} is not owned by this bot`);
+		await message.delete();
+	}
+
 	async setLifecycleReaction(channelId: string, messageId: string, reaction: DiscordLifecycleReaction): Promise<void> {
 		const client = this.readyClient();
 		const channel = await client.channels.fetch(channelId).catch(() => null);
@@ -276,6 +306,14 @@ export class DiscordJsTransport implements DiscordTransport {
 	private readyClient(): Client<true> {
 		if (!this.client?.isReady()) throw new Error("Discord transport is not connected");
 		return this.client;
+	}
+
+	private async textChannel(channelId: string, action: string) {
+		const channel = await this.readyClient().channels.fetch(channelId).catch(() => null);
+		if (!channel?.isTextBased() || channel.isDMBased()) {
+			throw new Error(`Discord channel ${channelId} is missing or cannot ${action}`);
+		}
+		return channel;
 	}
 
 	private async guild(guildId: string): Promise<Guild> {

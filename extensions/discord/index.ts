@@ -15,6 +15,7 @@ import { launchRelayChild } from "./relay-launcher.js";
 import { resolveProjectContext } from "./project-identity.js";
 import { discoverTaskTitle } from "./task-title.js";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
+import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
 
 const STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.discord;
 const STATUS_CONNECTED = "💬";
@@ -57,17 +58,49 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 	return function discordExtension(pi: ExtensionAPI): void {
 		let bridge: DiscordBridge | undefined;
+		let taskSummaryProducer: ManagerTaskSummaryProducer | undefined;
+		let desiredTaskSummary: string | undefined;
+		let publishingTaskSummary: Promise<void> | undefined;
+		let taskSummaryPublishRequested = false;
 		let operation: Promise<void> = Promise.resolve();
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
 
-		async function sessionFrom(ctx: ExtensionContext): Promise<BridgeSession> {
+		async function sessionFrom(ctx: ExtensionContext): Promise<{ session: BridgeSession; checkoutRoot: string }> {
 			const project = await resolveProjectContext(ctx.cwd);
 			return {
-				cwd: project.projectIdentity,
-				projectIdentityResolved: true,
-				sessionId: ctx.sessionManager.getSessionId(),
-				sessionName: pi.getSessionName() ?? await discoverTaskTitle(project.checkoutRoot),
+				checkoutRoot: project.checkoutRoot,
+				session: {
+					cwd: project.projectIdentity,
+					projectIdentityResolved: true,
+					sessionId: ctx.sessionManager.getSessionId(),
+					sessionName: pi.getSessionName() ?? await discoverTaskTitle(project.checkoutRoot),
+				},
 			};
+		}
+
+		function publishTaskSummary(ctx: ExtensionContext): void {
+			if (!desiredTaskSummary || !bridge?.status().projectSummaries) return;
+			if (publishingTaskSummary) {
+				taskSummaryPublishRequested = true;
+				return;
+			}
+			publishingTaskSummary = (async () => {
+				do {
+					taskSummaryPublishRequested = false;
+					const active = bridge;
+					const summary = desiredTaskSummary;
+					if (!active || !summary || !active.status().projectSummaries) return;
+					try {
+						await active.publishProjectSummary(summary);
+					} catch (error) {
+						ctx.ui.notify(`Discord task-summary update deferred: ${errorMessage(error)}`, "warning");
+						return;
+					}
+				} while (taskSummaryPublishRequested);
+			})().finally(() => {
+				publishingTaskSummary = undefined;
+				if (taskSummaryPublishRequested) publishTaskSummary(ctx);
+			});
 		}
 
 		function setConnectedStatus(ctx: ExtensionContext): void {
@@ -79,6 +112,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		}
 
 		async function stopBridge(ctx: ExtensionContext): Promise<void> {
+			taskSummaryProducer?.stop();
+			taskSummaryProducer = undefined;
+			desiredTaskSummary = undefined;
+			taskSummaryPublishRequested = false;
 			const active = bridge;
 			bridge = undefined;
 			await active?.stop();
@@ -100,9 +137,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				return;
 			}
 
+			const { session, checkoutRoot } = await sessionFrom(ctx);
 			const candidate = new DiscordBridge(
 				config,
-				await sessionFrom(ctx),
+				session,
 				{
 					onUserText(text) {
 						if (ctx.isIdle()) pi.sendUserMessage(text);
@@ -117,6 +155,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 							STATUS_KEY,
 							status.connected ? STATUS_CONNECTED : STATUS_RECONNECTING,
 						);
+						if (status.connected) publishTaskSummary(ctx);
 					},
 				},
 				{
@@ -135,6 +174,16 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				bridge = candidate;
 				await candidate.start();
 				setConnectedStatus(ctx);
+				taskSummaryProducer = await ManagerTaskSummaryProducer.create(checkoutRoot, {
+					onSummary(summary) {
+						desiredTaskSummary = summary;
+						publishTaskSummary(ctx);
+					},
+					onError(error) {
+						ctx.ui.notify(`Discord task-summary producer: ${error.message}`, "warning");
+					},
+				});
+				taskSummaryProducer?.start();
 			} catch (error) {
 				await candidate.stop().catch(() => {});
 				bridge = undefined;

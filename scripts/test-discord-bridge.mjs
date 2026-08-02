@@ -53,6 +53,10 @@ class FakeGateway {
 	static lifecycleReactionEvents = [];
 	static failLifecycleOnce = new Set();
 	static hangLifecycleFor = new Set();
+	static channelMessages = new Map();
+	static summaryEvents = [];
+	static failDeleteOnce = new Set();
+	static failEditOnce = new Set();
 
 	connected = false;
 	listeners = new Set();
@@ -118,6 +122,28 @@ class FakeGateway {
 		FakeGateway.lifecycleReactionEvents.push({ channelId, messageId, reaction, gateway: this });
 	}
 
+	async latestMessageId(channelId) {
+		return FakeGateway.channelMessages.get(channelId)?.at(-1)?.id;
+	}
+
+	async editOwnText(channelId, messageId, text) {
+		if (FakeGateway.failEditOnce.delete(messageId)) throw new Error("injected Discord edit failure");
+		const message = (FakeGateway.channelMessages.get(channelId) ?? []).find((candidate) => candidate.id === messageId);
+		if (!message || !message.botOwned) throw new Error("summary message is missing or not bot-owned");
+		message.text = text;
+		FakeGateway.summaryEvents.push({ type: "edit", channelId, messageId, text });
+	}
+
+	async deleteOwnText(channelId, messageId) {
+		if (FakeGateway.failDeleteOnce.delete(messageId)) throw new Error("injected Discord delete failure");
+		const messages = FakeGateway.channelMessages.get(channelId) ?? [];
+		const index = messages.findIndex((message) => message.id === messageId);
+		if (index < 0) return;
+		if (!messages[index].botOwned) throw new Error("summary message is not bot-owned");
+		messages.splice(index, 1);
+		FakeGateway.summaryEvents.push({ type: "delete", channelId, messageId });
+	}
+
 	async sendText(channelId, text, nonce) {
 		FakeGateway.sendAttempts.set(text, (FakeGateway.sendAttempts.get(text) ?? 0) + 1);
 		const attemptTimes = FakeGateway.sendAttemptTimes.get(text) ?? [];
@@ -130,6 +156,10 @@ class FakeGateway {
 		if (FakeGateway.failSendAt === this.sent.length) throw new Error("injected Discord send failure");
 		const id = `sent-${FakeGateway.nonceResults.size + 1}`;
 		this.sent.push({ channelId, text, nonce, id });
+		const messages = FakeGateway.channelMessages.get(channelId) ?? [];
+		messages.push({ id, text, botOwned: true });
+		FakeGateway.channelMessages.set(channelId, messages);
+		FakeGateway.summaryEvents.push({ type: "send", channelId, messageId: id, text });
 		FakeGateway.nonceResults.set(nonce, id);
 		return id;
 	}
@@ -230,6 +260,7 @@ try {
 	const { resolveProjectContext, resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
 	const { discoverTaskTitle, parseTaskTitle } = await importBuilt("extensions/discord/task-title.js");
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
+	const { formatManagerTaskSummary, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
@@ -313,6 +344,74 @@ try {
 	assert.equal(legacyState.sessions["legacy-session"].threadCursors["legacy-thread"], "123");
 	assert.deepEqual(legacyState.sessions["legacy-session"].outboundMessages, []);
 	assert.deepEqual(legacyState.sessions["legacy-session"].lifecycleMessages, []);
+
+	const managerFixture = join(dataDir, "the-manager");
+	await mkdir(join(managerFixture, "bin"), { recursive: true });
+	await mkdir(join(managerFixture, "data", "tasks"), { recursive: true });
+	await mkdir(join(managerFixture, ".manager", "events"), { recursive: true });
+	await writeFile(join(managerFixture, "bin", "manager.mjs"), [
+		'import { readFileSync } from "node:fs";',
+		'import { join } from "node:path";',
+		'console.log(readFileSync(join(process.cwd(), "status.json"), "utf8"));',
+		"",
+	].join("\n"));
+	let managerStatus = {
+		ok: true,
+		command: "status",
+		schema_version: 1,
+		summary: { tasks: 1, pending_events: 0, ready_tasks: 0, orphan_events: 0 },
+		tasks: [{
+			task_id: "discord-@everyone",
+			project: "pi-extensions",
+			status: "active",
+			current_run: "implement-1",
+			pending_events: [],
+		}],
+	};
+	const formattedManagerStatus = formatManagerTaskSummary(managerStatus);
+	assert.match(formattedManagerStatus, /pi-extensions\/discord-@\u200beveryone · active · implement-1/);
+	assert.ok(formattedManagerStatus.length <= 2_000);
+	const oversizedManagerStatus = formatManagerTaskSummary({
+		...managerStatus,
+		summary: { tasks: 100, pending_events: 0, ready_tasks: 0, orphan_events: 0 },
+		tasks: Array.from({ length: 100 }, (_, index) => ({
+			...managerStatus.tasks[0],
+			task_id: `task-${index}-${"x".repeat(100)}`,
+		})),
+	});
+	assert.ok(oversizedManagerStatus.length <= 2_000, "manager snapshot must fit exactly one Discord message");
+	assert.match(oversizedManagerStatus, /… \d+ more$/);
+	const managerWatchListeners = [];
+	const producedSummaries = [];
+	const producerErrors = [];
+	const managerProducer = await ManagerTaskSummaryProducer.create(managerFixture, {
+		onSummary: (summary) => producedSummaries.push(summary),
+		onError: (error) => producerErrors.push(error),
+	}, {
+		readStatus: async () => structuredClone(managerStatus),
+		watchDirectory: (_path, listener) => {
+			managerWatchListeners.push(listener);
+			const watcher = new EventEmitter();
+			watcher.close = () => {};
+			return watcher;
+		},
+	});
+	assert.ok(managerProducer, "the-manager checkout must activate the canonical status producer");
+	managerProducer.start();
+	await waitFor(() => producedSummaries.length === 1, "initial manager task snapshot");
+	managerStatus = {
+		...managerStatus,
+		summary: { tasks: 1, pending_events: 1, ready_tasks: 1, orphan_events: 0 },
+		tasks: [{ ...managerStatus.tasks[0], status: "ready", current_run: "review-1", pending_events: ["event"] }],
+	};
+	managerWatchListeners[0]();
+	await waitFor(() => producedSummaries.length === 2, "task-change manager snapshot");
+	assert.match(producedSummaries[1], /1 ready · 1 pending/);
+	assert.match(producedSummaries[1], /ready · review-1 · 1 events/);
+	assert.deepEqual(producerErrors, []);
+	managerProducer.stop();
+	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
+
 	const epochConfig = join(dataDir, "epoch-config.json");
 	await saveDiscordConfig({ token: "one", guildId: "12345" }, epochConfig);
 	const firstEpoch = (await loadDiscordConfig(epochConfig, {})).epoch;
@@ -475,6 +574,103 @@ try {
 	assert.equal(Object.keys((await rollingIdentityState.load()).projects).length, 1);
 	await rollingIdentityCore.stop();
 
+	FakeGateway.channelMessages.delete("summary-channel");
+	FakeGateway.summaryEvents.length = 0;
+	const summaryStateFile = join(dataDir, "project-summary-state.json");
+	const summaryState = new DiscordStateStore(summaryStateFile);
+	const summaryGateway = new FakeGateway();
+	summaryGateway.ensureProjectChannel = async (request) => {
+		summaryGateway.projectRequests.push(request);
+		return "summary-channel";
+	};
+	const summaryCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		summaryState,
+		summaryGateway,
+	);
+	await summaryCore.start();
+	await summaryCore.prepareRegistration("summary-client", "summary-generation", {
+		cwd: "/the-manager",
+		projectIdentityResolved: true,
+		sessionId: "summary-session",
+	});
+	await summaryCore.activateRegistration("summary-client", "summary-generation", "summary-session", () => true);
+	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary one");
+	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary one", "initial parent-channel summary");
+	const initialSummaryId = FakeGateway.channelMessages.get("summary-channel").at(-1).id;
+	assert.equal(summaryGateway.sent.at(-1).channelId, "summary-channel", "summary must target the mapped project parent channel");
+
+	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary two");
+	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary two", "latest summary edit");
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").length, 1);
+	assert.equal(FakeGateway.channelMessages.get("summary-channel")[0].id, initialSummaryId, "latest summary must edit in place");
+
+	FakeGateway.channelMessages.get("summary-channel").push({ id: "external-displacement", text: "human message", botOwned: false });
+	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary three");
+	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary three", "displaced summary replacement");
+	const displacedEvents = FakeGateway.summaryEvents.filter((event) => event.text === "summary three" || event.messageId === initialSummaryId);
+	assert.deepEqual(displacedEvents.slice(-2).map((event) => event.type), ["delete", "send"], "displaced summary must delete before send");
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").filter((message) => message.botOwned).length, 1);
+
+	const replacementId = FakeGateway.channelMessages.get("summary-channel").at(-1).id;
+	FakeGateway.channelMessages.get("summary-channel").push({ id: "failure-displacement", text: "another human message", botOwned: false });
+	FakeGateway.failDeleteOnce.add(replacementId);
+	const sendsBeforeFailure = summaryGateway.sent.length;
+	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary four");
+	await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+	assert.equal(summaryGateway.sent.length, sendsBeforeFailure, "delete failure must not send a duplicate replacement");
+	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary four", "bounded delete retry recovery");
+	await waitFor(async () => (await summaryState.projectSummaries())[0]?.summary.delivery?.content === "summary four", "persisted delete retry recovery");
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").filter((message) => message.botOwned).length, 1);
+
+	const beforeSendFailureId = FakeGateway.channelMessages.get("summary-channel").at(-1).id;
+	FakeGateway.channelMessages.get("summary-channel").push({ id: "send-failure-displacement", text: "human again", botOwned: false });
+	FakeGateway.failOnceTexts.add("summary five");
+	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary five");
+	await waitFor(() => FakeGateway.sendAttempts.get("summary five") === 1, "first failed replacement send");
+	assert.ok(!FakeGateway.channelMessages.get("summary-channel").some((message) => message.id === beforeSendFailureId), "old summary must be deleted before replacement attempt");
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").filter((message) => message.botOwned).length, 0, "failed replacement send must not retain the deleted summary");
+	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary five", "bounded send retry recovery");
+	await waitFor(async () => (await summaryState.projectSummaries())[0]?.summary.delivery?.content === "summary five", "persisted send retry recovery");
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").filter((message) => message.botOwned).length, 1);
+
+	const uncertainSummaryId = FakeGateway.channelMessages.get("summary-channel").at(-1).id;
+	FakeGateway.channelMessages.get("summary-channel").push({ id: "uncertain-send-displacement", text: "human after failure", botOwned: false });
+	const recordSummarySent = summaryState.recordProjectSummarySent.bind(summaryState);
+	let failSummaryPersistence = true;
+	summaryState.recordProjectSummarySent = async (...args) => {
+		if (failSummaryPersistence) {
+			failSummaryPersistence = false;
+			throw new Error("injected crash after Discord accepted summary");
+		}
+		return recordSummarySent(...args);
+	};
+	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary six");
+	await waitFor(async () => (await summaryState.projectSummaries())[0]?.summary.delivery?.content === "summary six", "uncertain accepted-send recovery");
+	assert.ok(!FakeGateway.channelMessages.get("summary-channel").some((message) => message.id === uncertainSummaryId));
+	assert.equal(FakeGateway.sendAttempts.get("summary six"), 2, "uncertain send must retry its durable nonce");
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").filter((message) => message.botOwned && message.text === "summary six").length, 1,
+		"nonce retry must not duplicate an accepted summary");
+
+	await summaryCore.stop();
+	const beforeRestartSummaryId = FakeGateway.channelMessages.get("summary-channel").find((message) => message.botOwned).id;
+	FakeGateway.channelMessages.get("summary-channel").push({ id: "restart-displacement", text: "human while relay stopped", botOwned: false });
+	const restartSummaryGateway = new FakeGateway();
+	restartSummaryGateway.ensureProjectChannel = async () => "summary-channel";
+	const restartSummaryCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		new DiscordStateStore(summaryStateFile),
+		restartSummaryGateway,
+	);
+	await restartSummaryCore.start();
+	await waitFor(async () => {
+		const project = (await new DiscordStateStore(summaryStateFile).projectSummaries())[0];
+		return project?.summary.delivery?.content === "summary six" && project.summary.delivery.messageId !== beforeRestartSummaryId;
+	}, "durable displaced-summary restart reconciliation");
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").filter((message) => message.botOwned).length, 1);
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").at(-1).text, "summary six");
+	await restartSummaryCore.stop();
+
 	assert.equal(projectChannelName("/one/My Project"), "my-project");
 	assert.equal(projectChannelName("/one/project"), projectChannelName("/two/project"));
 	assert.equal(projectChannelName(`/tmp/${"a".repeat(150)}`).length, 100);
@@ -544,6 +740,8 @@ try {
 	};
 	assert.equal(isClientFrame(resolvedRegistrationFrame), true);
 	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, projectIdentityResolved: "true" }), false);
+	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "summary" }), true);
+	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "x".repeat(2_001) }), false);
 	const previousValidator = (frame) => frame?.type === "outbound" && typeof frame.requestId === "string" &&
 		typeof frame.messageId === "string" && typeof frame.text === "string" && (frame.kind === "user" || frame.kind === "assistant");
 	compatibilityDirectory = await mkdtemp(join(tmpdir(), "dc-ipc-"));
@@ -941,6 +1139,8 @@ try {
 	FakeGateway.lifecycleReactionEvents.length = 0;
 	FakeGateway.failLifecycleOnce.clear();
 	FakeGateway.hangLifecycleFor.clear();
+	FakeGateway.channelMessages.clear();
+	FakeGateway.summaryEvents.length = 0;
 
 	const relayDirectory = join(dataDir, "shared-relay");
 	const paths = relayPaths(relayDirectory);
@@ -1004,6 +1204,27 @@ try {
 		sessionName: undefined,
 	});
 	await metadataAbsent.emit("session_start", { reason: "startup" });
+	const managerSummarySession = createExtensionHarness(extension, {
+		cwd: managerFixture,
+		sessionId: "manager-summary-session",
+		sessionName: "Manager",
+	});
+	await managerSummarySession.emit("session_start", { reason: "startup" });
+	const managerSummaryMapping = await new DiscordStateStore(stateFile).getSession("manager-summary-session");
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text.includes("ready · review-1"),
+		"extension-produced initial manager summary");
+	const managerSummaryMessageId = FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id;
+	managerStatus = {
+		...managerStatus,
+		summary: { tasks: 1, pending_events: 0, ready_tasks: 0, orphan_events: 0 },
+		tasks: [{ ...managerStatus.tasks[0], status: "active", current_run: "implement-2", pending_events: [] }],
+	};
+	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
+	await writeFile(join(managerFixture, "data", "tasks", "changed.md"), "changed\n");
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text.includes("active · implement-2"),
+		"extension-produced manager task-change reconciliation");
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
+		"producer task change must edit the latest parent summary");
 
 	const namingState = new DiscordStateStore(stateFile);
 	const taskNamedMapping = await namingState.getSession(taskNamedSessionId);
@@ -1317,6 +1538,7 @@ try {
 	await taskNamedSibling.emit("session_shutdown", { reason: "quit" });
 	await taskFallback.emit("session_shutdown", { reason: "quit" });
 	await metadataAbsent.emit("session_shutdown", { reason: "quit" });
+	await managerSummarySession.emit("session_shutdown", { reason: "quit" });
 	await second.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "zero-client relay child shutdown");
 	FakeGateway.catchUpByThread.set(inactiveThread, [

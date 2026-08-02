@@ -24,6 +24,7 @@ export interface RelayClientStatus {
 	leaderNonce?: string;
 	channelId?: string;
 	threadId?: string;
+	projectSummaries?: true;
 }
 
 export interface RelayClientCallbacks {
@@ -174,6 +175,12 @@ export class LocalRelayClient {
 
 	async sendAssistantText(text: string): Promise<void> {
 		await this.queueOutbound("assistant", text);
+	}
+
+	async sendProjectSummary(text: string): Promise<boolean> {
+		if (!text || !this.currentStatus.projectSummaries) return false;
+		await this.sendRequest({ type: "project_summary", requestId: randomUUID(), text }, REQUEST_TIMEOUT_MS);
+		return true;
 	}
 
 	async acknowledgeInbound(messageId: string): Promise<void> {
@@ -342,6 +349,7 @@ export class LocalRelayClient {
 				...(frame.leaderNonce ? { leaderNonce: frame.leaderNonce } : {}),
 				channelId: frame.channelId,
 				threadId: frame.threadId,
+				...(frame.projectSummaries ? { projectSummaries: true as const } : {}),
 			});
 			this.flushLifecycleStatuses();
 			return;
@@ -374,7 +382,7 @@ export class LocalRelayClient {
 			waiter.reject(new Error(`Local Discord relay is replacing configuration with epoch ${frame.configEpoch}`));
 			return;
 		}
-		if (frame.type === "inbound_acked" || frame.type === "outbound_queued") {
+		if (frame.type === "inbound_acked" || frame.type === "outbound_queued" || frame.type === "project_summary_queued") {
 			const pending = this.pendingRequests.get(frame.requestId);
 			if (pending) {
 				clearTimeout(pending.timer);

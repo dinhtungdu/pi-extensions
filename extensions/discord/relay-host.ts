@@ -244,6 +244,7 @@ export class LocalRelayHost {
 				leaderPid: this.options.lease.pid,
 				leaderNonce: this.options.lease.nonce,
 				lifecycleReactions: true,
+				projectSummaries: true,
 			})) throw new Error("Local Discord relay response queue is full");
 			await this.options.core.activateRegistration(parsed.clientId, parsed.generation, parsed.sessionId, (message) => {
 				return this.write(state, { type: "inbound", messageId: message.id, text: message.content });
@@ -271,6 +272,16 @@ export class LocalRelayHost {
 		}
 		if (parsed.type === "lifecycle") {
 			this.options.core.queueLifecycleUpdate(clientId, generation, sessionId, parsed.messageId, parsed.status);
+			return;
+		}
+		if (parsed.type === "project_summary") {
+			try {
+				await this.options.core.queueProjectSummary(clientId, generation, sessionId, parsed.text);
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
+				return;
+			}
+			this.write(state, { type: "project_summary_queued", requestId: parsed.requestId });
 			return;
 		}
 		if (parsed.type === "outbound") {
