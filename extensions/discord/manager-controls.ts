@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import {
 	boundedControlResult,
@@ -9,7 +9,9 @@ import {
 	type PiManagerControlRequest,
 	type PiSessionControlResult,
 } from "./controls.js";
+import { managerProjectCatalogue, managerTaskCatalogue } from "./manager-task-summary.js";
 
+const STATUS_TIMEOUT_MS = 2_000;
 const VALIDATE_TIMEOUT_MS = 30_000;
 const CONTROL_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 1_048_576;
@@ -151,33 +153,69 @@ export class ManagerControlExecutor {
 		projects: readonly ManagerProjectCatalogueEntry[],
 		deliverAsk?: (message: string) => void | Promise<void>,
 	): Promise<PiSessionControlResult> {
-		if (!request.request || request.request.length > 2_000) {
-			return { ok: false, message: "Manager requests must contain 1-2000 characters." };
+		const trimmedRequest = request.request.trim();
+		if (!trimmedRequest || trimmedRequest.length > 2_000) {
+			return { ok: false, message: "Manager requests must contain 1-2000 characters after trimming." };
 		}
-		let context: string;
-		let label: string;
-		if (request.target.startsWith("project:")) {
-			const projectId = request.target.slice("project:".length);
-			if (!projects.some((project) => project.projectId === projectId)) {
+		const projectTarget = request.target.startsWith("project:") ? request.target.slice("project:".length) : undefined;
+		const taskTarget = request.target.startsWith("task:") ? request.target.slice("task:".length) : undefined;
+		if (projectTarget) {
+			if (!projects.some((project) => project.projectId === projectTarget)) {
 				return { ok: false, message: "Select a target from this manager session's current autocomplete catalogue." };
 			}
-			context = `Project: ${projectId}`;
-			label = `project ${projectId}`;
-		} else if (request.target.startsWith("task:")) {
-			const taskId = request.target.slice("task:".length);
-			const task = tasks.find((candidate) => candidate.taskId === taskId && isActiveManagerTask(candidate));
-			if (!task) return { ok: false, message: "Select a target from this manager session's current autocomplete catalogue." };
-			context = `Project: ${task.project}\nTask: ${task.taskId}`;
-			label = `task ${task.taskId}`;
+		} else if (taskTarget) {
+			if (!tasks.some((task) => task.taskId === taskTarget && isActiveManagerTask(task))) {
+				return { ok: false, message: "Select a target from this manager session's current autocomplete catalogue." };
+			}
 		} else return { ok: false, message: "Select a target from this manager session's current autocomplete catalogue." };
 		if (!deliverAsk) return { ok: false, message: "The verified manager client cannot deliver requests." };
 		try {
 			await this.validateRuntime();
-			await deliverAsk(`${context}\n\n${request.request}`);
+			const canonical = await this.readCanonicalCatalogues();
+			let context: string;
+			let label: string;
+			if (projectTarget) {
+				if (!canonical.projects.some((project) => project.projectId === projectTarget)) {
+					return { ok: false, message: "The selected project is no longer configured." };
+				}
+				context = `Project: ${projectTarget}`;
+				label = `project ${projectTarget}`;
+			} else {
+				const task = canonical.tasks.find((candidate) => candidate.taskId === taskTarget && isActiveManagerTask(candidate));
+				if (!task || !canonical.projects.some((project) => project.projectId === task.project)) {
+					return { ok: false, message: "The selected task is no longer an active task in a configured project." };
+				}
+				context = `Project: ${task.project}\nTask: ${task.taskId}`;
+				label = `task ${task.taskId}`;
+			}
+			await deliverAsk(`${context}\n\n${trimmedRequest}`);
 			return { ok: true, message: `Request sent to ${label}.` };
 		} catch (error) {
 			return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
 		}
+	}
+
+	private async readCanonicalCatalogues(): Promise<{
+		tasks: ManagerTaskCatalogueEntry[];
+		projects: ManagerProjectCatalogueEntry[];
+	}> {
+		const manager = join(this.root, "bin", "manager.mjs");
+		const statusResult = await this.run(process.execPath, [manager, "status", "--root", this.root], {
+			cwd: this.root,
+			timeout: STATUS_TIMEOUT_MS,
+		});
+		if (statusResult.code !== 0) {
+			throw new Error(failureMessage(statusResult, `manager status failed with exit ${statusResult.code}.`));
+		}
+		if (Buffer.byteLength(statusResult.stdout) > MAX_OUTPUT_BYTES) throw new Error("manager status output is too large");
+		const projectPath = join(this.root, "data", "PROJECTS.md");
+		const projectStat = await stat(projectPath);
+		if (!projectStat.isFile() || projectStat.size > MAX_OUTPUT_BYTES) throw new Error("the-manager project registry is invalid or too large");
+		const projectsContent = await readFile(projectPath, "utf8");
+		return {
+			tasks: managerTaskCatalogue(parseJson(statusResult.stdout, "manager status")),
+			projects: managerProjectCatalogue(projectsContent),
+		};
 	}
 
 	private async validateRuntime(): Promise<void> {

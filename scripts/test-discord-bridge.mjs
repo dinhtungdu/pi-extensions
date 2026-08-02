@@ -710,12 +710,28 @@ try {
 	await mkdir(join(managerExecutorRoot, "data", "tasks"), { recursive: true });
 	await writeFile(join(managerExecutorRoot, "bin", "manager.mjs"), "// fixture\n");
 	await writeFile(join(managerExecutorRoot, "bin", "manager-runtime.mjs"), "// fixture\n");
-	await writeFile(join(managerExecutorRoot, "data", "PROJECTS.md"), "---\nprojects:\n---\n");
+	const canonicalExecutorProjects = (ids) => `---\nprojects:\n${ids.map((id) => `  ${id}:\n    repository: /tmp/${id}`).join("\n")}\n---\n`;
+	await writeFile(join(managerExecutorRoot, "data", "PROJECTS.md"), canonicalExecutorProjects(["pi-extensions", "safe-task"]));
+	let canonicalExecutorStatus = {
+		ok: true,
+		command: "status",
+		schema_version: 1,
+		summary: { tasks: 1, pending_events: 0, ready_tasks: 1, orphan_events: 0 },
+		tasks: [{
+			task_id: "safe-task",
+			title: "Safe task",
+			project: "pi-extensions",
+			status: "ready",
+			current_action: "review",
+			current_run: "review-1",
+		}],
+	};
 	const managerProcessCalls = [];
 	let managerProcessFailure;
 	const managerRun = async (executable, args, options) => {
 		managerProcessCalls.push({ executable, args, options });
 		if (args.at(-1) === "validate") return { code: 0, stdout: '{"valid":true}\n', stderr: "" };
+		if (args[1] === "status") return { code: 0, stdout: `${JSON.stringify(canonicalExecutorStatus)}\n`, stderr: "" };
 		if (managerProcessFailure) return managerProcessFailure;
 		const command = args[1];
 		const taskId = args[args.indexOf("--task") + 1].split("/").at(-1).replace(/\.md$/, "");
@@ -776,7 +792,7 @@ try {
 		requestId: "ask-project",
 		action: "ask",
 		target: "project:safe-task",
-		request: "Inspect the project",
+		request: "  Inspect the project \n",
 	}, executorCatalogue, executorProjects, (message) => deliveredAskRequests.push(message)), {
 		ok: true,
 		message: "Request sent to project safe-task.",
@@ -793,7 +809,16 @@ try {
 	assert.deepEqual(deliveredAskRequests, [
 		"Project: safe-task\n\nInspect the project",
 		"Project: pi-extensions\nTask: safe-task\n\nInspect the task",
-	], "ask must derive exact project/task context without invoking a lifecycle composite");
+	], "ask must derive exact project/task context and deliver trimmed TUI-compatible requests");
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "ask-whitespace",
+		action: "ask",
+		target: "project:safe-task",
+		request: "  \n\t  ",
+	}, executorCatalogue, executorProjects, () => assert.fail("whitespace-only asks must not deliver")), {
+		ok: false,
+		message: "Manager requests must contain 1-2000 characters after trimming.",
+	});
 	assert.deepEqual(await managerExecutor.execute({
 		requestId: "ask-inactive-task",
 		action: "ask",
@@ -819,9 +844,91 @@ try {
 		request: "x".repeat(2_001),
 	}, executorCatalogue, executorProjects, () => assert.fail("oversize asks must not deliver")), {
 		ok: false,
-		message: "Manager requests must contain 1-2000 characters.",
+		message: "Manager requests must contain 1-2000 characters after trimming.",
 	});
-	assert.equal(managerProcessCalls.filter((call) => !call.args.includes("validate")).length, 4,
+	const deliveredBeforeCanonicalAdversaries = deliveredAskRequests.length;
+	canonicalExecutorStatus = {
+		...canonicalExecutorStatus,
+		summary: { ...canonicalExecutorStatus.summary, tasks: 0, ready_tasks: 0 },
+		tasks: [],
+	};
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "ask-canonical-removed-task",
+		action: "ask",
+		target: "task:safe-task",
+		request: "Do not send",
+	}, executorCatalogue, executorProjects, () => assert.fail("canonically removed tasks must not deliver")), {
+		ok: false,
+		message: "The selected task is no longer an active task in a configured project.",
+	}, "stale task catalogues must not authorize a removed canonical task");
+	canonicalExecutorStatus = {
+		...canonicalExecutorStatus,
+		summary: { ...canonicalExecutorStatus.summary, tasks: 1 },
+		tasks: [{
+			task_id: "safe-task", title: "Safe task", project: "pi-extensions", status: "complete",
+			current_action: "none", current_run: "review-1",
+		}],
+	};
+	assert.equal((await managerExecutor.execute({
+		requestId: "ask-canonical-inactive-task",
+		action: "ask",
+		target: "task:safe-task",
+		request: "Do not send",
+	}, executorCatalogue, executorProjects, () => assert.fail("canonically inactive tasks must not deliver"))).ok, false,
+	"stale active hints must not authorize a canonically inactive task");
+	canonicalExecutorStatus = {
+		...canonicalExecutorStatus,
+		tasks: [{
+			task_id: "safe-task", title: "Safe task", project: "removed-project", status: "ready",
+			current_action: "review", current_run: "review-1",
+		}],
+	};
+	assert.equal((await managerExecutor.execute({
+		requestId: "ask-canonical-orphan-task",
+		action: "ask",
+		target: "task:safe-task",
+		request: "Do not send",
+	}, executorCatalogue, executorProjects, () => assert.fail("tasks outside canonical projects must not deliver"))).ok, false,
+	"canonical task metadata must reference a currently configured canonical project");
+	canonicalExecutorStatus = {
+		...canonicalExecutorStatus,
+		tasks: [{
+			task_id: "safe-task", title: "Safe task", project: "pi-extensions", status: "ready",
+			current_action: "review", current_run: "review-1",
+		}],
+	};
+	await writeFile(join(managerExecutorRoot, "data", "PROJECTS.md"), canonicalExecutorProjects(["pi-extensions"]));
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "ask-canonical-removed-project",
+		action: "ask",
+		target: "project:safe-task",
+		request: "Do not send",
+	}, executorCatalogue, executorProjects, () => assert.fail("canonically removed projects must not deliver")), {
+		ok: false,
+		message: "The selected project is no longer configured.",
+	}, "stale project catalogues must not authorize a removed canonical project");
+	await writeFile(join(managerExecutorRoot, "data", "PROJECTS.md"), "---\nprojects:\n  INVALID:\n---\n");
+	assert.equal((await managerExecutor.execute({
+		requestId: "ask-canonical-malformed-projects",
+		action: "ask",
+		target: "project:safe-task",
+		request: "Do not send",
+	}, executorCatalogue, executorProjects, () => assert.fail("malformed canonical projects must not deliver"))).ok, false,
+	"ask must fail closed on malformed canonical project data");
+	await writeFile(join(managerExecutorRoot, "data", "PROJECTS.md"), canonicalExecutorProjects(["pi-extensions", "safe-task"]));
+	const validCanonicalExecutorStatus = canonicalExecutorStatus;
+	canonicalExecutorStatus = { ...canonicalExecutorStatus, tasks: "invalid" };
+	assert.equal((await managerExecutor.execute({
+		requestId: "ask-canonical-malformed-status",
+		action: "ask",
+		target: "task:safe-task",
+		request: "Do not send",
+	}, executorCatalogue, executorProjects, () => assert.fail("malformed canonical status must not deliver"))).ok, false,
+	"ask must fail closed on malformed canonical manager status");
+	canonicalExecutorStatus = validCanonicalExecutorStatus;
+	assert.equal(deliveredAskRequests.length, deliveredBeforeCanonicalAdversaries,
+		"canonical stale/removed target refusals must never call deliverAsk");
+	assert.equal(managerProcessCalls.filter((call) => ["handoff-start", "handoff-return", "task-archive", "task-merge-and-archive"].includes(call.args[1])).length, 4,
 		"ask must not invoke or mutate manager lifecycle state");
 	const callsBeforeStale = managerProcessCalls.length;
 	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-stale", action: "archive", taskId: "missing-task" }, executorCatalogue), {
