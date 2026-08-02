@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { DiscordBridgeConfig } from "./config.js";
 import type { RelaySessionRegistration } from "./relay-core.js";
 import type { DiscordLifecycleStatus } from "./reactions.js";
-import { isQueuedInboundImage, MAX_INBOUND_IMAGES, type QueuedInboundImage } from "./inbound-images.js";
+import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
 import {
 	isPiModelCatalogue,
 	isPiSessionControlAction,
@@ -26,6 +26,7 @@ export type ClientFrame =
 	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
 	| { type: "project_summary"; requestId: string; text: string }
 	| { type: "ack_inbound"; requestId: string; messageId: string }
+	| { type: "release_inbound_images"; requestId: string; messageId: string }
 	| { type: "lifecycle"; messageId: string; status: DiscordLifecycleStatus }
 	| { type: "control_result"; requestId: string; ok: boolean; message: string }
 	| { type: "unregister" }
@@ -46,6 +47,7 @@ export type ServerFrame =
 	| { type: "inbound"; messageId: string; text: string; images?: QueuedInboundImage[] }
 	| { type: "control"; requestId: string; action: PiSessionControlAction }
 	| { type: "inbound_acked"; requestId: string; messageId: string }
+	| { type: "inbound_images_released"; requestId: string; messageId: string }
 	| { type: "outbound_queued"; requestId: string; messageId: string }
 	| { type: "project_summary_queued"; requestId: string }
 	| { type: "pong" }
@@ -87,7 +89,9 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string" && typeof frame.text === "string" &&
 			(frame.kind === "user" || frame.kind === "assistant");
 	}
-	if (frame.type === "ack_inbound") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
+	if (frame.type === "ack_inbound" || frame.type === "release_inbound_images") {
+		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
+	}
 	if (frame.type === "project_summary") {
 		return typeof frame.requestId === "string" && typeof frame.text === "string" && frame.text.length <= 2_000;
 	}
@@ -116,11 +120,12 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 	}
 	if (frame.type === "inbound") {
 		return typeof frame.messageId === "string" && typeof frame.text === "string" &&
-			(frame.images === undefined || (Array.isArray(frame.images) && frame.images.length <= MAX_INBOUND_IMAGES &&
-				frame.images.every(isQueuedInboundImage)));
+			(frame.images === undefined || isQueuedInboundImageList(frame.images));
 	}
 	if (frame.type === "control") return typeof frame.requestId === "string" && isPiSessionControlAction(frame.action);
-	if (frame.type === "inbound_acked") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
+	if (frame.type === "inbound_acked" || frame.type === "inbound_images_released") {
+		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
+	}
 	if (frame.type === "outbound_queued") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	if (frame.type === "project_summary_queued") return typeof frame.requestId === "string";
 	if (frame.type === "error") {

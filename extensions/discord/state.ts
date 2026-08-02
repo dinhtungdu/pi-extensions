@@ -4,15 +4,12 @@ import { dirname } from "node:path";
 import { DISCORD_STATE_FILE } from "./config.js";
 import { collidingProjectChannelName, normalizeCwd, projectChannelName } from "./text.js";
 import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reactions.js";
-import {
-	isQueuedInboundImage,
-	MAX_INBOUND_IMAGES,
-	type QueuedInboundImage,
-} from "./inbound-images.js";
+import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
 
 const STATE_VERSION = 1;
 const MAX_RECENT_MESSAGE_IDS = 2_000;
 const MAX_LIFECYCLE_MESSAGES_PER_SESSION = 2_000;
+const MAX_RETAINED_IMAGE_MESSAGES_PER_SESSION = 2_000;
 const LOCK_STALE_MS = 120_000;
 const LOCK_RETRIES = 600;
 const LOCK_RETRY_MS = 50;
@@ -72,12 +69,19 @@ export interface OutboundMessage {
 	chunks: OutboundChunk[];
 }
 
+export interface RetainedInboundImages {
+	messageId: string;
+	acknowledgedAt: number;
+	images: QueuedInboundImage[];
+}
+
 export interface SessionThreadMapping {
 	cwd: string;
 	channelId: string;
 	threadId: string;
 	threadCursors: Record<string, string>;
 	pendingMessages: QueuedDiscordMessage[];
+	retainedImages: RetainedInboundImages[];
 	outboundMessages: OutboundMessage[];
 	lifecycleMessages: DiscordLifecycleMessage[];
 }
@@ -149,8 +153,7 @@ function parsePendingMessages(value: unknown, file: string): QueuedDiscordMessag
 	if (!Array.isArray(value)) throw new Error(`Discord bridge state ${file} has an invalid pending message queue`);
 	return value.map((message) => {
 		if (!isRecord(message) || typeof message.id !== "string" || typeof message.content !== "string" ||
-			(message.images !== undefined && (!Array.isArray(message.images) || message.images.length > MAX_INBOUND_IMAGES ||
-				!message.images.every(isQueuedInboundImage)))) {
+			(message.images !== undefined && !isQueuedInboundImageList(message.images))) {
 			throw new Error(`Discord bridge state ${file} has an invalid pending message`);
 		}
 		const images = message.images as QueuedInboundImage[] | undefined;
@@ -158,6 +161,24 @@ function parsePendingMessages(value: unknown, file: string): QueuedDiscordMessag
 			id: message.id,
 			content: message.content,
 			...(images?.length ? { images: images.map((image) => ({ ...image })) } : {}),
+		};
+	});
+}
+
+function parseRetainedImages(value: unknown, file: string): RetainedInboundImages[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value) || value.length > MAX_RETAINED_IMAGE_MESSAGES_PER_SESSION) {
+		throw new Error(`Discord bridge state ${file} has an invalid retained image list`);
+	}
+	return value.map((entry) => {
+		if (!isRecord(entry) || typeof entry.messageId !== "string" || !Number.isSafeInteger(entry.acknowledgedAt) ||
+			Number(entry.acknowledgedAt) < 0 || !isQueuedInboundImageList(entry.images) || entry.images.length === 0) {
+			throw new Error(`Discord bridge state ${file} has invalid retained image metadata`);
+		}
+		return {
+			messageId: entry.messageId,
+			acknowledgedAt: Number(entry.acknowledgedAt),
+			images: (entry.images as QueuedInboundImage[]).map((image) => ({ ...image })),
 		};
 	});
 }
@@ -238,6 +259,7 @@ function parseState(value: unknown, file: string): DiscordBridgeState {
 			threadId: mapping.threadId,
 			threadCursors,
 			pendingMessages: parsePendingMessages(mapping.pendingMessages, file),
+			retainedImages: parseRetainedImages(mapping.retainedImages, file),
 			outboundMessages: parseOutboundMessages(mapping.outboundMessages, file, mapping.threadId),
 			lifecycleMessages: parseLifecycleMessages(mapping.lifecycleMessages, file),
 		};
@@ -328,6 +350,7 @@ export class DiscordStateStore {
 				threadId,
 				threadCursors: existing?.threadCursors ?? {},
 				pendingMessages: existing?.pendingMessages ?? [],
+				retainedImages: existing?.retainedImages ?? [],
 				outboundMessages,
 				lifecycleMessages: existing?.lifecycleMessages ?? [],
 			};
@@ -423,7 +446,7 @@ export class DiscordStateStore {
 			if (message.authorBot || (!message.content.trim() && !message.images?.length) || state.recentMessageIds.includes(message.id)) {
 				return { queued: false };
 			}
-			if (message.images && (message.images.length > MAX_INBOUND_IMAGES || !message.images.every(isQueuedInboundImage))) {
+			if (message.images && !isQueuedInboundImageList(message.images)) {
 				throw new Error("Discord inbound image metadata is invalid");
 			}
 			state.recentMessageIds.push(message.id);
@@ -447,6 +470,10 @@ export class DiscordStateStore {
 		return (await this.getSession(sessionId))?.pendingMessages ?? [];
 	}
 
+	async hasRecordedMessage(messageId: string): Promise<boolean> {
+		return (await this.load()).recentMessageIds.includes(messageId);
+	}
+
 	async updateLifecycleStatus(
 		sessionId: string,
 		messageId: string,
@@ -460,21 +487,41 @@ export class DiscordStateStore {
 		});
 	}
 
-	async acknowledgeMessage(sessionId: string, messageId: string): Promise<string[]> {
+	async acknowledgeMessage(sessionId: string, messageId: string): Promise<void> {
+		await this.mutate(async (state) => {
+			const session = state.sessions[sessionId];
+			if (!session) return;
+			const acknowledged = session.pendingMessages.find((message) => message.id === messageId);
+			if (acknowledged?.images?.length && !session.retainedImages.some((entry) => entry.messageId === messageId)) {
+				session.retainedImages.push({
+					messageId,
+					acknowledgedAt: Date.now(),
+					images: acknowledged.images.map((image) => ({ ...image })),
+				});
+				if (session.retainedImages.length > MAX_RETAINED_IMAGE_MESSAGES_PER_SESSION) {
+					throw new Error("Discord retained image metadata limit reached before image cleanup");
+				}
+			}
+			session.pendingMessages = session.pendingMessages.filter((message) => message.id !== messageId);
+		});
+	}
+
+	async releaseMessageImages(sessionId: string, messageId: string): Promise<string[]> {
 		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) return [];
-			const acknowledged = session.pendingMessages.find((message) => message.id === messageId);
-			session.pendingMessages = session.pendingMessages.filter((message) => message.id !== messageId);
-			return acknowledged?.images?.map((image) => image.localPath) ?? [];
+			const retained = session.retainedImages.find((entry) => entry.messageId === messageId);
+			session.retainedImages = session.retainedImages.filter((entry) => entry.messageId !== messageId);
+			return retained?.images.map((image) => image.localPath) ?? [];
 		});
 	}
 
 	async pendingImagePaths(): Promise<Set<string>> {
 		const state = await this.load();
-		return new Set(Object.values(state.sessions).flatMap((session) =>
-			session.pendingMessages.flatMap((message) => message.images?.map((image) => image.localPath) ?? []),
-		));
+		return new Set(Object.values(state.sessions).flatMap((session) => [
+			...session.pendingMessages.flatMap((message) => message.images?.map((image) => image.localPath) ?? []),
+			...session.retainedImages.flatMap((entry) => entry.images.map((image) => image.localPath)),
+		]));
 	}
 
 	async enqueueOutbound(sessionId: string, message: OutboundMessage): Promise<void> {

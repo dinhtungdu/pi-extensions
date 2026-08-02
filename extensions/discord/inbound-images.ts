@@ -3,9 +3,13 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink 
 import { basename, dirname, resolve } from "node:path";
 
 export const MAX_INBOUND_IMAGES = 4;
+export const MAX_INBOUND_ATTACHMENTS = 10;
 export const MAX_INBOUND_IMAGE_BYTES = 8 * 1024 * 1024;
+export const MAX_INBOUND_MESSAGE_IMAGE_BYTES = 16 * 1024 * 1024;
+export const MAX_INBOUND_IMAGE_SPOOL_BYTES = 128 * 1024 * 1024;
 export const MAX_INBOUND_IMAGE_URL_LENGTH = 2_048;
 export const MAX_INBOUND_IMAGE_PATH_LENGTH = 4_096;
+export const MAX_INBOUND_IMAGE_WARNING_LENGTH = 240;
 export const INBOUND_IMAGE_DOWNLOAD_TIMEOUT_MS = 15_000;
 export const INBOUND_IMAGE_DOWNLOAD_ATTEMPTS = 3;
 export const MAX_INBOUND_IMAGE_DIRECTORY_ENTRIES = 10_000;
@@ -33,7 +37,15 @@ export interface NativeInboundImage {
 	mimeType: InboundImageMimeType;
 }
 
+export interface InboundImagePreparation {
+	images: QueuedInboundImage[];
+	warnings: string[];
+}
+
 type FetchImage = (url: string, init: RequestInit) => Promise<Response>;
+
+class PermanentInboundImageError extends Error {}
+export class TransientInboundImageError extends Error {}
 
 function normalizedMimeType(value: string | null | undefined): string | undefined {
 	const normalized = value?.split(";", 1)[0]?.trim().toLowerCase();
@@ -53,17 +65,30 @@ export function isQueuedInboundImage(value: unknown): value is QueuedInboundImag
 		Number(image.size) > 0 && Number(image.size) <= MAX_INBOUND_IMAGE_BYTES;
 }
 
+export function isQueuedInboundImageList(value: unknown): value is QueuedInboundImage[] {
+	return Array.isArray(value) && value.length <= MAX_INBOUND_IMAGES && value.every(isQueuedInboundImage) &&
+		value.reduce((total, image) => total + image.size, 0) <= MAX_INBOUND_MESSAGE_IMAGE_BYTES;
+}
+
+function permanent(message: string): PermanentInboundImageError {
+	return new PermanentInboundImageError(message.slice(0, MAX_INBOUND_IMAGE_WARNING_LENGTH));
+}
+
+function warning(message: string): string {
+	return `[Discord attachment warning: images were not injected: ${message.slice(0, MAX_INBOUND_IMAGE_WARNING_LENGTH)}.]`;
+}
+
 function assertAttachmentUrl(value: string): string {
-	if (!value || value.length > MAX_INBOUND_IMAGE_URL_LENGTH) throw rejected("URL is invalid or too long");
+	if (!value || value.length > MAX_INBOUND_IMAGE_URL_LENGTH) throw permanent("URL is invalid or too long");
 	let url: URL;
 	try {
 		url = new URL(value);
 	} catch {
-		throw rejected("URL is invalid");
+		throw permanent("URL is invalid");
 	}
 	if (url.protocol !== "https:" || url.hostname !== "cdn.discordapp.com" || url.port || url.username || url.password || url.hash ||
 		!/^\/attachments\/\d{1,25}\/\d{1,25}\//.test(url.pathname)) {
-		throw rejected("URL is outside the Discord attachment CDN");
+		throw permanent("URL is outside the Discord attachment CDN");
 	}
 	return url.href;
 }
@@ -81,83 +106,153 @@ function detectedMimeType(bytes: Uint8Array): InboundImageMimeType | undefined {
 	return undefined;
 }
 
-function retryable(error: unknown): boolean {
-	return !(error instanceof Error) || !error.message.startsWith("Discord image attachment rejected:");
-}
-
-function rejected(message: string): Error {
-	return new Error(`Discord image attachment rejected: ${message}`);
-}
-
 function delay(milliseconds: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
+export function appendInboundImageContext(
+	text: string,
+	images: readonly QueuedInboundImage[],
+	warnings: readonly string[] = [],
+): string {
+	const references = images.map((image, index) =>
+		`[Discord image ${index + 1}/${images.length}: local_path=${JSON.stringify(image.localPath)}; mime=${image.mimeType}; bytes=${image.size}]`,
+	);
+	const blocks = [...references, ...warnings.map((value) => value.slice(0, MAX_INBOUND_IMAGE_WARNING_LENGTH + 64))];
+	return blocks.length === 0 ? text : `${text}${text ? "\n\n" : ""}${blocks.join("\n")}`;
+}
+
+export function appendImageCapabilityWarning(text: string): string {
+	return `${text}${text ? "\n" : ""}[Discord image warning: the current Pi model does not support image input; local files were not natively injected.]`;
+}
+
 export class InboundImageStore {
+	private operation: Promise<void> = Promise.resolve();
+	private spooledBytes = 0;
+
 	constructor(
 		readonly directory: string,
 		private readonly fetchImage: FetchImage = (url, init) => fetch(url, init),
 	) {}
 
-	async initialize(referencedPaths: ReadonlySet<string>): Promise<void> {
-		await mkdir(this.directory, { recursive: true, mode: 0o700 });
-		await chmod(this.directory, 0o700);
-		const entries = await readdir(this.directory, { withFileTypes: true });
-		if (entries.length > MAX_INBOUND_IMAGE_DIRECTORY_ENTRIES) {
-			throw new Error(`Discord image directory exceeds ${MAX_INBOUND_IMAGE_DIRECTORY_ENTRIES} entries`);
-		}
-		for (const entry of entries) {
-			if (!/^[0-9a-f-]{36}\.(?:image|part)$/.test(entry.name)) continue;
-			const path = resolve(this.directory, entry.name);
-			if (entry.name.endsWith(".image") && referencedPaths.has(path)) continue;
-			await unlink(path).catch((error: NodeJS.ErrnoException) => {
-				if (error.code !== "ENOENT") throw error;
-			});
-		}
+	initialize(referencedPaths: ReadonlySet<string>): Promise<void> {
+		return this.serialize(async () => {
+			await mkdir(this.directory, { recursive: true, mode: 0o700 });
+			await chmod(this.directory, 0o700);
+			const entries = await readdir(this.directory, { withFileTypes: true });
+			if (entries.length > MAX_INBOUND_IMAGE_DIRECTORY_ENTRIES) {
+				throw new Error(`Discord image directory exceeds ${MAX_INBOUND_IMAGE_DIRECTORY_ENTRIES} entries`);
+			}
+			let retainedBytes = 0;
+			for (const entry of entries) {
+				if (!/^[0-9a-f-]{36}\.(?:image|part)$/.test(entry.name)) continue;
+				const path = resolve(this.directory, entry.name);
+				if (entry.isFile() && entry.name.endsWith(".image") && referencedPaths.has(path)) {
+					const fileStat = await lstat(path);
+					retainedBytes += fileStat.size;
+					continue;
+				}
+				if (entry.isDirectory()) continue;
+				await unlink(path).catch((error: NodeJS.ErrnoException) => {
+					if (error.code !== "ENOENT") throw error;
+				});
+			}
+			// Existing referenced files are never deleted merely to satisfy a newer budget.
+			// Counting them above the cap prevents further downloads until safe acknowledgements release enough space.
+			this.spooledBytes = retainedBytes;
+		});
 	}
 
-	async download(attachments: readonly DiscordInboundAttachment[]): Promise<QueuedInboundImage[]> {
-		const candidates = attachments.filter((attachment) => isInboundImageMimeType(normalizedMimeType(attachment.contentType)));
-		if (candidates.length > MAX_INBOUND_IMAGES) throw rejected(`more than ${MAX_INBOUND_IMAGES} supported images`);
+	prepare(attachments: readonly DiscordInboundAttachment[]): Promise<InboundImagePreparation> {
+		return this.serialize(() => this.prepareExclusive(attachments));
+	}
+
+	remove(paths: readonly string[]): Promise<void> {
+		return this.serialize(() => this.removeExclusive(paths));
+	}
+
+	private async prepareExclusive(attachments: readonly DiscordInboundAttachment[]): Promise<InboundImagePreparation> {
+		if (attachments.length === 0) return { images: [], warnings: [] };
+		if (attachments.length > MAX_INBOUND_ATTACHMENTS) {
+			return { images: [], warnings: [warning(`message has more than ${MAX_INBOUND_ATTACHMENTS} attachments`)] };
+		}
+		const candidates: Array<DiscordInboundAttachment & { mimeType: InboundImageMimeType }> = [];
+		for (const attachment of attachments) {
+			if (!/^\d{1,25}$/.test(attachment.id)) {
+				return { images: [], warnings: [warning("attachment metadata has an invalid ID")] };
+			}
+			const mimeType = normalizedMimeType(attachment.contentType);
+			if (!isInboundImageMimeType(mimeType)) {
+				return { images: [], warnings: [warning("attachment MIME type is missing or unsupported")] };
+			}
+			if (!Number.isSafeInteger(attachment.size) || attachment.size <= 0 || attachment.size > MAX_INBOUND_IMAGE_BYTES) {
+				return { images: [], warnings: [warning(`declared image size must be 1-${MAX_INBOUND_IMAGE_BYTES} bytes`)] };
+			}
+			try {
+				assertAttachmentUrl(attachment.url);
+			} catch (error) {
+				return { images: [], warnings: [warning((error as Error).message)] };
+			}
+			candidates.push({ ...attachment, mimeType });
+		}
+		if (candidates.length > MAX_INBOUND_IMAGES) {
+			return { images: [], warnings: [warning(`message has more than ${MAX_INBOUND_IMAGES} supported images`)] };
+		}
+		const messageBytes = candidates.reduce((total, attachment) => total + attachment.size, 0);
+		if (messageBytes > MAX_INBOUND_MESSAGE_IMAGE_BYTES) {
+			return { images: [], warnings: [warning(`declared image total exceeds ${MAX_INBOUND_MESSAGE_IMAGE_BYTES} bytes`)] };
+		}
+		if (this.spooledBytes + messageBytes > MAX_INBOUND_IMAGE_SPOOL_BYTES) {
+			return { images: [], warnings: [warning(`relay image spool budget of ${MAX_INBOUND_IMAGE_SPOOL_BYTES} bytes is full`)] };
+		}
+
 		const downloaded: QueuedInboundImage[] = [];
 		try {
 			for (const attachment of candidates) downloaded.push(await this.downloadOne(attachment));
-			return downloaded;
+			return { images: downloaded, warnings: [] };
 		} catch (error) {
-			await this.remove(downloaded.map((image) => image.localPath));
+			await this.removeExclusive(downloaded.map((image) => image.localPath));
+			if (error instanceof PermanentInboundImageError) {
+				return { images: [], warnings: [warning(error.message)] };
+			}
 			throw error;
 		}
 	}
 
-	async remove(paths: readonly string[]): Promise<void> {
+	private async removeExclusive(paths: readonly string[]): Promise<void> {
 		const root = resolve(this.directory);
 		for (const path of paths) {
 			if (dirname(resolve(path)) !== root || !/^[0-9a-f-]{36}\.image$/.test(basename(path))) continue;
+			let size = 0;
+			try {
+				const fileStat = await lstat(path);
+				if (fileStat.isFile() && !fileStat.isSymbolicLink()) size = fileStat.size;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
 			await unlink(path).catch((error: NodeJS.ErrnoException) => {
 				if (error.code !== "ENOENT") throw error;
 			});
+			this.spooledBytes = Math.max(0, this.spooledBytes - size);
 		}
 	}
 
-	private async downloadOne(attachment: DiscordInboundAttachment): Promise<QueuedInboundImage> {
-		if (!/^\d{1,25}$/.test(attachment.id)) throw rejected("invalid attachment ID");
-		const mimeType = normalizedMimeType(attachment.contentType);
-		if (!isInboundImageMimeType(mimeType)) throw rejected("unsupported MIME type");
-		if (!Number.isSafeInteger(attachment.size) || attachment.size <= 0 || attachment.size > MAX_INBOUND_IMAGE_BYTES) {
-			throw rejected(`declared size must be 1-${MAX_INBOUND_IMAGE_BYTES} bytes`);
-		}
+	private async downloadOne(
+		attachment: DiscordInboundAttachment & { mimeType: InboundImageMimeType },
+	): Promise<QueuedInboundImage> {
 		const url = assertAttachmentUrl(attachment.url);
 		let lastError: unknown;
 		for (let attempt = 1; attempt <= INBOUND_IMAGE_DOWNLOAD_ATTEMPTS; attempt++) {
 			try {
-				return await this.downloadAttempt(attachment.id, url, mimeType, attachment.size);
+				return await this.downloadAttempt(attachment.id, url, attachment.mimeType, attachment.size);
 			} catch (error) {
 				lastError = error;
-				if (!retryable(error) || attempt === INBOUND_IMAGE_DOWNLOAD_ATTEMPTS) throw error;
-				await delay(100 * 2 ** (attempt - 1));
+				if (error instanceof PermanentInboundImageError) throw error;
+				if (attempt < INBOUND_IMAGE_DOWNLOAD_ATTEMPTS) await delay(100 * 2 ** (attempt - 1));
 			}
 		}
-		throw lastError;
+		const detail = lastError instanceof Error ? lastError.message.slice(0, 120) : "unknown download failure";
+		throw new TransientInboundImageError(`Discord image download exhausted ${INBOUND_IMAGE_DOWNLOAD_ATTEMPTS} attempts: ${detail}`);
 	}
 
 	private async downloadAttempt(
@@ -186,19 +281,19 @@ export class InboundImageStore {
 			if (response.status !== 200 || response.redirected) {
 				await response.body?.cancel().catch(() => {});
 				if (response.status >= 500 || response.status === 429) throw new Error(`Discord image CDN returned ${response.status}`);
-				if ((response.status >= 300 && response.status < 400) || response.redirected) throw rejected("redirects are not allowed");
-				throw rejected(`Discord image CDN returned ${response.status}`);
+				if ((response.status >= 300 && response.status < 400) || response.redirected) throw permanent("redirects are not allowed");
+				throw permanent(`Discord image CDN returned ${response.status}`);
 			}
 			if (normalizedMimeType(response.headers.get("content-type")) !== mimeType) {
 				await response.body?.cancel().catch(() => {});
-				throw rejected("response MIME type does not match metadata");
+				throw permanent("response MIME type does not match metadata");
 			}
 			const contentLength = response.headers.get("content-length");
 			if (contentLength !== null && (!/^\d+$/.test(contentLength) || Number(contentLength) !== declaredSize)) {
 				await response.body?.cancel().catch(() => {});
-				throw rejected("response size does not match metadata");
+				throw permanent("response size does not match metadata");
 			}
-			if (!response.body) throw rejected("response body is missing");
+			if (!response.body) throw permanent("response body is missing");
 			handle = await open(temporary, "wx", 0o600);
 			const reader = response.body.getReader();
 			let size = 0;
@@ -210,7 +305,7 @@ export class InboundImageStore {
 				size += value.byteLength;
 				if (size > declaredSize || size > MAX_INBOUND_IMAGE_BYTES) {
 					await reader.cancel();
-					throw rejected("response exceeds declared or maximum size");
+					throw permanent("response exceeds declared or maximum size");
 				}
 				if (headerBytes < header.length) {
 					const copied = Math.min(header.length - headerBytes, value.byteLength);
@@ -219,17 +314,24 @@ export class InboundImageStore {
 				}
 				await handle.write(value);
 			}
-			if (size !== declaredSize) throw rejected("response size does not match metadata");
-			if (detectedMimeType(header.subarray(0, headerBytes)) !== mimeType) throw rejected("file signature does not match MIME type");
+			if (size !== declaredSize) throw permanent("response size does not match metadata");
+			if (detectedMimeType(header.subarray(0, headerBytes)) !== mimeType) throw permanent("file signature does not match MIME type");
 			await handle.close();
 			handle = undefined;
 			await rename(temporary, localPath);
+			this.spooledBytes += size;
 			return { attachmentId, localPath, mimeType, size };
 		} finally {
 			clearTimeout(timer);
 			await handle?.close().catch(() => {});
 			await unlink(temporary).catch(() => {});
 		}
+	}
+
+	private serialize<T>(operation: () => Promise<T>): Promise<T> {
+		const result = this.operation.then(operation, operation);
+		this.operation = result.then(() => {}, () => {});
+		return result;
 	}
 }
 
@@ -241,8 +343,11 @@ export async function loadInboundImages(
 	const lexicalRoot = resolve(directory);
 	const canonicalRoot = await realpath(lexicalRoot);
 	const result: NativeInboundImage[] = [];
+	let totalBytes = 0;
 	for (const image of images) {
 		if (!isQueuedInboundImage(image)) throw new Error("Discord inbound image metadata is invalid");
+		totalBytes += image.size;
+		if (totalBytes > MAX_INBOUND_MESSAGE_IMAGE_BYTES) throw new Error("Discord inbound image total exceeds the message byte limit");
 		const lexicalPath = resolve(image.localPath);
 		if (dirname(lexicalPath) !== lexicalRoot || !/^[0-9a-f-]{36}\.image$/.test(basename(lexicalPath))) {
 			throw new Error("Discord inbound image path is outside the relay image directory");

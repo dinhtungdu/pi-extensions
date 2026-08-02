@@ -310,6 +310,16 @@ export class LocalRelayHost {
 			this.write(state, { type: "inbound_acked", requestId: parsed.requestId, messageId: parsed.messageId });
 			return;
 		}
+		if (parsed.type === "release_inbound_images") {
+			try {
+				await this.options.core.releaseInboundImages(clientId, generation, sessionId, parsed.messageId);
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
+				return;
+			}
+			this.write(state, { type: "inbound_images_released", requestId: parsed.requestId, messageId: parsed.messageId });
+			return;
+		}
 		if (parsed.type === "lifecycle") {
 			this.options.core.queueLifecycleUpdate(clientId, generation, sessionId, parsed.messageId, parsed.status);
 			return;

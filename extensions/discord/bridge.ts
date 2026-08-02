@@ -2,7 +2,12 @@ import type { DiscordBridgeConfig } from "./config.js";
 import { LocalRelayClient, type RelayClientDependencies, type RelayClientStatus } from "./relay-client.js";
 import { assistantText } from "./text.js";
 import type { PiModelCatalogueEntry, PiSessionControlRequest, PiSessionControlResult } from "./controls.js";
-import { loadInboundImages, type NativeInboundImage, type QueuedInboundImage } from "./inbound-images.js";
+import {
+	appendImageCapabilityWarning,
+	loadInboundImages,
+	type NativeInboundImage,
+	type QueuedInboundImage,
+} from "./inbound-images.js";
 
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
@@ -19,6 +24,7 @@ export interface BridgeCallbacks {
 	onUserMessage(content: string | ({ type: "text"; text: string } | NativeInboundImage)[]): void;
 	onError(error: Error): void;
 	onStatus(status: BridgeStatus): void;
+	supportsImageInput?(): boolean;
 	modelCatalogue?(): PiModelCatalogueEntry[];
 	onControl?(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
 }
@@ -55,7 +61,9 @@ export class DiscordBridge {
 	private finalAssistantText: string | undefined;
 	private readonly submittedInboundIds = new Set<string>();
 	private readonly acceptedInboundIds = new Set<string>();
+	private readonly restoredImageInboundIds = new Set<string>();
 	private readonly runInboundIds = new Set<string>();
+	private readonly imageInboundIds = new Set<string>();
 	private initialInboundId: string | undefined;
 	private activeInboundId: string | undefined;
 	private terminalRunFailed = false;
@@ -82,12 +90,18 @@ export class DiscordBridge {
 
 	async start(): Promise<BridgeStatus> {
 		await this.relay.start();
+		for (const messageId of this.restoredImageInboundIds) {
+			await this.acknowledgeAndRelease(messageId, true);
+		}
+		this.restoredImageInboundIds.clear();
 		return this.status();
 	}
 
 	async stop(): Promise<void> {
 		this.finalAssistantText = undefined;
 		this.resetAgentRun();
+		this.imageInboundIds.clear();
+		this.restoredImageInboundIds.clear();
 		await this.relay.stop();
 	}
 
@@ -108,8 +122,16 @@ export class DiscordBridge {
 		else await this.relay.sendUserText(text);
 	}
 
-	restoreAcceptedInbound(messageIds: Iterable<string>): void {
-		for (const id of messageIds) this.acceptedInboundIds.add(id);
+	restoreAcceptedInbound(messages: Iterable<string | { messageId: string; hasImages: boolean }>): void {
+		for (const message of messages) {
+			const messageId = typeof message === "string" ? message : message.messageId;
+			this.acceptedInboundIds.add(messageId);
+			if (typeof message !== "string" && message.hasImages) this.restoredImageInboundIds.add(messageId);
+		}
+	}
+
+	hasInboundImages(messageId: string): boolean {
+		return this.imageInboundIds.has(messageId);
 	}
 
 	async confirmInboundAccepted(messageId: string): Promise<void> {
@@ -144,10 +166,15 @@ export class DiscordBridge {
 		this.terminalRunFailed = aborted || lastAssistant?.stopReason === "aborted" || lastAssistant?.stopReason === "error";
 	}
 
-	settleAgentRun(): void {
+	async settleAgentRun(): Promise<void> {
 		const status = this.terminalRunFailed ? "failed" : "succeeded";
-		for (const messageId of this.runInboundIds) this.relay.updateLifecycle(messageId, status);
+		const messageIds = [...this.runInboundIds];
+		for (const messageId of messageIds) this.relay.updateLifecycle(messageId, status);
 		this.resetAgentRun();
+		await Promise.all(messageIds.filter((messageId) => this.imageInboundIds.has(messageId)).map(async (messageId) => {
+			await this.relay.releaseInboundImages(messageId);
+			this.imageInboundIds.delete(messageId);
+		}));
 	}
 
 	captureAssistantMessage(message: { role?: string; content?: unknown; stopReason?: string }): void {
@@ -175,26 +202,39 @@ export class DiscordBridge {
 		this.terminalRunFailed = false;
 	}
 
+	private async acknowledgeAndRelease(messageId: string, releaseImages: boolean): Promise<void> {
+		await this.relay.acknowledgeInbound(messageId);
+		if (releaseImages) {
+			await this.relay.releaseInboundImages(messageId);
+			this.imageInboundIds.delete(messageId);
+		}
+	}
+
 	private async receiveInbound(
 		messageId: string,
 		text: string,
 		images: readonly QueuedInboundImage[],
 	): Promise<void> {
 		if (this.acceptedInboundIds.has(messageId)) {
-			await this.relay.acknowledgeInbound(messageId);
+			if (images.length > 0) this.imageInboundIds.add(messageId);
+			void this.acknowledgeAndRelease(messageId, images.length > 0).catch(this.callbacks.onError);
 			return;
 		}
 		if (this.submittedInboundIds.has(messageId)) return;
 		this.submittedInboundIds.add(messageId);
+		if (images.length > 0) this.imageInboundIds.add(messageId);
 		try {
 			const markedText = `${markerFor(messageId)}${text}`;
 			if (images.length === 0) this.callbacks.onUserMessage(markedText);
-			else {
+			else if (this.callbacks.supportsImageInput?.() !== true) {
+				this.callbacks.onUserMessage(appendImageCapabilityWarning(markedText));
+			} else {
 				const nativeImages = await loadInboundImages(this.dependencies.paths.attachments, images);
 				this.callbacks.onUserMessage([{ type: "text", text: markedText }, ...nativeImages]);
 			}
 		} catch (error) {
 			this.submittedInboundIds.delete(messageId);
+			this.imageInboundIds.delete(messageId);
 			throw error;
 		}
 	}

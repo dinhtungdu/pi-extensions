@@ -11,7 +11,11 @@ import { lifecycleReaction, type DiscordLifecycleStatus } from "./reactions.js";
 import { resolveProjectIdentity } from "./project-identity.js";
 import { normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
 import type { DiscordInboundMessage, DiscordTransport } from "./transport.js";
-import { InboundImageStore } from "./inbound-images.js";
+import {
+	appendInboundImageContext,
+	InboundImageStore,
+	TransientInboundImageError,
+} from "./inbound-images.js";
 import {
 	boundedControlResult,
 	isPiThinkingLevel,
@@ -57,6 +61,8 @@ const MAX_PENDING_LIFECYCLE_UPDATES = 256;
 const MAX_DESIRED_REACTIONS = 2_000;
 const SUMMARY_RETRY_MIN_MS = 250;
 const SUMMARY_RETRY_MAX_MS = 30_000;
+const INBOUND_RETRY_MIN_MS = 1_000;
+const INBOUND_RETRY_MAX_MS = 30_000;
 
 async function boundedReaction(operation: Promise<void>): Promise<boolean> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -93,6 +99,8 @@ export class DiscordRelayCore {
 	private outboundDrainRequested = false;
 	private readonly outboundRetryAttempts = new Map<string, number>();
 	private readonly outboundRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly inboundRetryAttempts = new Map<string, number>();
+	private readonly inboundRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly pendingLifecycleUpdates: Array<{ sessionId: string; messageId: string; status: DiscordLifecycleStatus }> = [];
 	private readonly reactionQueues = new Map<string, Promise<void>>();
 	private readonly queuedReactionStatuses = new Map<string, DiscordLifecycleStatus>();
@@ -155,6 +163,9 @@ export class DiscordRelayCore {
 		for (const timer of this.outboundRetryTimers.values()) clearTimeout(timer);
 		this.outboundRetryTimers.clear();
 		this.outboundRetryAttempts.clear();
+		for (const timer of this.inboundRetryTimers.values()) clearTimeout(timer);
+		this.inboundRetryTimers.clear();
+		this.inboundRetryAttempts.clear();
 		this.pendingLifecycleUpdates.length = 0;
 		this.reactionQueues.clear();
 		this.queuedReactionStatuses.clear();
@@ -204,7 +215,6 @@ export class DiscordRelayCore {
 			this.inboundQueue = catchUp.catch(() => {});
 			await catchUp;
 			this.catchingUpSessions.delete(registration.sessionId);
-			this.inboundCursorBlockedSessions.delete(registration.sessionId);
 			return { channelId, threadId: mapping.threadId };
 		} catch (error) {
 			this.catchingUpSessions.delete(registration.sessionId);
@@ -256,6 +266,7 @@ export class DiscordRelayCore {
 		for (const message of pending) {
 			if (!this.deliverMessage(active, message)) break;
 		}
+		if (this.inboundCursorBlockedSessions.has(sessionId)) this.scheduleInboundRetry(sessionId);
 		void this.drainOutbound().catch(this.onTerminalError);
 	}
 
@@ -269,6 +280,7 @@ export class DiscordRelayCore {
 				this.activeSessions.delete(sessionId);
 				if (this.activeThreadSessions.get(active.threadId) === sessionId) this.activeThreadSessions.delete(active.threadId);
 				this.clearOutboundRetry(sessionId);
+				this.cancelInboundRetry(sessionId);
 			}
 		}
 		if (![...this.activeSessions.values()].some((active) => active.clientId === clientId)) this.clientSessions.delete(clientId);
@@ -358,7 +370,12 @@ export class DiscordRelayCore {
 
 	async acknowledge(clientId: string, generation: string, sessionId: string, messageId: string): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
-		const paths = await this.state.acknowledgeMessage(sessionId, messageId);
+		await this.state.acknowledgeMessage(sessionId, messageId);
+	}
+
+	async releaseInboundImages(clientId: string, generation: string, sessionId: string, messageId: string): Promise<void> {
+		this.assertClientSession(clientId, generation, sessionId);
+		const paths = await this.state.releaseMessageImages(sessionId, messageId);
 		await this.imageStore?.remove(paths).catch(() => {});
 	}
 
@@ -607,9 +624,53 @@ export class DiscordRelayCore {
 		this.outboundRetryAttempts.delete(sessionId);
 	}
 
+	private scheduleInboundRetry(sessionId: string): void {
+		if (!this.started || !this.activeSessions.has(sessionId) || this.inboundRetryTimers.has(sessionId)) return;
+		const attempt = (this.inboundRetryAttempts.get(sessionId) ?? 0) + 1;
+		this.inboundRetryAttempts.set(sessionId, attempt);
+		const delay = Math.min(INBOUND_RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 5), INBOUND_RETRY_MAX_MS);
+		const timer = setTimeout(() => {
+			this.inboundRetryTimers.delete(sessionId);
+			this.inboundQueue = this.inboundQueue
+				.then(() => this.retryInbound(sessionId))
+				.catch(() => this.scheduleInboundRetry(sessionId));
+		}, delay);
+		timer.unref();
+		this.inboundRetryTimers.set(sessionId, timer);
+	}
+
+	private async retryInbound(sessionId: string): Promise<void> {
+		if (!this.started || !this.activeSessions.has(sessionId)) return;
+		const mapping = await this.state.getSession(sessionId);
+		if (!mapping) return;
+		await this.catchUp(sessionId, mapping);
+		await this.resumeDelivery(sessionId);
+		if (this.inboundCursorBlockedSessions.has(sessionId)) this.scheduleInboundRetry(sessionId);
+	}
+
+	private cancelInboundRetry(sessionId: string): void {
+		const timer = this.inboundRetryTimers.get(sessionId);
+		if (timer) clearTimeout(timer);
+		this.inboundRetryTimers.delete(sessionId);
+		this.inboundRetryAttempts.delete(sessionId);
+	}
+
+	private clearInboundRetry(sessionId: string): void {
+		this.cancelInboundRetry(sessionId);
+		this.inboundCursorBlockedSessions.delete(sessionId);
+	}
+
 	private async catchUp(sessionId: string, mapping: SessionThreadMapping): Promise<void> {
+		const wasBlocked = this.inboundCursorBlockedSessions.has(sessionId);
 		const missed = await this.transport.fetchMessagesAfter(mapping.threadId, mapping.threadCursors[mapping.threadId]);
-		for (const message of missed) await this.recordMessage(sessionId, message, false, true);
+		let complete = true;
+		for (const message of missed) {
+			if (!await this.recordMessage(sessionId, message, false, true)) {
+				complete = false;
+				break;
+			}
+		}
+		if (complete && (!wasBlocked || missed.length > 0)) this.clearInboundRetry(sessionId);
 	}
 
 	private async receiveDiscordMessage(message: DiscordInboundMessage): Promise<void> {
@@ -627,27 +688,36 @@ export class DiscordRelayCore {
 		message: DiscordInboundMessage,
 		deliver: boolean,
 		advanceCursor = !this.catchingUpSessions.has(sessionId) && !this.inboundCursorBlockedSessions.has(sessionId),
-	): Promise<void> {
+	): Promise<boolean> {
+		if (await this.state.hasRecordedMessage(message.id)) {
+			await this.state.recordDiscordMessage(sessionId, message, advanceCursor);
+			return true;
+		}
 		let imagePaths: string[] = [];
 		try {
-			const images = !message.authorBot && message.attachments?.length
-				? await this.requireImageStore().download(message.attachments)
-				: [];
-			imagePaths = images.map((image) => image.localPath);
+			const preparation = !message.authorBot && message.attachments?.length
+				? await this.requireImageStore().prepare(message.attachments)
+				: { images: [], warnings: [] };
+			imagePaths = preparation.images.map((image) => image.localPath);
+			const content = appendInboundImageContext(message.content, preparation.images, preparation.warnings);
 			const result = await this.state.recordDiscordMessage(
 				sessionId,
-				{ ...message, ...(images.length ? { images } : {}) },
+				{ ...message, content, ...(preparation.images.length ? { images: preparation.images } : {}) },
 				advanceCursor,
 			);
 			if (!result.queued) await this.imageStore?.remove(imagePaths);
 			if (result.lifecycle) this.scheduleReaction(result.lifecycle);
-			if (!result.queued || !result.message || !deliver) return;
-			const active = this.activeSessions.get(sessionId);
-			if (active) this.deliverMessage(active, result.message);
+			if (result.queued && result.message && deliver) {
+				const active = this.activeSessions.get(sessionId);
+				if (active) this.deliverMessage(active, result.message);
+			}
+			return true;
 		} catch (error) {
-			if (advanceCursor) this.inboundCursorBlockedSessions.add(sessionId);
 			await this.imageStore?.remove(imagePaths).catch(() => {});
-			throw error;
+			if (!(error instanceof TransientInboundImageError)) throw error;
+			this.inboundCursorBlockedSessions.add(sessionId);
+			this.scheduleInboundRetry(sessionId);
+			return false;
 		}
 	}
 

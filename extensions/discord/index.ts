@@ -224,6 +224,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 						);
 						if (status.connected) publishTaskSummary(ctx);
 					},
+					supportsImageInput: () => ctx.model?.input?.includes("image") === true,
 					modelCatalogue: () => modelCatalogue(ctx),
 					onControl: (request) => executeSessionControl(request, ctx),
 				},
@@ -234,11 +235,12 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					...(dependencies.restartRelay ? { restartRelay: dependencies.restartRelay } : {}),
 				},
 			);
-			const acceptedIds = ctx.sessionManager.getBranch()
+			const acceptedMessages = ctx.sessionManager.getBranch()
 				.filter((entry) => entry.type === "custom" && entry.customType === ACCEPTED_INBOUND_ENTRY)
-				.map((entry) => (entry as { data?: { messageId?: unknown } }).data?.messageId)
-				.filter((id): id is string => typeof id === "string");
-			candidate.restoreAcceptedInbound(acceptedIds);
+				.map((entry) => (entry as { data?: { messageId?: unknown; hasImages?: unknown } }).data)
+				.filter((data): data is { messageId: string; hasImages?: unknown } => typeof data?.messageId === "string")
+				.map((data) => ({ messageId: data.messageId, hasImages: data.hasImages === true }));
+			candidate.restoreAcceptedInbound(acceptedMessages);
 			try {
 				bridge = candidate;
 				await candidate.start();
@@ -382,10 +384,11 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			const messageId = inboundMessageId(text);
 			if (!messageId) return;
 			const acceptingBridge = bridge;
+			const hasImages = acceptingBridge.hasInboundImages(messageId);
 			// Pi 0.83 persists the user message immediately after message_end handlers return.
 			const timer = setTimeout(() => {
 				inboundAcceptanceTimers.delete(timer);
-				pi.appendEntry(ACCEPTED_INBOUND_ENTRY, { messageId });
+				pi.appendEntry(ACCEPTED_INBOUND_ENTRY, { messageId, hasImages });
 				void acceptingBridge.confirmInboundAccepted(messageId).catch((error) => {
 					ctx.ui.notify(`Discord inbound acknowledgement deferred: ${errorMessage(error)}`, "warning");
 				});
@@ -394,7 +397,11 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		});
 
 		pi.on("agent_settled", async (_event, ctx) => {
-			bridge?.settleAgentRun();
+			try {
+				await bridge?.settleAgentRun();
+			} catch (error) {
+				ctx.ui.notify(`Discord settled-image cleanup deferred: ${errorMessage(error)}`, "warning");
+			}
 			try {
 				await bridge?.flushSettledAssistant();
 			} catch (error) {

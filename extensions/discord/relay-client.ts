@@ -199,6 +199,10 @@ export class LocalRelayClient {
 		await this.sendRequest({ type: "ack_inbound", requestId: randomUUID(), messageId }, ACK_TIMEOUT_MS);
 	}
 
+	async releaseInboundImages(messageId: string): Promise<void> {
+		await this.sendRequest({ type: "release_inbound_images", requestId: randomUUID(), messageId }, ACK_TIMEOUT_MS);
+	}
+
 	updateLifecycle(messageId: string, status: DiscordLifecycleStatus): void {
 		if (this.stopped) return;
 		const existing = this.desiredLifecycleStatuses.get(messageId);
@@ -420,7 +424,8 @@ export class LocalRelayClient {
 			waiter.reject(new Error(`Local Discord relay is replacing configuration with epoch ${frame.configEpoch}`));
 			return;
 		}
-		if (frame.type === "inbound_acked" || frame.type === "outbound_queued" || frame.type === "project_summary_queued") {
+		if (frame.type === "inbound_acked" || frame.type === "inbound_images_released" ||
+			frame.type === "outbound_queued" || frame.type === "project_summary_queued") {
 			const pending = this.pendingRequests.get(frame.requestId);
 			if (pending) {
 				clearTimeout(pending.timer);
