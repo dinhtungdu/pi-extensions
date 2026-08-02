@@ -385,6 +385,7 @@ try {
 	const {
 		assertConfiguredCategory,
 		collectChronologicalMessages,
+		DiscordJsTransport,
 		managerCommandDefinition,
 		replaceOwnLifecycleReaction,
 		reuseSessionThread,
@@ -553,6 +554,49 @@ try {
 	assert.equal(JSON.stringify(managerDefinition).includes("project"), false, "/manager must not expose a project option");
 	assert.equal(JSON.stringify(managerDefinition).includes('"ask"'), false, "/manager must not expose ask");
 	assert.equal(JSON.stringify(managerDefinition).includes('"status"'), false, "/manager must not expose status");
+	const timerTransport = new DiscordJsTransport();
+	let timerRequest;
+	timerTransport.onManagerControl(async (request) => {
+		timerRequest = request;
+		return { ok: true, message: "settled" };
+	});
+	const managerInteractionReplies = [];
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	const managerInteractionTimer = { unref() {} };
+	let clearedManagerInteractionTimer;
+	try {
+		globalThis.setTimeout = (_callback, milliseconds) => {
+			assert.equal(milliseconds, 180_000);
+			return managerInteractionTimer;
+		};
+		globalThis.clearTimeout = (timer) => { clearedManagerInteractionTimer = timer; };
+		await timerTransport.executeManagerControlInteraction({
+			id: "timer-manager-control",
+			channelId: "timer-manager-thread",
+			async deferReply() {},
+			options: {
+				getSubcommand: () => "handoff",
+				getString: (name, required) => {
+					assert.deepEqual([name, required], ["task", true]);
+					return "timer-task";
+				},
+			},
+			async editReply(reply) { managerInteractionReplies.push(reply); },
+		});
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+	}
+	assert.equal(clearedManagerInteractionTimer, managerInteractionTimer,
+		"the 180-second Discord interaction timer must clear when manager execution settles");
+	assert.deepEqual(timerRequest, {
+		requestId: "timer-manager-control",
+		channelId: "timer-manager-thread",
+		action: "handoff",
+		taskId: "timer-task",
+	});
+	assert.equal(managerInteractionReplies[0].content, "✅ settled");
 
 	let managerStatus = {
 		...focusedManagerStatus,
@@ -636,10 +680,36 @@ try {
 				: { ok: true, command, task_id: taskId, archived: true, checkout_mode: "repository", slot_state: null, replay: false };
 		return { code: 0, stdout: `${JSON.stringify(output)}\n`, stderr: "" };
 	};
-	assert.equal(await ManagerControlExecutor.create(managerExecutorRoot, { run: managerRun, environment: { THE_MANAGER_ROLE: "worker" } }), undefined,
-		"worker sessions must never register as verified manager clients");
-	const managerExecutor = await ManagerControlExecutor.create(managerExecutorRoot, { run: managerRun, environment: {} });
-	assert.ok(managerExecutor, "manager controls require the canonical manager/runtime/project structure and successful runtime JSON");
+	const validManagerEnvironment = {
+		HERDR_ENV: "1",
+		THE_MANAGER_ROLE: "manager",
+		HERDR_WORKSPACE_ID: "w-manager",
+		HERDR_PANE_ID: "w-manager:p1",
+		HERDR_SOCKET_PATH: "/tmp/herdr.sock",
+	};
+	const invalidManagerEnvironments = [
+		["missing HERDR_ENV", { ...validManagerEnvironment, HERDR_ENV: undefined }],
+		["wrong HERDR_ENV", { ...validManagerEnvironment, HERDR_ENV: "true" }],
+		["worker role", { ...validManagerEnvironment, THE_MANAGER_ROLE: "worker" }],
+		["missing workspace", { ...validManagerEnvironment, HERDR_WORKSPACE_ID: undefined }],
+		["invalid workspace", { ...validManagerEnvironment, HERDR_WORKSPACE_ID: "bad workspace" }],
+		["missing pane", { ...validManagerEnvironment, HERDR_PANE_ID: undefined }],
+		["invalid pane", { ...validManagerEnvironment, HERDR_PANE_ID: "bad/pane" }],
+		["missing socket", { ...validManagerEnvironment, HERDR_SOCKET_PATH: undefined }],
+		["relative socket", { ...validManagerEnvironment, HERDR_SOCKET_PATH: "relative/herdr.sock" }],
+	];
+	const callsBeforeEnvironmentChecks = managerProcessCalls.length;
+	for (const [description, environment] of invalidManagerEnvironments) {
+		assert.equal(await ManagerControlExecutor.create(managerExecutorRoot, { run: managerRun, environment }), undefined,
+			`${description} must not advertise manager controls`);
+	}
+	assert.equal(managerProcessCalls.length, callsBeforeEnvironmentChecks,
+		"unprotected manager environments must be rejected before runtime validation");
+	const managerExecutor = await ManagerControlExecutor.create(managerExecutorRoot, {
+		run: managerRun,
+		environment: validManagerEnvironment,
+	});
+	assert.ok(managerExecutor, "a protected non-worker Herdr environment plus canonical runtime validation must verify manager controls");
 	const executorCatalogue = [{ taskId: "safe-task", project: "pi-extensions", title: "Safe task", status: "ready" }];
 	for (const action of ["handoff", "takeback", "archive", "merge-and-archive"]) {
 		assert.equal((await managerExecutor.execute({ requestId: `executor-${action}`, action, taskId: "safe-task" }, executorCatalogue)).ok, true);
@@ -2094,13 +2164,16 @@ try {
 		sessionId: "manager-summary-session",
 		sessionName: "Manager",
 	});
-	const inheritedManagerRole = process.env.THE_MANAGER_ROLE;
-	delete process.env.THE_MANAGER_ROLE;
+	const managerEnvironmentKeys = Object.keys(validManagerEnvironment);
+	const inheritedManagerEnvironment = Object.fromEntries(managerEnvironmentKeys.map((key) => [key, process.env[key]]));
+	Object.assign(process.env, validManagerEnvironment);
 	try {
 		await managerSummarySession.emit("session_start", { reason: "startup" });
 	} finally {
-		if (inheritedManagerRole === undefined) delete process.env.THE_MANAGER_ROLE;
-		else process.env.THE_MANAGER_ROLE = inheritedManagerRole;
+		for (const key of managerEnvironmentKeys) {
+			if (inheritedManagerEnvironment[key] === undefined) delete process.env[key];
+			else process.env[key] = inheritedManagerEnvironment[key];
+		}
 	}
 	const managerSummaryMapping = await new DiscordStateStore(stateFile).getSession("manager-summary-session");
 	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text.includes("✅ **Pi Extensions** — Discord @\u200beveryone summary"),

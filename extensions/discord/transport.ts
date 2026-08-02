@@ -527,6 +527,7 @@ export class DiscordJsTransport implements DiscordTransport {
 			return;
 		}
 		let result: PiSessionControlResult;
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			const action = command.options.getSubcommand();
 			if (!(MANAGER_CONTROL_ACTIONS as readonly string[]).includes(action)) throw new Error("Unknown /manager subcommand");
@@ -541,13 +542,15 @@ export class DiscordJsTransport implements DiscordTransport {
 						taskId: command.options.getString("task", true),
 					}),
 					new Promise<PiSessionControlResult>((resolveResult) => {
-						const timer = setTimeout(() => resolveResult({ ok: false, message: "Manager control timed out." }), MANAGER_CONTROL_EXECUTION_TIMEOUT_MS);
+						timer = setTimeout(() => resolveResult({ ok: false, message: "Manager control timed out." }), MANAGER_CONTROL_EXECUTION_TIMEOUT_MS);
 						timer.unref();
 					}),
 				]);
 			}
 		} catch (error) {
 			result = { ok: false, message: error instanceof Error ? error.message : String(error) };
+		} finally {
+			if (timer) clearTimeout(timer);
 		}
 		const bounded = boundedControlResult(result);
 		await command.editReply({

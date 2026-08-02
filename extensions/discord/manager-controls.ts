@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
 	boundedControlResult,
 	type ManagerTaskCatalogueEntry,
@@ -11,6 +11,7 @@ import {
 const VALIDATE_TIMEOUT_MS = 30_000;
 const CONTROL_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 1_048_576;
+const HERDR_LOCATOR = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/;
 
 export interface ManagerProcessResult {
 	code: number;
@@ -66,6 +67,14 @@ function failureMessage(result: ManagerProcessResult, fallback: string): string 
 	return (result.stderr.trim() || fallback).slice(0, 2_000);
 }
 
+function isProtectedManagerEnvironment(environment: NodeJS.ProcessEnv): boolean {
+	return environment.HERDR_ENV === "1" && environment.THE_MANAGER_ROLE !== "worker" &&
+		typeof environment.HERDR_WORKSPACE_ID === "string" && HERDR_LOCATOR.test(environment.HERDR_WORKSPACE_ID) &&
+		typeof environment.HERDR_PANE_ID === "string" && HERDR_LOCATOR.test(environment.HERDR_PANE_ID) &&
+		typeof environment.HERDR_SOCKET_PATH === "string" && !environment.HERDR_SOCKET_PATH.includes("\0") &&
+		isAbsolute(environment.HERDR_SOCKET_PATH);
+}
+
 export class ManagerControlExecutor {
 	private constructor(
 		private readonly root: string,
@@ -76,7 +85,7 @@ export class ManagerControlExecutor {
 		root: string,
 		dependencies: ManagerControlDependencies = {},
 	): Promise<ManagerControlExecutor | undefined> {
-		if ((dependencies.environment ?? process.env).THE_MANAGER_ROLE === "worker") return undefined;
+		if (!isProtectedManagerEnvironment(dependencies.environment ?? process.env)) return undefined;
 		const canonicalRoot = resolve(root);
 		const manager = join(canonicalRoot, "bin", "manager.mjs");
 		const runtime = join(canonicalRoot, "bin", "manager-runtime.mjs");
