@@ -16,6 +16,13 @@ import { resolveProjectContext } from "./project-identity.js";
 import { discoverTaskTitle } from "./task-title.js";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
+import {
+	MAX_MODEL_CATALOGUE_ITEMS,
+	modelChoiceValue,
+	type PiModelCatalogueEntry,
+	type PiSessionControlRequest,
+	type PiSessionControlResult,
+} from "./controls.js";
 
 const STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.discord;
 const STATUS_CONNECTED = "💬";
@@ -64,6 +71,66 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		let taskSummaryPublishRequested = false;
 		let operation: Promise<void> = Promise.resolve();
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
+
+		function modelCatalogue(ctx: ExtensionContext): PiModelCatalogueEntry[] {
+			const scoped = ctx.scopedModels.length > 0 ? ctx.scopedModels.map((entry) => entry.model) : ctx.modelRegistry.getAvailable();
+			const models = ctx.model ? [ctx.model, ...scoped] : scoped;
+			const seen = new Set<string>();
+			const catalogue: PiModelCatalogueEntry[] = [];
+			for (const model of models) {
+				const entry = { provider: model.provider, id: model.id, name: model.name || model.id };
+				const key = `${entry.provider}\0${entry.id}`;
+				if (seen.has(key) || entry.provider.length > 100 || entry.id.length > 200 || entry.name.length > 200 || modelChoiceValue(entry).length > 100) continue;
+				seen.add(key);
+				catalogue.push(entry);
+				if (catalogue.length >= MAX_MODEL_CATALOGUE_ITEMS) break;
+			}
+			return catalogue;
+		}
+
+		async function executeSessionControl(
+			request: PiSessionControlRequest,
+			ctx: ExtensionContext,
+		): Promise<PiSessionControlResult> {
+			const action = request.action;
+			if (action.type === "status") {
+				const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
+				return {
+					ok: true,
+					message: [
+						`Pi session: ${ctx.isIdle() ? "idle" : "busy"}`,
+						`Model: ${model}`,
+						`Thinking: ${pi.getThinkingLevel()}`,
+						`Queued messages: ${ctx.hasPendingMessages() ? "yes" : "no"}`,
+					].join("\n"),
+				};
+			}
+			if (action.type === "model") {
+				if (!ctx.isIdle()) return { ok: false, message: "Model cannot change while Pi is busy." };
+				const model = ctx.modelRegistry.find(action.provider, action.modelId);
+				if (!model || !modelCatalogue(ctx).some((entry) => entry.provider === action.provider && entry.id === action.modelId)) {
+					return { ok: false, message: `Model is unavailable: ${action.provider}/${action.modelId}` };
+				}
+				if (!await pi.setModel(model)) return { ok: false, message: `No configured authentication for ${action.provider}/${action.modelId}.` };
+				return { ok: true, message: `Model set to ${action.provider}/${action.modelId}. This updates Pi's persisted default.` };
+			}
+			if (action.type === "thinking") {
+				if (!ctx.isIdle()) return { ok: false, message: "Thinking level cannot change while Pi is busy." };
+				pi.setThinkingLevel(action.level);
+				return { ok: true, message: `Thinking set to ${pi.getThinkingLevel()}. This updates Pi's persisted default.` };
+			}
+			if (action.type === "steer") {
+				pi.sendUserMessage(action.text, { deliverAs: "steer" });
+				return { ok: true, message: "Steering message queued." };
+			}
+			if (action.type === "followup") {
+				pi.sendUserMessage(action.text, { deliverAs: "followUp" });
+				return { ok: true, message: "Follow-up message queued." };
+			}
+			if (ctx.isIdle()) return { ok: false, message: "Pi is idle; there is no active turn to abort." };
+			ctx.abort();
+			return { ok: true, message: "Abort requested; queued messages were not discarded." };
+		}
 
 		async function sessionFrom(ctx: ExtensionContext): Promise<{ session: BridgeSession; checkoutRoot: string }> {
 			const project = await resolveProjectContext(ctx.cwd);
@@ -157,6 +224,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 						);
 						if (status.connected) publishTaskSummary(ctx);
 					},
+					modelCatalogue: () => modelCatalogue(ctx),
+					onControl: (request) => executeSessionControl(request, ctx),
 				},
 				{
 					paths,

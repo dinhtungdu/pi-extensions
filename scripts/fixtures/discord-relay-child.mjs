@@ -30,6 +30,14 @@ class ChildFakeTransport {
 		return () => this.messageListeners.delete(listener);
 	}
 
+	onSessionControl() {
+		return () => {};
+	}
+
+	onModelAutocomplete() {
+		return () => {};
+	}
+
 	onTerminalError(listener) {
 		this.terminalListeners.add(listener);
 		return () => this.terminalListeners.delete(listener);

@@ -101,7 +101,7 @@ New thread names prefer the Pi session display name, then an explicit title from
 Bot setup:
 
 1. Enable the privileged Message Content intent in the Discord developer portal.
-2. Invite the bot with View Channels, Read Message History, Send Messages, Add Reactions, Create Public Threads, Manage Threads, and Manage Channels permissions.
+2. Invite the bot with the `bot` and `applications.commands` scopes plus View Channels, Read Message History, Send Messages, Add Reactions, Create Public Threads, Manage Threads, and Manage Channels permissions.
 3. Run `/discord setup`, or create `~/.pi/agent/discord-bridge/config.json`:
 
 ```json
@@ -117,6 +117,17 @@ Bot setup:
 Mappings, per-thread Discord cursors, pending inbound messages, ordered outbound messages, and recent IDs are stored in `~/.pi/agent/discord-bridge/state.json`. Relay ownership, its Unix socket/named pipe, effective-config authority, and a generated 256-bit IPC token live in the same mode-0700 directory; token and Unix socket are mode 0600. State and configuration writes are atomic and cross-process locked. Extension clients automatically launch a bundled child process that owns the sole gateway while any Pi client remains; no service installation or manual daemon is required. Environment overrides participate in the authoritative monotonic configuration epoch, so a changed effective configuration atomically replaces the child gateway and remains authoritative if the updating Pi process exits. The child exits after a bounded zero-client grace period. IPC queues are memory-bounded and respect socket backpressure. Inactive sessions receive queued messages when they register again. If every Pi process was closed, the next relay fetches messages after each registering session's durable cursor where Discord history APIs permit. Outbound chunks use Discord's enforced nonce deduplication, remain queued until Discord confirms them, retry transient failures with bounded backoff, and retarget safely when registration recreates a deleted thread.
 
 The bridge ignores bot messages and duplicate Discord IDs, and extension-injected Pi input is not echoed back. Each chunk of interactive Pi user input is mirrored unchanged between `──────────── 👨‍💻 ────────────` and `──────────────────────────────` divider lines; RPC/non-interactive input is mirrored without that frame. Discord messages received while Pi is active use Pi 0.83's normal `followUp` queue. For Discord-originated prompts, the bot replaces only its own lifecycle reaction: 👀 queued, 🤔 running, ⚙️ using tools, then ✅ settled or ❌ failed/aborted. Reaction failures do not block prompts or replies. Assistant text is sent only after `agent_settled`; thinking, tools, progress, attachments, and intermediate responses are not forwarded.
+
+The relay registers guild-scoped `/pi` controls for mapped session threads. Replies are ephemeral, controls are rejected for unmapped or offline sessions, and model autocomplete filters a bounded catalogue cached when the Pi client registers or reconnects. `/pi model` and `/pi thinking` are idle-only and use Pi's native APIs, so they also update Pi's persisted global defaults. `/pi abort` requests cancellation through Pi's queue-preserving abort API; it does not claim the turn already stopped.
+
+```text
+/pi status
+/pi model <model>
+/pi thinking <off|minimal|low|medium|high|xhigh|max>
+/pi steer <message>
+/pi followup <message>
+/pi abort
+```
 
 When Pi runs from a `the-manager` checkout, the extension watches canonical active-task and event changes and publishes one compact task snapshot from `manager status` in that project's parent channel. Normal Discord Markdown groups active, ready, and any additional statuses; task rows use canonical titles, with run details only under active tasks. A latest summary is edited in place. Once displaced, the old bot-owned summary is deleted before its replacement is sent. Desired text, message identity, and send nonce are durable across relay restarts; bounded backoff and nonce deduplication recover delete/send failures without blocking manager mutations or intentionally creating duplicate summaries. Producers submit text only—the relay always derives the project channel from the authenticated session registration.
 

@@ -11,6 +11,20 @@ import { lifecycleReaction, type DiscordLifecycleStatus } from "./reactions.js";
 import { resolveProjectIdentity } from "./project-identity.js";
 import { normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
 import type { DiscordInboundMessage, DiscordTransport } from "./transport.js";
+import {
+	boundedControlResult,
+	isPiThinkingLevel,
+	MAX_RECENT_SESSION_CONTROLS,
+	MAX_SESSION_CONTROL_QUEUE,
+	MAX_SESSION_CONTROL_TEXT_LENGTH,
+	modelAutocompleteChoices,
+	modelChoiceValue,
+	type DiscordModelChoice,
+	type DiscordSessionControlRequest,
+	type PiModelCatalogueEntry,
+	type PiSessionControlRequest,
+	type PiSessionControlResult,
+} from "./controls.js";
 
 export interface RelaySessionRegistration {
 	cwd: string;
@@ -27,8 +41,11 @@ export interface PreparedRegistration {
 interface ActiveSession {
 	clientId: string;
 	generation: string;
+	threadId: string;
 	deliver(message: QueuedDiscordMessage): boolean;
 	deliveredIds: Set<string>;
+	modelCatalogue: PiModelCatalogueEntry[];
+	executeControl?: (request: PiSessionControlRequest) => Promise<PiSessionControlResult>;
 }
 
 const OUTBOUND_RETRY_MIN_MS = 100;
@@ -58,9 +75,16 @@ export class DiscordRelayCore {
 	private readonly activeSessions = new Map<string, ActiveSession>();
 	private readonly reservedSessions = new Map<string, { clientId: string; generation: string }>();
 	private readonly clientSessions = new Map<string, Set<string>>();
+	private readonly activeThreadSessions = new Map<string, string>();
 	private readonly catchingUpSessions = new Set<string>();
 	private unsubscribe: (() => void) | undefined;
+	private unsubscribeControls: (() => void) | undefined;
+	private unsubscribeAutocomplete: (() => void) | undefined;
 	private unsubscribeTerminal: (() => void) | undefined;
+	private readonly controlQueues = new Map<string, Promise<void>>();
+	private readonly controlQueueDepths = new Map<string, number>();
+	private readonly inFlightControls = new Map<string, Promise<PiSessionControlResult>>();
+	private readonly completedControls = new Map<string, PiSessionControlResult>();
 	private inboundQueue: Promise<void> = Promise.resolve();
 	private drainingOutbound = false;
 	private outboundDrainRequested = false;
@@ -94,6 +118,10 @@ export class DiscordRelayCore {
 				.catch(() => {});
 			return this.inboundQueue;
 		});
+		this.unsubscribeControls = this.transport.onSessionControl((request) => this.executeDiscordControl(request));
+		this.unsubscribeAutocomplete = this.transport.onModelAutocomplete((channelId, prefix) => {
+			return this.modelAutocomplete(channelId, prefix);
+		});
 		this.started = true;
 		for (const { cwd } of await this.state.projectSummaries()) this.scheduleProjectSummaryReconciliation(cwd);
 	}
@@ -103,12 +131,21 @@ export class DiscordRelayCore {
 		this.started = false;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		this.unsubscribeControls?.();
+		this.unsubscribeControls = undefined;
+		this.unsubscribeAutocomplete?.();
+		this.unsubscribeAutocomplete = undefined;
 		this.unsubscribeTerminal?.();
 		this.unsubscribeTerminal = undefined;
 		await this.inboundQueue;
 		this.activeSessions.clear();
+		this.activeThreadSessions.clear();
 		this.reservedSessions.clear();
 		this.clientSessions.clear();
+		this.controlQueues.clear();
+		this.controlQueueDepths.clear();
+		this.inFlightControls.clear();
+		this.completedControls.clear();
 		for (const timer of this.outboundRetryTimers.values()) clearTimeout(timer);
 		this.outboundRetryTimers.clear();
 		this.outboundRetryAttempts.clear();
@@ -174,6 +211,10 @@ export class DiscordRelayCore {
 		generation: string,
 		sessionId: string,
 		deliver: (message: QueuedDiscordMessage) => boolean,
+		controls?: {
+			modelCatalogue: PiModelCatalogueEntry[];
+			execute(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
+		},
 	): Promise<void> {
 		const reserved = this.reservedSessions.get(sessionId);
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
@@ -186,8 +227,19 @@ export class DiscordRelayCore {
 			if (lifecycle) this.scheduleReaction(lifecycle);
 		}
 		this.reservedSessions.delete(sessionId);
-		const active: ActiveSession = { clientId, generation, deliver, deliveredIds: new Set() };
+		const active: ActiveSession = {
+			clientId,
+			generation,
+			threadId: mapping!.threadId,
+			deliver,
+			deliveredIds: new Set(),
+			modelCatalogue: controls?.modelCatalogue.map((model) => ({ ...model })) ?? [],
+			...(controls ? { executeControl: controls.execute } : {}),
+		};
+		const replaced = this.activeSessions.get(sessionId);
+		if (replaced && this.activeThreadSessions.get(replaced.threadId) === sessionId) this.activeThreadSessions.delete(replaced.threadId);
 		this.activeSessions.set(sessionId, active);
+		this.activeThreadSessions.set(active.threadId, sessionId);
 		const sessions = this.clientSessions.get(clientId) ?? new Set<string>();
 		sessions.add(sessionId);
 		this.clientSessions.set(clientId, sessions);
@@ -205,10 +257,85 @@ export class DiscordRelayCore {
 			const active = this.activeSessions.get(sessionId);
 			if (active?.clientId === clientId && active.generation === generation) {
 				this.activeSessions.delete(sessionId);
+				if (this.activeThreadSessions.get(active.threadId) === sessionId) this.activeThreadSessions.delete(active.threadId);
 				this.clearOutboundRetry(sessionId);
 			}
 		}
 		if (![...this.activeSessions.values()].some((active) => active.clientId === clientId)) this.clientSessions.delete(clientId);
+	}
+
+	modelAutocomplete(channelId: string, prefix: string): DiscordModelChoice[] {
+		const sessionId = this.activeThreadSessions.get(channelId);
+		const active = sessionId ? this.activeSessions.get(sessionId) : undefined;
+		return active?.executeControl ? modelAutocompleteChoices(active.modelCatalogue, prefix) : [];
+	}
+
+	async executeDiscordControl(request: DiscordSessionControlRequest): Promise<PiSessionControlResult> {
+		const sessionId = this.activeThreadSessions.get(request.channelId);
+		if (!sessionId) {
+			const mapped = await this.state.findSessionByThread(request.channelId);
+			return mapped
+				? { ok: false, message: "The Pi session mapped to this thread is offline." }
+				: { ok: false, message: "This Discord thread is not mapped to a Pi session." };
+		}
+		const active = this.activeSessions.get(sessionId);
+		if (!active?.executeControl) return { ok: false, message: "The live Pi client does not support session controls; reconnect or reload it." };
+
+		let action: PiSessionControlRequest["action"];
+		if (request.action.type === "model") {
+			const requestedModel = request.action.value;
+			const model = active.modelCatalogue.find((candidate) => modelChoiceValue(candidate) === requestedModel);
+			if (!model) return { ok: false, message: "Select a model from this session's current autocomplete catalogue." };
+			action = { type: "model", provider: model.provider, modelId: model.id };
+		} else if (request.action.type === "thinking") {
+			if (!isPiThinkingLevel(request.action.level)) return { ok: false, message: "Invalid Pi thinking level." };
+			action = { type: "thinking", level: request.action.level };
+		} else if (request.action.type === "steer" || request.action.type === "followup") {
+			if (!request.action.text || request.action.text.length > MAX_SESSION_CONTROL_TEXT_LENGTH) {
+				return { ok: false, message: "Pi session control messages must contain 1-2000 characters." };
+			}
+			action = request.action;
+		} else action = request.action;
+
+		const control = { requestId: request.requestId, action };
+		const mutating = action.type !== "status";
+		if (mutating) {
+			const completed = this.completedControls.get(request.requestId);
+			if (completed) return { ...completed };
+			const inFlight = this.inFlightControls.get(request.requestId);
+			if (inFlight) return inFlight;
+		}
+		const depth = this.controlQueueDepths.get(sessionId) ?? 0;
+		if (depth >= MAX_SESSION_CONTROL_QUEUE) return { ok: false, message: "Pi session control queue is full; retry later." };
+		this.controlQueueDepths.set(sessionId, depth + 1);
+		const previous = this.controlQueues.get(sessionId) ?? Promise.resolve();
+		const execution = previous.catch(() => {}).then(async () => {
+			if (this.activeSessions.get(sessionId) !== active || !active.executeControl) {
+				return { ok: false, message: "The Pi session disconnected before this control executed." };
+			}
+			try {
+				return boundedControlResult(await active.executeControl(control));
+			} catch (error) {
+				return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
+			}
+		});
+		const tail = execution.then(() => {});
+		this.controlQueues.set(sessionId, tail);
+		if (mutating) this.inFlightControls.set(request.requestId, execution);
+		return execution.then((result) => {
+			if (mutating) {
+				this.completedControls.set(request.requestId, result);
+				while (this.completedControls.size > MAX_RECENT_SESSION_CONTROLS) {
+					this.completedControls.delete(this.completedControls.keys().next().value!);
+				}
+			}
+			return result;
+		}).finally(() => {
+			this.controlQueueDepths.set(sessionId, Math.max(0, (this.controlQueueDepths.get(sessionId) ?? 1) - 1));
+			if (this.controlQueueDepths.get(sessionId) === 0) this.controlQueueDepths.delete(sessionId);
+			if (this.controlQueues.get(sessionId) === tail) this.controlQueues.delete(sessionId);
+			if (mutating && this.inFlightControls.get(request.requestId) === execution) this.inFlightControls.delete(request.requestId);
+		});
 	}
 
 	async resumeDelivery(sessionId: string): Promise<void> {

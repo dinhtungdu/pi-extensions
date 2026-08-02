@@ -2,21 +2,46 @@ import { createHash } from "node:crypto";
 import type { DiscordBridgeConfig } from "./config.js";
 import type { RelaySessionRegistration } from "./relay-core.js";
 import type { DiscordLifecycleStatus } from "./reactions.js";
+import {
+	isPiModelCatalogue,
+	isPiSessionControlAction,
+	type PiModelCatalogueEntry,
+	type PiSessionControlAction,
+} from "./controls.js";
 
 export const MAX_IPC_FRAME_BYTES = 1_048_576;
 
 export type ClientFrame =
-	| ({ type: "register"; token: string; clientId: string; generation: string; configFingerprint: string; configEpoch: number } & RelaySessionRegistration)
+	| ({
+		type: "register";
+		token: string;
+		clientId: string;
+		generation: string;
+		configFingerprint: string;
+		configEpoch: number;
+		sessionControls?: { modelCatalogue: PiModelCatalogueEntry[] };
+	} & RelaySessionRegistration)
 	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
 	| { type: "project_summary"; requestId: string; text: string }
 	| { type: "ack_inbound"; requestId: string; messageId: string }
 	| { type: "lifecycle"; messageId: string; status: DiscordLifecycleStatus }
+	| { type: "control_result"; requestId: string; ok: boolean; message: string }
 	| { type: "unregister" }
 	| { type: "ping" };
 
 export type ServerFrame =
-	| { type: "registered"; channelId: string; threadId: string; leaderPid: number; leaderNonce?: string; lifecycleReactions?: true; projectSummaries?: true }
+	| {
+		type: "registered";
+		channelId: string;
+		threadId: string;
+		leaderPid: number;
+		leaderNonce?: string;
+		lifecycleReactions?: true;
+		projectSummaries?: true;
+		sessionControls?: true;
+	}
 	| { type: "inbound"; messageId: string; text: string }
+	| { type: "control"; requestId: string; action: PiSessionControlAction }
 	| { type: "inbound_acked"; requestId: string; messageId: string }
 	| { type: "outbound_queued"; requestId: string; messageId: string }
 	| { type: "project_summary_queued"; requestId: string }
@@ -48,7 +73,11 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(key) => typeof frame[key] === "string",
 		) && typeof frame.configEpoch === "number" &&
 			(frame.projectIdentityResolved === undefined || typeof frame.projectIdentityResolved === "boolean") &&
-			(frame.sessionName === undefined || typeof frame.sessionName === "string");
+			(frame.sessionName === undefined || typeof frame.sessionName === "string") &&
+			(frame.sessionControls === undefined || (
+				Boolean(frame.sessionControls) && typeof frame.sessionControls === "object" && !Array.isArray(frame.sessionControls) &&
+				isPiModelCatalogue((frame.sessionControls as Record<string, unknown>).modelCatalogue)
+			));
 	}
 	if (frame.type === "outbound") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string" && typeof frame.text === "string" &&
@@ -63,6 +92,10 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(frame.status === "accepted" || frame.status === "thinking" || frame.status === "tool" ||
 				frame.status === "succeeded" || frame.status === "failed");
 	}
+	if (frame.type === "control_result") {
+		return typeof frame.requestId === "string" && typeof frame.ok === "boolean" &&
+			typeof frame.message === "string" && frame.message.length <= 2_000;
+	}
 	return frame.type === "unregister" || frame.type === "ping";
 }
 
@@ -73,9 +106,11 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 		return typeof frame.channelId === "string" && typeof frame.threadId === "string" && typeof frame.leaderPid === "number" &&
 			(frame.leaderNonce === undefined || (typeof frame.leaderNonce === "string" && frame.leaderNonce.length > 0)) &&
 			(frame.lifecycleReactions === undefined || frame.lifecycleReactions === true) &&
-			(frame.projectSummaries === undefined || frame.projectSummaries === true);
+			(frame.projectSummaries === undefined || frame.projectSummaries === true) &&
+			(frame.sessionControls === undefined || frame.sessionControls === true);
 	}
 	if (frame.type === "inbound") return typeof frame.messageId === "string" && typeof frame.text === "string";
+	if (frame.type === "control") return typeof frame.requestId === "string" && isPiSessionControlAction(frame.action);
 	if (frame.type === "inbound_acked") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	if (frame.type === "outbound_queued") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	if (frame.type === "project_summary_queued") return typeof frame.requestId === "string";

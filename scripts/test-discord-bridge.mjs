@@ -61,6 +61,8 @@ class FakeGateway {
 	connected = false;
 	listeners = new Set();
 	terminalListeners = new Set();
+	controlListeners = new Set();
+	autocompleteListeners = new Set();
 	projectRequests = [];
 	threadRequests = [];
 	sent = [];
@@ -89,6 +91,27 @@ class FakeGateway {
 	onMessage(listener) {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	onSessionControl(listener) {
+		this.controlListeners.add(listener);
+		return () => this.controlListeners.delete(listener);
+	}
+
+	onModelAutocomplete(listener) {
+		this.autocompleteListeners.add(listener);
+		return () => this.autocompleteListeners.delete(listener);
+	}
+
+	async executeControl(request) {
+		const listener = this.controlListeners.values().next().value;
+		return listener
+			? listener(request)
+			: { ok: false, message: "Discord relay is not ready for Pi session controls." };
+	}
+
+	modelAutocomplete(channelId, prefix) {
+		return this.autocompleteListeners.values().next().value?.(channelId, prefix) ?? [];
 	}
 
 	async ensureProjectChannel(request) {
@@ -181,7 +204,16 @@ class FakeGateway {
 	}
 }
 
-function createExtensionHarness(extension, { cwd, sessionId, sessionName, entries = [] }) {
+function createExtensionHarness(extension, {
+	cwd,
+	sessionId,
+	sessionName,
+	entries = [],
+	models = [
+		{ provider: "openai", id: "gpt-test", name: "GPT Test" },
+		{ provider: "anthropic", id: "claude-test", name: "Claude Test" },
+	],
+}) {
 	const events = new Map();
 	const commands = new Map();
 	const notifications = [];
@@ -191,6 +223,10 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName, entrie
 	let idle = true;
 	let injectionError = false;
 	let currentSessionName = sessionName;
+	let currentModel = models[0];
+	let thinkingLevel = "medium";
+	let pendingMessages = false;
+	let abortRequests = 0;
 	const pi = {
 		on(name, handler) {
 			const handlers = events.get(name) ?? [];
@@ -212,11 +248,32 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName, entrie
 		appendEntry(customType, data) {
 			entries.push({ type: "custom", customType, data });
 		},
+		async setModel(model) {
+			currentModel = model;
+			ctx.model = model;
+			return true;
+		},
+		getThinkingLevel() {
+			return thinkingLevel;
+		},
+		setThinkingLevel(level) {
+			thinkingLevel = level;
+			ctx.thinkingLevel = level;
+		},
 	};
 	const ctx = {
 		cwd,
 		hasUI: true,
 		isIdle: () => idle,
+		hasPendingMessages: () => pendingMessages,
+		abort: () => { abortRequests++; },
+		model: currentModel,
+		thinkingLevel,
+		scopedModels: [],
+		modelRegistry: {
+			getAvailable: () => models,
+			find: (provider, id) => models.find((model) => model.provider === provider && model.id === id),
+		},
 		sessionManager: { getSessionId: () => sessionId, getBranch: () => entries },
 		ui: {
 			notify: (...args) => notifications.push(args),
@@ -232,6 +289,10 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName, entrie
 		userMessages,
 		entries,
 		setIdle(value) { idle = value; },
+		setPendingMessages(value) { pendingMessages = value; },
+		abortRequests: () => abortRequests,
+		currentModel: () => currentModel,
+		thinkingLevel: () => thinkingLevel,
 		setInjectionError(value) { injectionError = value; },
 		setSessionName(value) { currentSessionName = value; },
 		nextUserMessage() {
@@ -267,7 +328,13 @@ try {
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
-	const { isClientFrame } = await importBuilt("extensions/discord/protocol.js");
+	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
+	const {
+		MAX_MODEL_AUTOCOMPLETE_CHOICES,
+		MAX_MODEL_CATALOGUE_ITEMS,
+		MAX_SESSION_CONTROL_QUEUE,
+		modelAutocompleteChoices,
+	} = await importBuilt("extensions/discord/controls.js");
 	const { restartOwnedRelay, tryAcquireLeader } = await importBuilt("extensions/discord/leader.js");
 	const {
 		assistantText,
@@ -626,7 +693,85 @@ try {
 	assert.equal(legacyLinkedRegistration.channelId, legacyMainRegistration.channelId, "a new relay must canonicalize registrations from rolling older clients");
 	assert.notEqual(legacyLinkedRegistration.threadId, legacyMainRegistration.threadId);
 	assert.equal(Object.keys((await rollingIdentityState.load()).projects).length, 1);
+	await rollingIdentityCore.activateRegistration("legacy-main-client", "legacy-main-generation", "legacy-main-session", () => true);
+	assert.deepEqual(rollingIdentityGateway.modelAutocomplete(legacyMainRegistration.threadId, ""), []);
+	assert.deepEqual(await rollingIdentityGateway.executeControl({
+		requestId: "rolling-old-client-control",
+		channelId: legacyMainRegistration.threadId,
+		action: { type: "status" },
+	}), { ok: false, message: "The live Pi client does not support session controls; reconnect or reload it." },
+	"new relays must keep older clients connected while explicitly rejecting unsupported controls");
 	await rollingIdentityCore.stop();
+
+	const controlState = new DiscordStateStore(join(dataDir, "control-state.json"));
+	const controlGateway = new FakeGateway();
+	const controlCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		controlState,
+		controlGateway,
+	);
+	await controlCore.start();
+	const controlPrepared = await controlCore.prepareRegistration("control-client", "control-generation", {
+		cwd: "/controls",
+		projectIdentityResolved: true,
+		sessionId: "control-session",
+	});
+	let releaseControl;
+	let activeControls = 0;
+	let maximumActiveControls = 0;
+	let executedControls = 0;
+	let blockControls = true;
+	await controlCore.activateRegistration("control-client", "control-generation", "control-session", () => true, {
+		modelCatalogue: [{ provider: "provider", id: "model", name: "Model" }],
+		async execute() {
+			executedControls++;
+			activeControls++;
+			maximumActiveControls = Math.max(maximumActiveControls, activeControls);
+			if (blockControls) await new Promise((resolveControl) => { releaseControl = resolveControl; });
+			activeControls--;
+			return { ok: true, message: "done" };
+		},
+	});
+	assert.deepEqual(controlGateway.modelAutocomplete(controlPrepared.threadId, "provider"), [{ name: "Model (provider/model)", value: "provider/model" }]);
+	assert.deepEqual(controlGateway.modelAutocomplete("unmapped", "provider"), []);
+	const queuedControls = Array.from({ length: MAX_SESSION_CONTROL_QUEUE }, (_, index) => controlGateway.executeControl({
+		requestId: `queued-control-${index}`,
+		channelId: controlPrepared.threadId,
+		action: { type: "status" },
+	}));
+	await waitFor(() => activeControls === 1, "first serialized session control");
+	assert.deepEqual(await controlGateway.executeControl({
+		requestId: "queue-overflow",
+		channelId: controlPrepared.threadId,
+		action: { type: "status" },
+	}), { ok: false, message: "Pi session control queue is full; retry later." });
+	blockControls = false;
+	releaseControl();
+	await Promise.all(queuedControls);
+	assert.equal(maximumActiveControls, 1, "session controls must execute serially");
+	const beforeDeduplication = executedControls;
+	const duplicateControl = {
+		requestId: "duplicate-mutating-control",
+		channelId: controlPrepared.threadId,
+		action: { type: "steer", text: "once" },
+	};
+	assert.deepEqual(await Promise.all([
+		controlGateway.executeControl(duplicateControl),
+		controlGateway.executeControl(duplicateControl),
+	]), [{ ok: true, message: "done" }, { ok: true, message: "done" }]);
+	assert.equal(executedControls, beforeDeduplication + 1, "mutating Discord interaction retries must execute once");
+	controlCore.unregisterClient("control-client", "control-generation");
+	assert.deepEqual(await controlGateway.executeControl({
+		requestId: "offline-control",
+		channelId: controlPrepared.threadId,
+		action: { type: "status" },
+	}), { ok: false, message: "The Pi session mapped to this thread is offline." });
+	assert.deepEqual(await controlGateway.executeControl({
+		requestId: "unmapped-control",
+		channelId: "never-mapped",
+		action: { type: "status" },
+	}), { ok: false, message: "This Discord thread is not mapped to a Pi session." });
+	await controlCore.stop();
 
 	FakeGateway.channelMessages.delete("summary-channel");
 	FakeGateway.summaryEvents.length = 0;
@@ -806,13 +951,42 @@ try {
 	};
 	assert.equal(isClientFrame(resolvedRegistrationFrame), true);
 	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, projectIdentityResolved: "true" }), false);
+	const controlRegistrationFrame = {
+		...resolvedRegistrationFrame,
+		sessionControls: {
+			modelCatalogue: Array.from({ length: MAX_MODEL_CATALOGUE_ITEMS }, (_, index) => ({
+				provider: "provider",
+				id: `model-${index}`,
+				name: `Model ${index}`,
+			})),
+		},
+	};
+	assert.equal(isClientFrame(controlRegistrationFrame), true);
+	assert.equal(isClientFrame({
+		...controlRegistrationFrame,
+		sessionControls: { modelCatalogue: [...controlRegistrationFrame.sessionControls.modelCatalogue, { provider: "p", id: "overflow", name: "Overflow" }] },
+	}), false, "registration model catalogues must be bounded");
+	assert.equal(isClientFrame({ type: "control_result", requestId: "control-1", ok: true, message: "done" }), true);
+	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "high" } }), true);
+	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "turbo" } }), false);
+	const autocompleteCatalogue = Array.from({ length: 40 }, (_, index) => ({
+		provider: "provider",
+		id: `model-${index}`,
+		name: `Matching Model ${index}`,
+	}));
+	assert.equal(modelAutocompleteChoices(autocompleteCatalogue, "matching").length, MAX_MODEL_AUTOCOMPLETE_CHOICES);
+	assert.ok(modelAutocompleteChoices(autocompleteCatalogue, "model-39").some((choice) => choice.value === "provider/model-39"));
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "summary" }), true);
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "x".repeat(2_001) }), false);
 	const previousValidator = (frame) => frame?.type === "outbound" && typeof frame.requestId === "string" &&
 		typeof frame.messageId === "string" && typeof frame.text === "string" && (frame.kind === "user" || frame.kind === "assistant");
+	const previousRegisterValidator = (frame) => frame?.type === "register" &&
+		["token", "clientId", "generation", "configFingerprint", "cwd", "sessionId"].every((key) => typeof frame[key] === "string") &&
+		typeof frame.configEpoch === "number";
 	compatibilityDirectory = await mkdtemp(join(tmpdir(), "dc-ipc-"));
 	const compatibilityPaths = relayPaths(compatibilityDirectory);
 	const previousHostFrames = [];
+	const previousHostRegistrations = [];
 	let rejectOutbound = false;
 	const compatibilityServer = createServer((socket) => {
 		socket.setEncoding("utf8");
@@ -826,7 +1000,9 @@ try {
 				if (line) {
 					const frame = JSON.parse(line);
 					if (frame.type === "register") {
-						socket.write(`${JSON.stringify({ type: "registered", channelId: "compat-channel", threadId: "compat-thread", leaderPid: process.pid })}\n`);
+						previousHostRegistrations.push(frame);
+						if (!previousRegisterValidator(frame)) socket.end();
+						else socket.write(`${JSON.stringify({ type: "registered", channelId: "compat-channel", threadId: "compat-thread", leaderPid: process.pid })}\n`);
 					} else if (frame.type === "outbound") {
 						previousHostFrames.push(frame);
 						if (!previousValidator(frame)) {
@@ -854,10 +1030,17 @@ try {
 			onInbound() {},
 			onError(error) { compatibilityErrors.push(error); },
 			onStatus() {},
+			modelCatalogue: () => [{ provider: "compat", id: "model", name: "Compatibility Model" }],
+			onControl: async () => assert.fail("an older relay must not send unsupported controls"),
 		},
 		{ paths: compatibilityPaths, launchRelay: async () => {} },
 	);
 	await compatibilityClient.start();
+	assert.equal(previousHostRegistrations.length, 1);
+	assert.deepEqual(previousHostRegistrations[0].sessionControls.modelCatalogue, [
+		{ provider: "compat", id: "model", name: "Compatibility Model" },
+	], "new clients may advertise controls to older relays because registration fields are additive");
+	assert.equal(compatibilityClient.status().sessionControls, undefined, "an older relay must not advertise unsupported controls");
 	compatibilityClient.updateLifecycle("compatibility-inbound", "thinking");
 	await compatibilityClient.sendInteractiveUserText("hot **reload**");
 	assert.equal(previousHostFrames.length, 1);
@@ -1379,6 +1562,69 @@ try {
 	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: routedSecondMessage.text }] } });
 	await waitFor(() => second.entries.some((entry) => entry.data?.messageId === "10"), "durable Pi acceptance receipt");
 	assert.equal(first.userMessages.length, 0, "Discord input must route only to its Pi session");
+	assert.deepEqual(gateway.modelAutocomplete(firstThread, "claude"), [{
+		name: "Claude Test (anthropic/claude-test)",
+		value: "anthropic/claude-test",
+	}], "model autocomplete must use the live relay registration cache");
+	const controlStatus = await gateway.executeControl({ requestId: "discord-status", channelId: firstThread, action: { type: "status" } });
+	assert.equal(controlStatus.ok, true);
+	assert.match(controlStatus.message, /Pi session: idle\nModel: openai\/gpt-test\nThinking: medium\nQueued messages: no/);
+	first.setIdle(false);
+	assert.deepEqual(await gateway.executeControl({
+		requestId: "busy-model",
+		channelId: firstThread,
+		action: { type: "model", value: "anthropic/claude-test" },
+	}), { ok: false, message: "Model cannot change while Pi is busy." });
+	assert.deepEqual(await gateway.executeControl({
+		requestId: "busy-thinking",
+		channelId: firstThread,
+		action: { type: "thinking", level: "high" },
+	}), { ok: false, message: "Thinking level cannot change while Pi is busy." });
+	first.setIdle(true);
+	assert.equal((await gateway.executeControl({
+		requestId: "set-model",
+		channelId: firstThread,
+		action: { type: "model", value: "anthropic/claude-test" },
+	})).ok, true);
+	assert.equal(first.currentModel().id, "claude-test", "native Pi setModel must execute instead of forwarding slash-looking text");
+	assert.equal((await gateway.executeControl({
+		requestId: "set-thinking",
+		channelId: firstThread,
+		action: { type: "thinking", level: "high" },
+	})).ok, true);
+	assert.equal(first.thinkingLevel(), "high", "native Pi setThinkingLevel must execute and retain persistence semantics");
+	assert.deepEqual(await gateway.executeControl({
+		requestId: "stale-model",
+		channelId: firstThread,
+		action: { type: "model", value: "provider/missing" },
+	}), { ok: false, message: "Select a model from this session's current autocomplete catalogue." });
+	first.setIdle(false);
+	first.setPendingMessages(true);
+	assert.equal((await gateway.executeControl({
+		requestId: "steer-control",
+		channelId: firstThread,
+		action: { type: "steer", text: "steer natively" },
+	})).ok, true);
+	assert.equal((await gateway.executeControl({
+		requestId: "followup-control",
+		channelId: firstThread,
+		action: { type: "followup", text: "follow up natively" },
+	})).ok, true);
+	assert.deepEqual(first.userMessages.slice(-2), [
+		{ text: "steer natively", options: { deliverAs: "steer" } },
+		{ text: "follow up natively", options: { deliverAs: "followUp" } },
+	]);
+	const abortResult = await gateway.executeControl({ requestId: "abort-control", channelId: firstThread, action: { type: "abort" } });
+	assert.deepEqual(abortResult, { ok: true, message: "Abort requested; queued messages were not discarded." });
+	assert.equal(first.abortRequests(), 1, "abort must use Pi's queue-preserving context API");
+	assert.equal(first.userMessages.length, 2, "abort must not consume or re-forward queued controls");
+	assert.match((await gateway.executeControl({ requestId: "post-abort-status", channelId: firstThread, action: { type: "status" } })).message,
+		/Queued messages: yes$/, "abort control must leave Pi's queued-message state intact");
+	first.setIdle(true);
+	assert.deepEqual(await gateway.executeControl({ requestId: "idle-abort", channelId: firstThread, action: { type: "abort" } }), {
+		ok: false,
+		message: "Pi is idle; there is no active turn to abort.",
+	}, "idle abort must not falsely claim confirmation");
 	await gateway.emit({ id: "10", channelId: secondThread, content: "duplicate", authorBot: false });
 	assert.equal(second.userMessages.length, 1, "duplicate Discord IDs must not deliver twice");
 	await gateway.emit({ id: "11", channelId: secondThread, content: "bot", authorBot: true });
@@ -1527,6 +1773,9 @@ try {
 	assert.match(second.notifications.at(-1)[0], /^Discord relay restarted: PID \d+ replaced by PID \d+$/);
 	await waitFor(() => FakeGateway.instances.length > gatewayCountBeforeReconnect, "command relay restart");
 	gateway = FakeGateway.instances.at(-1);
+	await waitFor(() => gateway.modelAutocomplete(firstThread, "").length > 0, "model catalogue republish after relay restart");
+	assert.equal(gateway.modelAutocomplete(firstThread, "")[0].value, "anthropic/claude-test",
+		"re-registration must refresh the relay catalogue with Pi's current model first");
 	await waitFor(() => FakeGateway.lifecycleReactionEvents.some((event) =>
 		event.messageId === "19" && event.reaction === "🤔" && event.gateway === gateway), "lifecycle replay after reconnect");
 	assert.notEqual(gateway, preReconnectGateway);

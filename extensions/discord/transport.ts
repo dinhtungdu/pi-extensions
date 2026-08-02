@@ -1,16 +1,31 @@
 import {
+	ApplicationCommandOptionType,
 	ChannelType,
 	Client,
 	Events,
 	GatewayIntentBits,
+	MessageFlags,
 	ThreadAutoArchiveDuration,
+	type ChatInputApplicationCommandData,
+	type ChatInputCommandInteraction,
 	type Guild,
 	type TextChannel,
 } from "discord.js";
 import type { DiscordBridgeConfig } from "./config.js";
 import { DISCORD_LIFECYCLE_REACTIONS, type DiscordLifecycleReaction } from "./reactions.js";
+import {
+	boundedControlResult,
+	MAX_MODEL_AUTOCOMPLETE_CHOICES,
+	MAX_SESSION_CONTROL_TEXT_LENGTH,
+	PI_THINKING_LEVELS,
+	type DiscordModelChoice,
+	type DiscordSessionControlRequest,
+	type PiSessionControlResult,
+} from "./controls.js";
 
 const READY_TIMEOUT_MS = 30_000;
+const CONTROL_EXECUTION_TIMEOUT_MS = 12_000;
+const PI_COMMAND_NAME = "pi";
 
 export interface DiscordInboundMessage {
 	id: string;
@@ -36,6 +51,8 @@ export interface DiscordTransport {
 	connect(config: DiscordBridgeConfig): Promise<void>;
 	disconnect(): Promise<void>;
 	onMessage(listener: (message: DiscordInboundMessage) => void): () => void;
+	onSessionControl(listener: (request: DiscordSessionControlRequest) => Promise<PiSessionControlResult>): () => void;
+	onModelAutocomplete(listener: (channelId: string, prefix: string) => DiscordModelChoice[]): () => void;
 	ensureProjectChannel(request: ProjectChannelRequest): Promise<string>;
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
@@ -129,6 +146,8 @@ export async function collectChronologicalMessages(
 export class DiscordJsTransport implements DiscordTransport {
 	private client: Client | undefined;
 	private readonly listeners = new Set<(message: DiscordInboundMessage) => void>();
+	private readonly controlListeners = new Set<(request: DiscordSessionControlRequest) => Promise<PiSessionControlResult>>();
+	private readonly autocompleteListeners = new Set<(channelId: string, prefix: string) => DiscordModelChoice[]>();
 	private readonly terminalListeners = new Set<(error: Error) => void>();
 
 	async connect(config: DiscordBridgeConfig): Promise<void> {
@@ -158,6 +177,23 @@ export class DiscordJsTransport implements DiscordTransport {
 			};
 			for (const listener of this.listeners) listener(normalized);
 		});
+		client.on(Events.InteractionCreate, (interaction) => {
+			if (interaction.isAutocomplete()) {
+				if (interaction.commandName !== PI_COMMAND_NAME) return;
+				const focused = interaction.options.getFocused(true);
+				if (focused.name !== "model") return;
+				let choices: DiscordModelChoice[] = [];
+				for (const listener of this.autocompleteListeners) {
+					choices = listener(interaction.channelId, String(focused.value));
+					break;
+				}
+				void interaction.respond(choices.slice(0, MAX_MODEL_AUTOCOMPLETE_CHOICES)).catch((error) => {
+					console.error("[discord-bridge] Discord autocomplete response failed:", error);
+				});
+				return;
+			}
+			if (interaction.isChatInputCommand() && interaction.commandName === PI_COMMAND_NAME) void this.executeControlInteraction(interaction);
+		});
 
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const ready = new Promise<void>((resolve, reject) => {
@@ -167,6 +203,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		try {
 			await client.login(config.token);
 			await ready;
+			await this.registerSessionControls(config.guildId);
 		} catch (error) {
 			client.destroy();
 			this.client = undefined;
@@ -184,6 +221,16 @@ export class DiscordJsTransport implements DiscordTransport {
 	onMessage(listener: (message: DiscordInboundMessage) => void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	onSessionControl(listener: (request: DiscordSessionControlRequest) => Promise<PiSessionControlResult>): () => void {
+		this.controlListeners.add(listener);
+		return () => this.controlListeners.delete(listener);
+	}
+
+	onModelAutocomplete(listener: (channelId: string, prefix: string) => DiscordModelChoice[]): () => void {
+		this.autocompleteListeners.add(listener);
+		return () => this.autocompleteListeners.delete(listener);
 	}
 
 	async ensureProjectChannel(request: ProjectChannelRequest): Promise<string> {
@@ -301,6 +348,109 @@ export class DiscordJsTransport implements DiscordTransport {
 	onTerminalError(listener: (error: Error) => void): () => void {
 		this.terminalListeners.add(listener);
 		return () => this.terminalListeners.delete(listener);
+	}
+
+	private async registerSessionControls(guildId: string): Promise<void> {
+		const guild = await this.guild(guildId);
+		const definition: ChatInputApplicationCommandData = {
+			name: PI_COMMAND_NAME,
+			description: "Control the live Pi session mapped to this thread",
+			options: [
+				{ type: ApplicationCommandOptionType.Subcommand, name: "status", description: "Show live Pi session status" },
+				{
+					type: ApplicationCommandOptionType.Subcommand,
+					name: "model",
+					description: "Select the Pi model",
+					options: [{
+						type: ApplicationCommandOptionType.String,
+						name: "model",
+						description: "Provider and model",
+						required: true,
+						autocomplete: true,
+					}],
+				},
+				{
+					type: ApplicationCommandOptionType.Subcommand,
+					name: "thinking",
+					description: "Select the Pi thinking level",
+					options: [{
+						type: ApplicationCommandOptionType.String,
+						name: "level",
+						description: "Thinking level",
+						required: true,
+						choices: PI_THINKING_LEVELS.map((level) => ({ name: level, value: level })),
+					}],
+				},
+				{
+					type: ApplicationCommandOptionType.Subcommand,
+					name: "steer",
+					description: "Steer the current Pi run",
+					options: [{
+						type: ApplicationCommandOptionType.String,
+						name: "message",
+						description: "Message delivered after the current turn",
+						required: true,
+						maxLength: MAX_SESSION_CONTROL_TEXT_LENGTH,
+					}],
+				},
+				{
+					type: ApplicationCommandOptionType.Subcommand,
+					name: "followup",
+					description: "Queue a Pi follow-up",
+					options: [{
+						type: ApplicationCommandOptionType.String,
+						name: "message",
+						description: "Message delivered after the current run settles",
+						required: true,
+						maxLength: MAX_SESSION_CONTROL_TEXT_LENGTH,
+					}],
+				},
+				{ type: ApplicationCommandOptionType.Subcommand, name: "abort", description: "Request abort of the current Pi turn" },
+			],
+		};
+		const existing = (await guild.commands.fetch()).find((command) => command.name === PI_COMMAND_NAME);
+		if (existing) await guild.commands.edit(existing.id, definition);
+		else await guild.commands.create(definition);
+	}
+
+	private async executeControlInteraction(command: ChatInputCommandInteraction): Promise<void> {
+		try {
+			await command.deferReply({ flags: MessageFlags.Ephemeral });
+		} catch {
+			return;
+		}
+		let result: PiSessionControlResult;
+		try {
+			const subcommand = command.options.getSubcommand();
+			const action = subcommand === "status" || subcommand === "abort"
+				? { type: subcommand } as const
+				: subcommand === "model"
+					? { type: "model" as const, value: command.options.getString("model", true) }
+					: subcommand === "thinking"
+						? { type: "thinking" as const, level: command.options.getString("level", true) }
+						: subcommand === "steer" || subcommand === "followup"
+							? { type: subcommand, text: command.options.getString("message", true) } as const
+							: undefined;
+			if (!action) throw new Error("Unknown /pi subcommand");
+			const listener = this.controlListeners.values().next().value;
+			if (!listener) result = { ok: false, message: "Discord relay is not ready for Pi session controls." };
+			else {
+				result = await Promise.race([
+					listener({ requestId: command.id, channelId: command.channelId, action }),
+					new Promise<PiSessionControlResult>((resolve) => {
+						const timer = setTimeout(() => resolve({ ok: false, message: "Pi session control timed out." }), CONTROL_EXECUTION_TIMEOUT_MS);
+						timer.unref();
+					}),
+				]);
+			}
+		} catch (error) {
+			result = { ok: false, message: error instanceof Error ? error.message : String(error) };
+		}
+		const bounded = boundedControlResult(result);
+		await command.editReply({
+			content: `${bounded.ok ? "✅" : "❌"} ${bounded.message}`,
+			allowedMentions: { parse: [] },
+		}).catch(() => {});
 	}
 
 	private readyClient(): Client<true> {

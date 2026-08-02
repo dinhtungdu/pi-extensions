@@ -1,6 +1,7 @@
 import type { DiscordBridgeConfig } from "./config.js";
 import { LocalRelayClient, type RelayClientDependencies, type RelayClientStatus } from "./relay-client.js";
 import { assistantText } from "./text.js";
+import type { PiModelCatalogueEntry, PiSessionControlRequest, PiSessionControlResult } from "./controls.js";
 
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
@@ -17,6 +18,8 @@ export interface BridgeCallbacks {
 	onUserText(text: string): void;
 	onError(error: Error): void;
 	onStatus(status: BridgeStatus): void;
+	modelCatalogue?(): PiModelCatalogueEntry[];
+	onControl?(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
 }
 
 export interface BridgeStatus extends RelayClientStatus {}
@@ -69,6 +72,8 @@ export class DiscordBridge {
 				onInbound: (messageId, text) => this.receiveInbound(messageId, text),
 				onError: callbacks.onError,
 				onStatus: callbacks.onStatus,
+				...(callbacks.modelCatalogue ? { modelCatalogue: callbacks.modelCatalogue } : {}),
+				...(callbacks.onControl ? { onControl: callbacks.onControl } : {}),
 			},
 			dependencies,
 		);

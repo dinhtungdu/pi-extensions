@@ -8,6 +8,13 @@ import type { RelaySessionRegistration } from "./relay-core.js";
 import { interactiveUserChunks } from "./text.js";
 import type { DiscordLifecycleStatus } from "./reactions.js";
 import { restartOwnedRelay } from "./leader.js";
+import {
+	boundedControlResult,
+	MAX_MODEL_CATALOGUE_ITEMS,
+	type PiModelCatalogueEntry,
+	type PiSessionControlRequest,
+	type PiSessionControlResult,
+} from "./controls.js";
 
 const CONNECT_RETRY_MIN_MS = 25;
 const CONNECT_RETRY_MAX_MS = 500;
@@ -25,12 +32,15 @@ export interface RelayClientStatus {
 	channelId?: string;
 	threadId?: string;
 	projectSummaries?: true;
+	sessionControls?: true;
 }
 
 export interface RelayClientCallbacks {
 	onInbound(messageId: string, text: string): void | Promise<void>;
 	onError(error: Error): void;
 	onStatus(status: RelayClientStatus): void;
+	modelCatalogue?(): PiModelCatalogueEntry[];
+	onControl?(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
 }
 
 export interface RelayClientDependencies {
@@ -284,6 +294,9 @@ export class LocalRelayClient {
 				REQUEST_TIMEOUT_MS,
 			);
 			socket.once("connect", () => {
+				const modelCatalogue = this.callbacks.onControl
+					? (this.callbacks.modelCatalogue?.() ?? []).slice(0, MAX_MODEL_CATALOGUE_ITEMS)
+					: undefined;
 				const frame: ClientFrame = {
 					type: "register",
 					token: this.token!,
@@ -292,6 +305,7 @@ export class LocalRelayClient {
 					configFingerprint: this.fingerprint,
 					configEpoch: this.config.epoch,
 					...this.registration,
+					...(modelCatalogue ? { sessionControls: { modelCatalogue } } : {}),
 				};
 				if (!writer.write(encodeFrame(frame))) {
 					waiter.reject(new Error("Local Discord relay request queue is full during registration"));
@@ -350,6 +364,7 @@ export class LocalRelayClient {
 				channelId: frame.channelId,
 				threadId: frame.threadId,
 				...(frame.projectSummaries ? { projectSummaries: true as const } : {}),
+				...(frame.sessionControls ? { sessionControls: true as const } : {}),
 			});
 			this.flushLifecycleStatuses();
 			return;
@@ -374,6 +389,22 @@ export class LocalRelayClient {
 				await this.callbacks.onInbound(frame.messageId, frame.text);
 			} catch (error) {
 				this.callbacks.onError(asError(error));
+			}
+			return;
+		}
+		if (frame.type === "control") {
+			let result: PiSessionControlResult;
+			try {
+				result = this.callbacks.onControl
+					? boundedControlResult(await this.callbacks.onControl({ requestId: frame.requestId, action: frame.action }))
+					: { ok: false, message: "This Pi client does not support Discord session controls." };
+			} catch (error) {
+				result = boundedControlResult({ ok: false, message: asError(error).message });
+			}
+			if (this.socket === socket && this.writer) {
+				if (!this.writer.write(encodeFrame({ type: "control_result", requestId: frame.requestId, ...result }))) {
+					this.callbacks.onError(new Error("Local Discord relay request queue is full while returning a session control result"));
+				}
 			}
 			return;
 		}
