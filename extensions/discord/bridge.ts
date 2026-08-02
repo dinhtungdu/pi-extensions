@@ -1,7 +1,13 @@
 import type { DiscordBridgeConfig } from "./config.js";
 import { LocalRelayClient, type RelayClientDependencies, type RelayClientStatus } from "./relay-client.js";
 import { assistantText } from "./text.js";
-import type { PiModelCatalogueEntry, PiSessionControlRequest, PiSessionControlResult } from "./controls.js";
+import type {
+	ManagerTaskCatalogueEntry,
+	PiManagerControlRequest,
+	PiModelCatalogueEntry,
+	PiSessionControlRequest,
+	PiSessionControlResult,
+} from "./controls.js";
 import {
 	appendImageCapabilityWarning,
 	loadInboundImages,
@@ -27,6 +33,8 @@ export interface BridgeCallbacks {
 	supportsImageInput?(): boolean;
 	modelCatalogue?(): PiModelCatalogueEntry[];
 	onControl?(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
+	managerTaskCatalogue?(): ManagerTaskCatalogueEntry[];
+	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 }
 
 export interface BridgeStatus extends RelayClientStatus {}
@@ -83,6 +91,8 @@ export class DiscordBridge {
 				onStatus: callbacks.onStatus,
 				...(callbacks.modelCatalogue ? { modelCatalogue: callbacks.modelCatalogue } : {}),
 				...(callbacks.onControl ? { onControl: callbacks.onControl } : {}),
+				...(callbacks.managerTaskCatalogue ? { managerTaskCatalogue: callbacks.managerTaskCatalogue } : {}),
+				...(callbacks.onManagerControl ? { onManagerControl: callbacks.onManagerControl } : {}),
 			},
 			dependencies,
 		);
@@ -115,6 +125,10 @@ export class DiscordBridge {
 
 	async publishProjectSummary(text: string): Promise<boolean> {
 		return this.relay.sendProjectSummary(text);
+	}
+
+	async updateManagerTaskCatalogue(catalogue: readonly ManagerTaskCatalogueEntry[]): Promise<boolean> {
+		return this.relay.updateManagerTaskCatalogue(catalogue);
 	}
 
 	async mirrorUserText(text: string, interactive = false): Promise<void> {

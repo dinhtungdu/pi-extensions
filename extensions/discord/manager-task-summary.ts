@@ -2,6 +2,11 @@ import { execFile } from "node:child_process";
 import { watch, type FSWatcher } from "node:fs";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
+import {
+	isManagerTaskCatalogue,
+	MAX_MANAGER_TASK_CATALOGUE_ITEMS,
+	type ManagerTaskCatalogueEntry,
+} from "./controls.js";
 
 const STATUS_TIMEOUT_MS = 2_000;
 const STATUS_MAX_BYTES = 1_048_576;
@@ -32,6 +37,7 @@ interface ManagerStatus {
 
 export interface ManagerTaskSummaryCallbacks {
 	onSummary(summary: string): void;
+	onTaskCatalogue?(catalogue: ManagerTaskCatalogueEntry[]): void;
 	onError(error: Error): void;
 }
 
@@ -145,6 +151,22 @@ function taskLines(task: ManagerTaskStatus, status: string): string[] {
 
 function sectionLabel(status: string): string {
 	return humanizeIdentifier(status);
+}
+
+export function managerTaskCatalogue(value: unknown): ManagerTaskCatalogueEntry[] {
+	const status = parseManagerStatus(value);
+	const catalogueText = (text: string, maximum: number) => {
+		const normalized = text.replaceAll(/[\r\n\t]+/g, " ").trim();
+		return normalized.length <= maximum ? normalized : `${normalized.slice(0, maximum - 1)}…`;
+	};
+	const catalogue = status.tasks.slice(0, MAX_MANAGER_TASK_CATALOGUE_ITEMS).map((task) => ({
+		taskId: task.task_id,
+		project: catalogueText(task.project, 100),
+		title: catalogueText(task.title?.trim() || humanizeIdentifier(task.task_id), 200),
+		status: catalogueText(task.status, 32),
+	}));
+	if (!isManagerTaskCatalogue(catalogue)) throw new Error("the-manager status returned an invalid task catalogue");
+	return catalogue;
 }
 
 export function formatManagerTaskSummary(value: unknown): string {
@@ -282,8 +304,13 @@ export class ManagerTaskSummaryProducer {
 			do {
 				this.refreshRequested = false;
 				try {
-					const summary = formatManagerTaskSummary(await this.dependencies.readStatus(this.root));
-					if (!this.stopped) this.callbacks.onSummary(summary);
+					const status = await this.dependencies.readStatus(this.root);
+					const summary = formatManagerTaskSummary(status);
+					const catalogue = managerTaskCatalogue(status);
+					if (!this.stopped) {
+						this.callbacks.onSummary(summary);
+						this.callbacks.onTaskCatalogue?.(catalogue);
+					}
 				} catch (error) {
 					if (!this.stopped) this.callbacks.onError(error instanceof Error ? error : new Error(String(error)));
 				}

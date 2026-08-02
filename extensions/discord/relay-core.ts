@@ -19,13 +19,17 @@ import {
 import {
 	boundedControlResult,
 	isPiThinkingLevel,
+	managerTaskAutocompleteChoices,
 	MAX_RECENT_SESSION_CONTROLS,
 	MAX_SESSION_CONTROL_QUEUE,
 	MAX_SESSION_CONTROL_TEXT_LENGTH,
 	modelAutocompleteChoices,
 	modelChoiceValue,
+	type DiscordManagerControlRequest,
 	type DiscordModelChoice,
 	type DiscordSessionControlRequest,
+	type ManagerTaskCatalogueEntry,
+	type PiManagerControlRequest,
 	type PiModelCatalogueEntry,
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
@@ -51,6 +55,8 @@ interface ActiveSession {
 	deliveredIds: Set<string>;
 	modelCatalogue: PiModelCatalogueEntry[];
 	executeControl?: (request: PiSessionControlRequest) => Promise<PiSessionControlResult>;
+	managerTaskCatalogue: ManagerTaskCatalogueEntry[];
+	executeManagerControl?: (request: PiManagerControlRequest) => Promise<PiSessionControlResult>;
 	inboundImages: boolean;
 }
 
@@ -89,11 +95,17 @@ export class DiscordRelayCore {
 	private unsubscribe: (() => void) | undefined;
 	private unsubscribeControls: (() => void) | undefined;
 	private unsubscribeAutocomplete: (() => void) | undefined;
+	private unsubscribeManagerControls: (() => void) | undefined;
+	private unsubscribeManagerAutocomplete: (() => void) | undefined;
 	private unsubscribeTerminal: (() => void) | undefined;
 	private readonly controlQueues = new Map<string, Promise<void>>();
 	private readonly controlQueueDepths = new Map<string, number>();
 	private readonly inFlightControls = new Map<string, Promise<PiSessionControlResult>>();
 	private readonly completedControls = new Map<string, PiSessionControlResult>();
+	private readonly managerControlQueues = new Map<string, Promise<void>>();
+	private readonly managerControlQueueDepths = new Map<string, number>();
+	private readonly inFlightManagerControls = new Map<string, Promise<PiSessionControlResult>>();
+	private readonly completedManagerControls = new Map<string, PiSessionControlResult>();
 	private inboundQueue: Promise<void> = Promise.resolve();
 	private drainingOutbound = false;
 	private outboundDrainRequested = false;
@@ -135,6 +147,10 @@ export class DiscordRelayCore {
 		this.unsubscribeAutocomplete = this.transport.onModelAutocomplete((channelId, prefix) => {
 			return this.modelAutocomplete(channelId, prefix);
 		});
+		this.unsubscribeManagerControls = this.transport.onManagerControl((request) => this.executeDiscordManagerControl(request));
+		this.unsubscribeManagerAutocomplete = this.transport.onManagerAutocomplete((channelId, prefix) => {
+			return this.managerAutocomplete(channelId, prefix);
+		});
 		this.started = true;
 		for (const { cwd } of await this.state.projectSummaries()) this.scheduleProjectSummaryReconciliation(cwd);
 	}
@@ -148,6 +164,10 @@ export class DiscordRelayCore {
 		this.unsubscribeControls = undefined;
 		this.unsubscribeAutocomplete?.();
 		this.unsubscribeAutocomplete = undefined;
+		this.unsubscribeManagerControls?.();
+		this.unsubscribeManagerControls = undefined;
+		this.unsubscribeManagerAutocomplete?.();
+		this.unsubscribeManagerAutocomplete = undefined;
 		this.unsubscribeTerminal?.();
 		this.unsubscribeTerminal = undefined;
 		await this.inboundQueue;
@@ -160,6 +180,10 @@ export class DiscordRelayCore {
 		this.controlQueueDepths.clear();
 		this.inFlightControls.clear();
 		this.completedControls.clear();
+		this.managerControlQueues.clear();
+		this.managerControlQueueDepths.clear();
+		this.inFlightManagerControls.clear();
+		this.completedManagerControls.clear();
 		for (const timer of this.outboundRetryTimers.values()) clearTimeout(timer);
 		this.outboundRetryTimers.clear();
 		this.outboundRetryAttempts.clear();
@@ -234,6 +258,10 @@ export class DiscordRelayCore {
 			execute(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
 		},
 		inboundImages = false,
+		managerControls?: {
+			taskCatalogue: ManagerTaskCatalogueEntry[];
+			execute(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
+		},
 	): Promise<void> {
 		const reserved = this.reservedSessions.get(sessionId);
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
@@ -254,6 +282,8 @@ export class DiscordRelayCore {
 			deliveredIds: new Set(),
 			modelCatalogue: controls?.modelCatalogue.map((model) => ({ ...model })) ?? [],
 			...(controls ? { executeControl: controls.execute } : {}),
+			managerTaskCatalogue: managerControls?.taskCatalogue.map((task) => ({ ...task })) ?? [],
+			...(managerControls ? { executeManagerControl: managerControls.execute } : {}),
 			inboundImages,
 		};
 		const replaced = this.activeSessions.get(sessionId);
@@ -290,6 +320,81 @@ export class DiscordRelayCore {
 		const sessionId = this.activeThreadSessions.get(channelId);
 		const active = sessionId ? this.activeSessions.get(sessionId) : undefined;
 		return active?.executeControl ? modelAutocompleteChoices(active.modelCatalogue, prefix) : [];
+	}
+
+	managerAutocomplete(channelId: string, prefix: string): DiscordModelChoice[] {
+		const sessionId = this.activeThreadSessions.get(channelId);
+		const active = sessionId ? this.activeSessions.get(sessionId) : undefined;
+		return active?.executeManagerControl ? managerTaskAutocompleteChoices(active.managerTaskCatalogue, prefix) : [];
+	}
+
+	updateManagerTaskCatalogue(
+		clientId: string,
+		generation: string,
+		sessionId: string,
+		catalogue: readonly ManagerTaskCatalogueEntry[],
+	): void {
+		this.assertClientSession(clientId, generation, sessionId);
+		const active = this.activeSessions.get(sessionId)!;
+		if (!active.executeManagerControl) throw new Error("Local client is not registered for manager controls");
+		active.managerTaskCatalogue = catalogue.map((task) => ({ ...task }));
+	}
+
+	async executeDiscordManagerControl(request: DiscordManagerControlRequest): Promise<PiSessionControlResult> {
+		const sessionId = this.activeThreadSessions.get(request.channelId);
+		if (!sessionId) {
+			const mapped = await this.state.findSessionByThread(request.channelId);
+			return mapped
+				? { ok: false, message: "The manager session mapped to this thread is offline." }
+				: { ok: false, message: "This Discord thread is not mapped to a Pi session." };
+		}
+		const active = this.activeSessions.get(sessionId);
+		if (!active?.executeManagerControl) {
+			return { ok: false, message: "This live Pi session is not a verified the-manager client." };
+		}
+		if (!active.managerTaskCatalogue.some((task) => task.taskId === request.taskId)) {
+			return { ok: false, message: "Select a task from this manager session's current autocomplete catalogue." };
+		}
+		const completed = this.completedManagerControls.get(request.requestId);
+		if (completed) return { ...completed };
+		const inFlight = this.inFlightManagerControls.get(request.requestId);
+		if (inFlight) return inFlight;
+		const depth = this.managerControlQueueDepths.get(sessionId) ?? 0;
+		if (depth >= MAX_SESSION_CONTROL_QUEUE) return { ok: false, message: "Manager control queue is full; retry later." };
+		this.managerControlQueueDepths.set(sessionId, depth + 1);
+		const previous = this.managerControlQueues.get(sessionId) ?? Promise.resolve();
+		const execution = previous.catch(() => {}).then(async () => {
+			if (this.activeSessions.get(sessionId) !== active || !active.executeManagerControl) {
+				return { ok: false, message: "The manager session disconnected before this control executed." };
+			}
+			if (!active.managerTaskCatalogue.some((task) => task.taskId === request.taskId)) {
+				return { ok: false, message: "The selected task became stale before this control executed." };
+			}
+			try {
+				return boundedControlResult(await active.executeManagerControl({
+					requestId: request.requestId,
+					action: request.action,
+					taskId: request.taskId,
+				}));
+			} catch (error) {
+				return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
+			}
+		});
+		const tail = execution.then(() => {});
+		this.managerControlQueues.set(sessionId, tail);
+		this.inFlightManagerControls.set(request.requestId, execution);
+		return execution.then((result) => {
+			this.completedManagerControls.set(request.requestId, result);
+			while (this.completedManagerControls.size > MAX_RECENT_SESSION_CONTROLS) {
+				this.completedManagerControls.delete(this.completedManagerControls.keys().next().value!);
+			}
+			return result;
+		}).finally(() => {
+			this.managerControlQueueDepths.set(sessionId, Math.max(0, (this.managerControlQueueDepths.get(sessionId) ?? 1) - 1));
+			if (this.managerControlQueueDepths.get(sessionId) === 0) this.managerControlQueueDepths.delete(sessionId);
+			if (this.managerControlQueues.get(sessionId) === tail) this.managerControlQueues.delete(sessionId);
+			if (this.inFlightManagerControls.get(request.requestId) === execution) this.inFlightManagerControls.delete(request.requestId);
+		});
 	}
 
 	async executeDiscordControl(request: DiscordSessionControlRequest): Promise<PiSessionControlResult> {

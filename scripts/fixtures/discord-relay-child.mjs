@@ -38,6 +38,14 @@ class ChildFakeTransport {
 		return () => {};
 	}
 
+	onManagerControl() {
+		return () => {};
+	}
+
+	onManagerAutocomplete() {
+		return () => {};
+	}
+
 	onTerminalError(listener) {
 		this.terminalListeners.add(listener);
 		return () => this.terminalListeners.delete(listener);

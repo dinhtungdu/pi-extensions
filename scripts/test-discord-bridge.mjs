@@ -64,6 +64,8 @@ class FakeGateway {
 	terminalListeners = new Set();
 	controlListeners = new Set();
 	autocompleteListeners = new Set();
+	managerControlListeners = new Set();
+	managerAutocompleteListeners = new Set();
 	projectRequests = [];
 	threadRequests = [];
 	sent = [];
@@ -104,6 +106,16 @@ class FakeGateway {
 		return () => this.autocompleteListeners.delete(listener);
 	}
 
+	onManagerControl(listener) {
+		this.managerControlListeners.add(listener);
+		return () => this.managerControlListeners.delete(listener);
+	}
+
+	onManagerAutocomplete(listener) {
+		this.managerAutocompleteListeners.add(listener);
+		return () => this.managerAutocompleteListeners.delete(listener);
+	}
+
 	async executeControl(request) {
 		const listener = this.controlListeners.values().next().value;
 		return listener
@@ -113,6 +125,17 @@ class FakeGateway {
 
 	modelAutocomplete(channelId, prefix) {
 		return this.autocompleteListeners.values().next().value?.(channelId, prefix) ?? [];
+	}
+
+	async executeManagerControl(request) {
+		const listener = this.managerControlListeners.values().next().value;
+		return listener
+			? listener(request)
+			: { ok: false, message: "Discord relay is not ready for manager controls." };
+	}
+
+	managerAutocomplete(channelId, prefix) {
+		return this.managerAutocompleteListeners.values().next().value?.(channelId, prefix) ?? [];
 	}
 
 	async ensureProjectChannel(request) {
@@ -325,7 +348,8 @@ try {
 	const { resolveProjectContext, resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
 	const { discoverTaskTitle, parseTaskTitle } = await importBuilt("extensions/discord/task-title.js");
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
-	const { formatManagerTaskSummary, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
+	const { formatManagerTaskSummary, managerTaskCatalogue, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
+	const { ManagerControlExecutor } = await importBuilt("extensions/discord/manager-controls.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const {
@@ -341,9 +365,12 @@ try {
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
 	const {
+		MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES,
+		MAX_MANAGER_TASK_CATALOGUE_ITEMS,
 		MAX_MODEL_AUTOCOMPLETE_CHOICES,
 		MAX_MODEL_CATALOGUE_ITEMS,
 		MAX_SESSION_CONTROL_QUEUE,
+		managerTaskAutocompleteChoices,
 		modelAutocompleteChoices,
 	} = await importBuilt("extensions/discord/controls.js");
 	const { restartOwnedRelay, tryAcquireLeader } = await importBuilt("extensions/discord/leader.js");
@@ -358,6 +385,7 @@ try {
 	const {
 		assertConfiguredCategory,
 		collectChronologicalMessages,
+		managerCommandDefinition,
 		replaceOwnLifecycleReaction,
 		reuseSessionThread,
 	} = await importBuilt("extensions/discord/transport.js");
@@ -433,9 +461,18 @@ try {
 	await writeFile(join(managerFixture, "bin", "manager.mjs"), [
 		'import { readFileSync } from "node:fs";',
 		'import { join } from "node:path";',
-		'console.log(readFileSync(join(process.cwd(), "status.json"), "utf8"));',
+		'const command = process.argv[2];',
+		'if (command === "status") console.log(readFileSync(join(process.cwd(), "status.json"), "utf8"));',
+		'else {',
+		'  const taskPath = process.argv[process.argv.indexOf("--task") + 1];',
+		'  const taskId = taskPath.split("/").at(-1).replace(/\\.md$/, "");',
+		'  const state = command === "handoff-start" ? { state: "direct", worker_session: "mgr-fixture" } : command === "handoff-return" ? { state: "return-requested", worker_session: "mgr-fixture" } : { archived: true, checkout_mode: "repository", slot_state: null };',
+		'  console.log(JSON.stringify({ ok: true, command, task_id: taskId, ...state, replay: false }));',
+		'}',
 		"",
 	].join("\n"));
+	await writeFile(join(managerFixture, "bin", "manager-runtime.mjs"), 'console.log(JSON.stringify({ valid: true }));\n');
+	await writeFile(join(managerFixture, "data", "PROJECTS.md"), "---\nprojects:\n  pi-extensions:\n    repository: /tmp/pi-extensions\n    base_ref: origin/main\n    landing_ref: main\n    checkout_mode: repository\n---\n");
 	const focusedManagerStatus = {
 		ok: true,
 		command: "status",
@@ -485,6 +522,37 @@ try {
 		...focusedManagerStatus,
 		tasks: [{ ...focusedManagerStatus.tasks[0], title: 42 }],
 	}), /invalid task/, "non-string canonical titles must be rejected safely");
+	assert.deepEqual(managerTaskCatalogue(focusedManagerStatus), [{
+		taskId: "discord-manager-task-summary",
+		project: "pi-extensions",
+		title: "Discord manager task summary",
+		status: "ready",
+	}, {
+		taskId: "legacy-task-id",
+		project: "wordpress",
+		title: "Legacy Task ID",
+		status: "planning",
+	}, {
+		taskId: "product-filters-drawer-visibility",
+		project: "woocommerce",
+		title: "Add Product Filters drawer for @everyone",
+		status: "active",
+	}], "the canonical status snapshot must also produce the manager control catalogue");
+	assert.deepEqual(managerTaskAutocompleteChoices(managerTaskCatalogue(focusedManagerStatus), "product filters"), [{
+		name: "Add Product Filters drawer for @everyone — woocommerce (@product-filters-drawer-visibility)",
+		value: "product-filters-drawer-visibility",
+	}], "task autocomplete labels must include title, project, and task ID");
+	const managerDefinition = managerCommandDefinition();
+	assert.equal(managerDefinition.name, "manager");
+	assert.deepEqual(managerDefinition.options.map((option) => option.name), ["handoff", "takeback", "archive", "merge-and-archive"]);
+	for (const option of managerDefinition.options) {
+		assert.deepEqual(option.options.map(({ name, required, autocomplete }) => ({ name, required, autocomplete })), [
+			{ name: "task", required: true, autocomplete: true },
+		], `${option.name} must expose exactly one required dynamic task option`);
+	}
+	assert.equal(JSON.stringify(managerDefinition).includes("project"), false, "/manager must not expose a project option");
+	assert.equal(JSON.stringify(managerDefinition).includes('"ask"'), false, "/manager must not expose ask");
+	assert.equal(JSON.stringify(managerDefinition).includes('"status"'), false, "/manager must not expose status");
 
 	let managerStatus = {
 		...focusedManagerStatus,
@@ -514,9 +582,11 @@ try {
 	assert.match(oversizedManagerStatus, /… \d+ more tasks$/);
 	const managerWatchListeners = [];
 	const producedSummaries = [];
+	const producedManagerCatalogues = [];
 	const producerErrors = [];
 	const managerProducer = await ManagerTaskSummaryProducer.create(managerFixture, {
 		onSummary: (summary) => producedSummaries.push(summary),
+		onTaskCatalogue: (catalogue) => producedManagerCatalogues.push(catalogue),
 		onError: (error) => producerErrors.push(error),
 	}, {
 		readStatus: async () => structuredClone(managerStatus),
@@ -529,20 +599,82 @@ try {
 	});
 	assert.ok(managerProducer, "the-manager checkout must activate the canonical status producer");
 	managerProducer.start();
-	await waitFor(() => producedSummaries.length === 1, "initial manager task snapshot");
+	await waitFor(() => producedSummaries.length === 1 && producedManagerCatalogues.length === 1, "initial manager task snapshot");
 	managerStatus = {
 		...managerStatus,
 		summary: { tasks: 1, pending_events: 1, ready_tasks: 1, orphan_events: 0 },
 		tasks: [{ ...managerStatus.tasks[0], status: "ready", current_action: "review", current_run: "review-1" }],
 	};
 	managerWatchListeners[0]();
-	await waitFor(() => producedSummaries.length === 2, "task-change manager snapshot");
+	await waitFor(() => producedSummaries.length === 2 && producedManagerCatalogues.length === 2, "task-change manager snapshot");
 	assert.match(producedSummaries[1], /📋 \*\*Tasks\*\* · 1 total · 0 active · 1 ready/);
 	assert.match(producedSummaries[1], /\*\*Ready\*\*[\s\S]*✅ \*\*Pi Extensions\*\* — Discord @\u200beveryone summary/);
 	assert.doesNotMatch(producedSummaries[1], /`review · run 1`/, "ready tasks must omit active-run details");
+	assert.equal(producedManagerCatalogues[1][0].status, "ready", "filesystem events must refresh the autocomplete catalogue without polling");
 	assert.deepEqual(producerErrors, []);
 	managerProducer.stop();
 	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
+
+	const managerExecutorRoot = join(dataDir, "manager-executor");
+	await mkdir(join(managerExecutorRoot, "bin"), { recursive: true });
+	await mkdir(join(managerExecutorRoot, "data", "tasks"), { recursive: true });
+	await writeFile(join(managerExecutorRoot, "bin", "manager.mjs"), "// fixture\n");
+	await writeFile(join(managerExecutorRoot, "bin", "manager-runtime.mjs"), "// fixture\n");
+	await writeFile(join(managerExecutorRoot, "data", "PROJECTS.md"), "---\nprojects:\n---\n");
+	const managerProcessCalls = [];
+	let managerProcessFailure;
+	const managerRun = async (executable, args, options) => {
+		managerProcessCalls.push({ executable, args, options });
+		if (args.at(-1) === "validate") return { code: 0, stdout: '{"valid":true}\n', stderr: "" };
+		if (managerProcessFailure) return managerProcessFailure;
+		const command = args[1];
+		const taskId = args[args.indexOf("--task") + 1].split("/").at(-1).replace(/\.md$/, "");
+		const output = command === "handoff-start"
+			? { ok: true, command, task_id: taskId, state: "direct", worker_session: "mgr-worker", replay: false }
+			: command === "handoff-return"
+				? { ok: true, command, task_id: taskId, state: "return-requested", worker_session: "mgr-worker", replay: false }
+				: { ok: true, command, task_id: taskId, archived: true, checkout_mode: "repository", slot_state: null, replay: false };
+		return { code: 0, stdout: `${JSON.stringify(output)}\n`, stderr: "" };
+	};
+	assert.equal(await ManagerControlExecutor.create(managerExecutorRoot, { run: managerRun, environment: { THE_MANAGER_ROLE: "worker" } }), undefined,
+		"worker sessions must never register as verified manager clients");
+	const managerExecutor = await ManagerControlExecutor.create(managerExecutorRoot, { run: managerRun, environment: {} });
+	assert.ok(managerExecutor, "manager controls require the canonical manager/runtime/project structure and successful runtime JSON");
+	const executorCatalogue = [{ taskId: "safe-task", project: "pi-extensions", title: "Safe task", status: "ready" }];
+	for (const action of ["handoff", "takeback", "archive", "merge-and-archive"]) {
+		assert.equal((await managerExecutor.execute({ requestId: `executor-${action}`, action, taskId: "safe-task" }, executorCatalogue)).ok, true);
+	}
+	const managerActionCalls = managerProcessCalls.filter((call) => call.args.at(-1) !== "validate");
+	assert.deepEqual(managerActionCalls.map((call) => call.args[1]), [
+		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive",
+	], "Discord controls must route only through canonical manager CLI composites");
+	assert.ok(managerActionCalls[2].args.includes("--completion-authorized"), "archive must carry explicit non-merge completion authorization");
+	assert.equal(managerActionCalls[3].args.includes("--completion-authorized"), false,
+		"merge-and-archive must use only its dedicated canonical composite");
+	assert.equal(managerActionCalls.every((call) => call.executable === process.execPath && call.options.cwd === managerExecutorRoot), true);
+	assert.equal(managerActionCalls.every((call) => call.args.includes(join(managerExecutorRoot, "data", "tasks", "safe-task.md"))), true,
+		"task selection must resolve only to the canonical active task path");
+	const callsBeforeStale = managerProcessCalls.length;
+	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-stale", action: "archive", taskId: "missing-task" }, executorCatalogue), {
+		ok: false,
+		message: "Select a task from this manager session's current autocomplete catalogue.",
+	});
+	assert.equal(managerProcessCalls.length, callsBeforeStale, "stale catalogue values must be rejected before any process execution");
+	managerProcessFailure = { code: 0, stdout: '{"ok":true,"command":"task-archive","task_id":"other","archived":true}\n', stderr: "" };
+	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-conflict", action: "archive", taskId: "safe-task" }, executorCatalogue), {
+		ok: false,
+		message: "archive returned conflicting manager output.",
+	}, "successful exit status alone must not authorize conflicting JSON");
+	managerProcessFailure = { code: 0, stdout: "not-json", stderr: "" };
+	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-malformed", action: "archive", taskId: "safe-task" }, executorCatalogue), {
+		ok: false,
+		message: "archive returned malformed JSON.",
+	}, "malformed successful output must fail closed");
+	managerProcessFailure = { code: 4, stdout: '{"ok":true}', stderr: "canonical manager safety refusal" };
+	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-refused", action: "archive", taskId: "safe-task" }, executorCatalogue), {
+		ok: false,
+		message: "canonical manager safety refusal",
+	}, "canonical manager CLI safety refusals must be preserved and never inferred as success");
 
 	const epochConfig = join(dataDir, "epoch-config.json");
 	await saveDiscordConfig({ token: "one", guildId: "12345" }, epochConfig);
@@ -712,6 +844,14 @@ try {
 		action: { type: "status" },
 	}), { ok: false, message: "The live Pi client does not support session controls; reconnect or reload it." },
 	"new relays must keep older clients connected while explicitly rejecting unsupported controls");
+	assert.deepEqual(rollingIdentityGateway.managerAutocomplete(legacyMainRegistration.threadId, ""), []);
+	assert.deepEqual(await rollingIdentityGateway.executeManagerControl({
+		requestId: "rolling-non-manager-control",
+		channelId: legacyMainRegistration.threadId,
+		action: "handoff",
+		taskId: "safe-task",
+	}), { ok: false, message: "This live Pi session is not a verified the-manager client." },
+	"manager controls must reject mapped live ordinary Pi sessions");
 	await rollingIdentityCore.stop();
 
 	const controlState = new DiscordStateStore(join(dataDir, "control-state.json"));
@@ -783,6 +923,92 @@ try {
 		action: { type: "status" },
 	}), { ok: false, message: "This Discord thread is not mapped to a Pi session." });
 	await controlCore.stop();
+
+	const managerControlState = new DiscordStateStore(join(dataDir, "manager-control-state.json"));
+	const managerControlGateway = new FakeGateway();
+	const managerControlCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		managerControlState,
+		managerControlGateway,
+	);
+	await managerControlCore.start();
+	const managerControlPrepared = await managerControlCore.prepareRegistration("manager-client", "manager-generation", {
+		cwd: "/the-manager",
+		projectIdentityResolved: true,
+		sessionId: "manager-session",
+	});
+	const deliveredManagerMessages = [];
+	const executedManagerControls = [];
+	const liveManagerCatalogue = [{ taskId: "safe-task", project: "pi-extensions", title: "Safe task", status: "active" }];
+	await managerControlCore.activateRegistration(
+		"manager-client",
+		"manager-generation",
+		"manager-session",
+		(message) => { deliveredManagerMessages.push(message); return true; },
+		undefined,
+		true,
+		{
+			taskCatalogue: liveManagerCatalogue,
+			async execute(request) {
+				executedManagerControls.push(request);
+				return { ok: true, message: `${request.action} ${request.taskId}` };
+			},
+		},
+	);
+	assert.deepEqual(managerControlGateway.managerAutocomplete(managerControlPrepared.threadId, "safe"), [{
+		name: "Safe task — pi-extensions (@safe-task)",
+		value: "safe-task",
+	}], "autocomplete must be scoped to the mapped live manager thread");
+	assert.deepEqual(managerControlGateway.managerAutocomplete("not-manager-thread", "safe"), []);
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "stale-manager-task",
+		channelId: managerControlPrepared.threadId,
+		action: "archive",
+		taskId: "missing-task",
+	}), { ok: false, message: "Select a task from this manager session's current autocomplete catalogue." });
+	const duplicateManagerRequest = {
+		requestId: "duplicate-manager-control",
+		channelId: managerControlPrepared.threadId,
+		action: "handoff",
+		taskId: "safe-task",
+	};
+	assert.deepEqual(await Promise.all([
+		managerControlGateway.executeManagerControl(duplicateManagerRequest),
+		managerControlGateway.executeManagerControl(duplicateManagerRequest),
+	]), [{ ok: true, message: "handoff safe-task" }, { ok: true, message: "handoff safe-task" }]);
+	assert.equal(executedManagerControls.length, 1, "Discord retries must execute each manager mutation once");
+	managerControlCore.updateManagerTaskCatalogue("manager-client", "manager-generation", "manager-session", [{
+		taskId: "new-task", project: "wordpress", title: "New task", status: "ready",
+	}]);
+	assert.deepEqual(managerControlGateway.managerAutocomplete(managerControlPrepared.threadId, ""), [{
+		name: "New task — wordpress (@new-task)",
+		value: "new-task",
+	}], "live manager task-state refreshes must replace the cached catalogue");
+	assert.deepEqual(await managerControlGateway.executeManagerControl({ ...duplicateManagerRequest, requestId: "removed-task", taskId: "safe-task" }), {
+		ok: false,
+		message: "Select a task from this manager session's current autocomplete catalogue.",
+	});
+	await managerControlGateway.emit({
+		id: "manager-ordinary-message",
+		channelId: managerControlPrepared.threadId,
+		content: "ordinary manager thread message",
+		authorBot: false,
+	});
+	assert.equal(deliveredManagerMessages.at(-1).content, "ordinary manager thread message", "manager controls must not alter ordinary messages");
+	managerControlCore.unregisterClient("manager-client", "manager-generation");
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "offline-manager-control",
+		channelId: managerControlPrepared.threadId,
+		action: "takeback",
+		taskId: "new-task",
+	}), { ok: false, message: "The manager session mapped to this thread is offline." });
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "unmapped-manager-control",
+		channelId: "never-mapped-manager",
+		action: "takeback",
+		taskId: "new-task",
+	}), { ok: false, message: "This Discord thread is not mapped to a Pi session." });
+	await managerControlCore.stop();
 
 	FakeGateway.channelMessages.delete("summary-channel");
 	FakeGateway.summaryEvents.length = 0;
@@ -978,10 +1204,30 @@ try {
 		sessionControls: { modelCatalogue: [...controlRegistrationFrame.sessionControls.modelCatalogue, { provider: "p", id: "overflow", name: "Overflow" }] },
 	}), false, "registration model catalogues must be bounded");
 	assert.equal(isClientFrame({ type: "control_result", requestId: "control-1", ok: true, message: "done" }), true);
+	const managerTask = { taskId: "safe-task", project: "pi-extensions", title: "Safe task", status: "active" };
+	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, managerControls: { taskCatalogue: [managerTask] } }), true);
+	assert.equal(isClientFrame({
+		...resolvedRegistrationFrame,
+		managerControls: { taskCatalogue: Array.from({ length: MAX_MANAGER_TASK_CATALOGUE_ITEMS + 1 }, () => managerTask) },
+	}), false, "manager registration catalogues must be bounded");
+	assert.equal(isClientFrame({
+		...resolvedRegistrationFrame,
+		managerControls: { taskCatalogue: [{ ...managerTask, taskId: "../hostile" }] },
+	}), false, "manager task IDs must be safe canonical IDs");
+	assert.equal(isClientFrame({ type: "manager_catalogue", requestId: "catalogue-1", taskCatalogue: [managerTask] }), true);
+	assert.equal(isClientFrame({ type: "manager_control_result", requestId: "manager-1", ok: true, message: "done" }), true);
 	assert.equal(isClientFrame({ type: "release_inbound_images", requestId: "release-1", messageId: "message-1" }), true);
 	assert.equal(isServerFrame({ type: "inbound_images_released", requestId: "release-1", messageId: "message-1" }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "high" } }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "turbo" } }), false);
+	for (const action of ["handoff", "takeback", "archive", "merge-and-archive"]) {
+		assert.equal(isServerFrame({ type: "manager_control", requestId: `manager-${action}`, action, taskId: "safe-task" }), true);
+	}
+	for (const action of ["ask", "status", "merge", "handoff-now"]) {
+		assert.equal(isServerFrame({ type: "manager_control", requestId: `manager-${action}`, action, taskId: "safe-task" }), false,
+			`unsupported manager action ${action} must fail closed`);
+	}
+	assert.equal(isServerFrame({ type: "manager_control", requestId: "manager-hostile", action: "archive", taskId: "../safe-task" }), false);
 
 	const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 	const validAttachmentUrl = "https://cdn.discordapp.com/attachments/12345/67890/image.png?ex=signed";
@@ -1356,6 +1602,14 @@ try {
 	}));
 	assert.equal(modelAutocompleteChoices(autocompleteCatalogue, "matching").length, MAX_MODEL_AUTOCOMPLETE_CHOICES);
 	assert.ok(modelAutocompleteChoices(autocompleteCatalogue, "model-39").some((choice) => choice.value === "provider/model-39"));
+	const managerAutocompleteCatalogue = Array.from({ length: 40 }, (_, index) => ({
+		taskId: `task-${index}`,
+		project: "pi-extensions",
+		title: `Matching manager task ${index}`,
+		status: "active",
+	}));
+	assert.equal(managerTaskAutocompleteChoices(managerAutocompleteCatalogue, "matching").length, MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES);
+	assert.ok(managerTaskAutocompleteChoices(managerAutocompleteCatalogue, "task-39").some((choice) => choice.value === "task-39"));
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "summary" }), true);
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "x".repeat(2_001) }), false);
 	const previousValidator = (frame) => frame?.type === "outbound" && typeof frame.requestId === "string" &&
@@ -1840,7 +2094,14 @@ try {
 		sessionId: "manager-summary-session",
 		sessionName: "Manager",
 	});
-	await managerSummarySession.emit("session_start", { reason: "startup" });
+	const inheritedManagerRole = process.env.THE_MANAGER_ROLE;
+	delete process.env.THE_MANAGER_ROLE;
+	try {
+		await managerSummarySession.emit("session_start", { reason: "startup" });
+	} finally {
+		if (inheritedManagerRole === undefined) delete process.env.THE_MANAGER_ROLE;
+		else process.env.THE_MANAGER_ROLE = inheritedManagerRole;
+	}
 	const managerSummaryMapping = await new DiscordStateStore(stateFile).getSession("manager-summary-session");
 	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text.includes("✅ **Pi Extensions** — Discord @\u200beveryone summary"),
 		"extension-produced initial manager summary");
@@ -1856,6 +2117,19 @@ try {
 		"extension-produced manager task-change reconciliation");
 	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
 		"producer task change must edit the latest parent summary");
+	await waitFor(() => FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "discord").length === 1,
+		"manager catalogue registration and live IPC refresh");
+	assert.deepEqual(FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "discord"), [{
+		name: "Discord @everyone summary — pi-extensions (@discord-manager-task-summary)",
+		value: "discord-manager-task-summary",
+	}]);
+	assert.deepEqual(await FakeGateway.instances[0].executeManagerControl({
+		requestId: "manager-end-to-end-handoff",
+		channelId: managerSummaryMapping.threadId,
+		action: "handoff",
+		taskId: "discord-manager-task-summary",
+	}), { ok: true, message: "Direct handoff started for @discord-manager-task-summary." },
+	"mapped manager controls must traverse Discord, relay IPC, verified client, runtime validation, and canonical manager CLI");
 
 	const namingState = new DiscordStateStore(stateFile);
 	const taskNamedMapping = await namingState.getSession(taskNamedSessionId);
@@ -2357,6 +2631,10 @@ try {
 	await waitFor(() => gateway.modelAutocomplete(firstThread, "").length > 0, "model catalogue republish after relay restart");
 	assert.equal(gateway.modelAutocomplete(firstThread, "")[0].value, "anthropic/claude-test",
 		"re-registration must refresh the relay catalogue with Pi's current model first");
+	await waitFor(() => gateway.managerAutocomplete(managerSummaryMapping.threadId, "").length > 0,
+		"manager task catalogue republish after relay restart");
+	assert.equal(gateway.managerAutocomplete(managerSummaryMapping.threadId, "")[0].value, "discord-manager-task-summary",
+		"manager reconnects must re-register the latest bounded task catalogue without polling");
 	await waitFor(() => FakeGateway.lifecycleReactionEvents.some((event) =>
 		event.messageId === "19" && event.reaction === "🤔" && event.gateway === gateway), "lifecycle replay after reconnect");
 	assert.notEqual(gateway, preReconnectGateway);

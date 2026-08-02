@@ -16,9 +16,11 @@ import { resolveProjectContext } from "./project-identity.js";
 import { discoverTaskTitle } from "./task-title.js";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
+import { ManagerControlExecutor } from "./manager-controls.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
 	modelChoiceValue,
+	type ManagerTaskCatalogueEntry,
 	type PiModelCatalogueEntry,
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
@@ -66,6 +68,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 	return function discordExtension(pi: ExtensionAPI): void {
 		let bridge: DiscordBridge | undefined;
 		let taskSummaryProducer: ManagerTaskSummaryProducer | undefined;
+		let managerTaskCatalogue: ManagerTaskCatalogueEntry[] = [];
 		let desiredTaskSummary: string | undefined;
 		let publishingTaskSummary: Promise<void> | undefined;
 		let taskSummaryPublishRequested = false;
@@ -181,6 +184,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		async function stopBridge(ctx: ExtensionContext): Promise<void> {
 			taskSummaryProducer?.stop();
 			taskSummaryProducer = undefined;
+			managerTaskCatalogue = [];
 			desiredTaskSummary = undefined;
 			taskSummaryPublishRequested = false;
 			const active = bridge;
@@ -205,6 +209,27 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			}
 
 			const { session, checkoutRoot } = await sessionFrom(ctx);
+			let managerExecutor: ManagerControlExecutor | undefined;
+			try {
+				managerExecutor = await ManagerControlExecutor.create(checkoutRoot);
+			} catch (error) {
+				ctx.ui.notify(`Discord manager controls disabled: ${errorMessage(error)}`, "warning");
+			}
+			const managerProducer = await ManagerTaskSummaryProducer.create(checkoutRoot, {
+				onSummary(summary) {
+					desiredTaskSummary = summary;
+					publishTaskSummary(ctx);
+				},
+				onTaskCatalogue(catalogue) {
+					managerTaskCatalogue = catalogue;
+					void bridge?.updateManagerTaskCatalogue(catalogue).catch((error) => {
+						ctx.ui.notify(`Discord manager task catalogue update deferred: ${errorMessage(error)}`, "warning");
+					});
+				},
+				onError(error) {
+					ctx.ui.notify(`Discord task-summary producer: ${error.message}`, "warning");
+				},
+			});
 			const candidate = new DiscordBridge(
 				config,
 				session,
@@ -227,6 +252,14 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					supportsImageInput: () => ctx.model?.input?.includes("image") === true,
 					modelCatalogue: () => modelCatalogue(ctx),
 					onControl: (request) => executeSessionControl(request, ctx),
+					...(managerExecutor && managerProducer ? {
+						managerTaskCatalogue: () => managerTaskCatalogue,
+						onManagerControl: async (request) => {
+							const result = await managerExecutor!.execute(request, managerTaskCatalogue);
+							managerProducer.requestRefresh(0);
+							return result;
+						},
+					} : {}),
 				},
 				{
 					paths,
@@ -245,17 +278,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				bridge = candidate;
 				await candidate.start();
 				setConnectedStatus(ctx);
-				taskSummaryProducer = await ManagerTaskSummaryProducer.create(checkoutRoot, {
-					onSummary(summary) {
-						desiredTaskSummary = summary;
-						publishTaskSummary(ctx);
-					},
-					onError(error) {
-						ctx.ui.notify(`Discord task-summary producer: ${error.message}`, "warning");
-					},
-				});
+				taskSummaryProducer = managerProducer;
 				taskSummaryProducer?.start();
 			} catch (error) {
+				managerProducer?.stop();
 				await candidate.stop().catch(() => {});
 				bridge = undefined;
 				ctx.ui.setStatus(STATUS_KEY, STATUS_ERROR);

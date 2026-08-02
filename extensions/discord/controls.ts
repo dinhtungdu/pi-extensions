@@ -1,5 +1,7 @@
 export const MAX_MODEL_CATALOGUE_ITEMS = 500;
 export const MAX_MODEL_AUTOCOMPLETE_CHOICES = 25;
+export const MAX_MANAGER_TASK_CATALOGUE_ITEMS = 500;
+export const MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES = 25;
 export const MAX_SESSION_CONTROL_TEXT_LENGTH = 2_000;
 export const MAX_SESSION_CONTROL_QUEUE = 32;
 export const MAX_RECENT_SESSION_CONTROLS = 2_000;
@@ -48,6 +50,69 @@ export interface DiscordSessionControlRequest {
 export interface DiscordModelChoice {
 	name: string;
 	value: string;
+}
+
+export const MANAGER_CONTROL_ACTIONS = ["handoff", "takeback", "archive", "merge-and-archive"] as const;
+export type ManagerControlAction = typeof MANAGER_CONTROL_ACTIONS[number];
+
+export interface ManagerTaskCatalogueEntry {
+	taskId: string;
+	project: string;
+	title: string;
+	status: string;
+}
+
+export interface PiManagerControlRequest {
+	requestId: string;
+	action: ManagerControlAction;
+	taskId: string;
+}
+
+export interface DiscordManagerControlRequest extends PiManagerControlRequest {
+	channelId: string;
+}
+
+const MANAGER_TASK_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+export function isManagerControlAction(value: unknown): value is ManagerControlAction {
+	return typeof value === "string" && (MANAGER_CONTROL_ACTIONS as readonly string[]).includes(value);
+}
+
+export function isManagerTaskCatalogue(value: unknown): value is ManagerTaskCatalogueEntry[] {
+	if (!Array.isArray(value) || value.length > MAX_MANAGER_TASK_CATALOGUE_ITEMS) return false;
+	const taskIds = new Set<string>();
+	return value.every((task) => {
+		if (!task || typeof task !== "object" || Array.isArray(task)) return false;
+		const entry = task as Record<string, unknown>;
+		if (typeof entry.taskId !== "string" || taskIds.has(entry.taskId)) return false;
+		taskIds.add(entry.taskId);
+		return entry.taskId.length <= 100 && MANAGER_TASK_ID.test(entry.taskId) &&
+			typeof entry.project === "string" && entry.project.length > 0 && entry.project.length <= 100 &&
+			typeof entry.title === "string" && entry.title.length > 0 && entry.title.length <= 200 &&
+			typeof entry.status === "string" && entry.status.length > 0 && entry.status.length <= 32;
+	});
+}
+
+export function isPiManagerControlRequest(value: unknown): value is PiManagerControlRequest {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const request = value as Record<string, unknown>;
+	return typeof request.requestId === "string" && request.requestId.length > 0 &&
+		isManagerControlAction(request.action) && typeof request.taskId === "string" &&
+		request.taskId.length <= 100 && MANAGER_TASK_ID.test(request.taskId);
+}
+
+export function managerTaskAutocompleteChoices(
+	catalogue: readonly ManagerTaskCatalogueEntry[],
+	prefix: string,
+): DiscordModelChoice[] {
+	const query = prefix.trim().toLocaleLowerCase();
+	return catalogue
+		.filter((task) => !query || `${task.taskId}\n${task.project}\n${task.title}\n${task.status}`.toLocaleLowerCase().includes(query))
+		.slice(0, MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES)
+		.map((task) => ({
+			name: truncate(`${task.title} — ${task.project} (@${task.taskId})`, 100),
+			value: task.taskId,
+		}));
 }
 
 export function isPiThinkingLevel(value: unknown): value is PiThinkingLevel {

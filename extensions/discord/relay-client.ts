@@ -11,7 +11,10 @@ import { restartOwnedRelay } from "./leader.js";
 import type { QueuedInboundImage } from "./inbound-images.js";
 import {
 	boundedControlResult,
+	MAX_MANAGER_TASK_CATALOGUE_ITEMS,
 	MAX_MODEL_CATALOGUE_ITEMS,
+	type ManagerTaskCatalogueEntry,
+	type PiManagerControlRequest,
 	type PiModelCatalogueEntry,
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
@@ -34,6 +37,7 @@ export interface RelayClientStatus {
 	threadId?: string;
 	projectSummaries?: true;
 	sessionControls?: true;
+	managerControls?: true;
 	inboundImages?: true;
 }
 
@@ -43,6 +47,8 @@ export interface RelayClientCallbacks {
 	onStatus(status: RelayClientStatus): void;
 	modelCatalogue?(): PiModelCatalogueEntry[];
 	onControl?(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
+	managerTaskCatalogue?(): ManagerTaskCatalogueEntry[];
+	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 }
 
 export interface RelayClientDependencies {
@@ -195,6 +201,16 @@ export class LocalRelayClient {
 		return true;
 	}
 
+	async updateManagerTaskCatalogue(catalogue: readonly ManagerTaskCatalogueEntry[]): Promise<boolean> {
+		if (!this.callbacks.onManagerControl || !this.currentStatus.managerControls) return false;
+		await this.sendRequest({
+			type: "manager_catalogue",
+			requestId: randomUUID(),
+			taskCatalogue: catalogue.slice(0, MAX_MANAGER_TASK_CATALOGUE_ITEMS).map((task) => ({ ...task })),
+		}, REQUEST_TIMEOUT_MS);
+		return true;
+	}
+
 	async acknowledgeInbound(messageId: string): Promise<void> {
 		await this.sendRequest({ type: "ack_inbound", requestId: randomUUID(), messageId }, ACK_TIMEOUT_MS);
 	}
@@ -303,6 +319,9 @@ export class LocalRelayClient {
 				const modelCatalogue = this.callbacks.onControl
 					? (this.callbacks.modelCatalogue?.() ?? []).slice(0, MAX_MODEL_CATALOGUE_ITEMS)
 					: undefined;
+				const managerTaskCatalogue = this.callbacks.onManagerControl
+					? (this.callbacks.managerTaskCatalogue?.() ?? []).slice(0, MAX_MANAGER_TASK_CATALOGUE_ITEMS)
+					: undefined;
 				const frame: ClientFrame = {
 					type: "register",
 					token: this.token!,
@@ -313,6 +332,7 @@ export class LocalRelayClient {
 					...this.registration,
 					inboundImages: true,
 					...(modelCatalogue ? { sessionControls: { modelCatalogue } } : {}),
+					...(managerTaskCatalogue ? { managerControls: { taskCatalogue: managerTaskCatalogue } } : {}),
 				};
 				if (!writer.write(encodeFrame(frame))) {
 					waiter.reject(new Error("Local Discord relay request queue is full during registration"));
@@ -372,6 +392,7 @@ export class LocalRelayClient {
 				threadId: frame.threadId,
 				...(frame.projectSummaries ? { projectSummaries: true as const } : {}),
 				...(frame.sessionControls ? { sessionControls: true as const } : {}),
+				...(frame.managerControls ? { managerControls: true as const } : {}),
 				...(frame.inboundImages ? { inboundImages: true as const } : {}),
 			});
 			this.flushLifecycleStatuses();
@@ -419,13 +440,34 @@ export class LocalRelayClient {
 			}
 			return;
 		}
+		if (frame.type === "manager_control") {
+			let result: PiSessionControlResult;
+			try {
+				result = this.callbacks.onManagerControl
+					? boundedControlResult(await this.callbacks.onManagerControl({
+						requestId: frame.requestId,
+						action: frame.action,
+						taskId: frame.taskId,
+					}))
+					: { ok: false, message: "This Pi client does not support Discord manager controls." };
+			} catch (error) {
+				result = boundedControlResult({ ok: false, message: asError(error).message });
+			}
+			if (this.socket === socket && this.writer) {
+				if (!this.writer.write(encodeFrame({ type: "manager_control_result", requestId: frame.requestId, ...result }))) {
+					this.callbacks.onError(new Error("Local Discord relay request queue is full while returning a manager control result"));
+				}
+			}
+			return;
+		}
 		if (frame.type === "replacing") {
 			socket.destroy();
 			waiter.reject(new Error(`Local Discord relay is replacing configuration with epoch ${frame.configEpoch}`));
 			return;
 		}
 		if (frame.type === "inbound_acked" || frame.type === "inbound_images_released" ||
-			frame.type === "outbound_queued" || frame.type === "project_summary_queued") {
+			frame.type === "outbound_queued" || frame.type === "project_summary_queued" ||
+			frame.type === "manager_catalogue_updated") {
 			const pending = this.pendingRequests.get(frame.requestId);
 			if (pending) {
 				clearTimeout(pending.timer);

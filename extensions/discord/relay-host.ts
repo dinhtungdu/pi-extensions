@@ -7,6 +7,7 @@ import { BoundedSocketWriter, MAX_QUEUED_IPC_BYTES, MAX_QUEUED_IPC_FRAMES } from
 import { DiscordRelayCore } from "./relay-core.js";
 import {
 	MAX_SESSION_CONTROL_QUEUE,
+	type PiManagerControlRequest,
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
 } from "./controls.js";
@@ -26,6 +27,7 @@ interface SocketState {
 	sessionId?: string;
 	closed: boolean;
 	registered: boolean;
+	managerControls: boolean;
 	buffer: string;
 	queue: Promise<void>;
 	queuedInputFrames: number;
@@ -35,11 +37,13 @@ interface SocketState {
 		resolve(result: PiSessionControlResult): void;
 		reject(error: Error): void;
 		timer: ReturnType<typeof setTimeout>;
+		resultType: "control_result" | "manager_control_result";
 	}>;
 }
 
 const ZERO_CLIENT_GRACE_MS = 1_000;
 const SESSION_CONTROL_TIMEOUT_MS = 10_000;
+const MANAGER_CONTROL_TIMEOUT_MS = 170_000;
 
 export class LocalRelayHost {
 	private server: Server | undefined;
@@ -148,6 +152,7 @@ export class LocalRelayHost {
 		Object.assign(state, {
 			closed: false,
 			registered: false,
+			managerControls: false,
 			buffer: "",
 			queue: Promise.resolve(),
 			queuedInputFrames: 0,
@@ -254,6 +259,7 @@ export class LocalRelayHost {
 			state.clientId = parsed.clientId;
 			state.generation = parsed.generation;
 			state.sessionId = parsed.sessionId;
+			state.managerControls = parsed.managerControls !== undefined;
 			if (!this.write(state, {
 				type: "registered",
 				channelId: prepared.channelId,
@@ -263,6 +269,7 @@ export class LocalRelayHost {
 				lifecycleReactions: true,
 				projectSummaries: true,
 				sessionControls: true,
+				managerControls: true,
 				inboundImages: true,
 			})) throw new Error("Local Discord relay response queue is full");
 			await this.options.core.activateRegistration(
@@ -280,6 +287,10 @@ export class LocalRelayHost {
 					execute: (request) => this.requestControl(state, request),
 				} : undefined,
 				parsed.inboundImages === true,
+				parsed.managerControls ? {
+					taskCatalogue: parsed.managerControls.taskCatalogue,
+					execute: (request) => this.requestManagerControl(state, request),
+				} : undefined,
 			);
 			if (state.closed) {
 				this.options.core.unregisterClient(parsed.clientId, parsed.generation);
@@ -292,12 +303,23 @@ export class LocalRelayHost {
 		const generation = state.generation!;
 		const sessionId = state.sessionId!;
 		if (parsed.type === "register") throw new Error("Local Discord relay client is already registered");
-		if (parsed.type === "control_result") {
+		if (parsed.type === "control_result" || parsed.type === "manager_control_result") {
 			const pending = state.pendingControls.get(parsed.requestId);
-			if (!pending) return;
+			if (!pending || pending.resultType !== parsed.type) return;
 			clearTimeout(pending.timer);
 			state.pendingControls.delete(parsed.requestId);
 			pending.resolve({ ok: parsed.ok, message: parsed.message });
+			return;
+		}
+		if (parsed.type === "manager_catalogue") {
+			if (!state.managerControls) throw new Error("Local client is not registered for manager controls");
+			try {
+				this.options.core.updateManagerTaskCatalogue(clientId, generation, sessionId, parsed.taskCatalogue);
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
+				return;
+			}
+			this.write(state, { type: "manager_catalogue_updated", requestId: parsed.requestId });
 			return;
 		}
 		if (parsed.type === "ack_inbound") {
@@ -351,23 +373,44 @@ export class LocalRelayHost {
 		if (parsed.type === "unregister") socket.end();
 	}
 
+	private requestManagerControl(state: SocketState, request: PiManagerControlRequest): Promise<PiSessionControlResult> {
+		return this.requestClientControl(
+			state,
+			{ type: "manager_control", requestId: request.requestId, action: request.action, taskId: request.taskId },
+			MANAGER_CONTROL_TIMEOUT_MS,
+		);
+	}
+
 	private requestControl(state: SocketState, request: PiSessionControlRequest): Promise<PiSessionControlResult> {
+		return this.requestClientControl(
+			state,
+			{ type: "control", requestId: request.requestId, action: request.action },
+			SESSION_CONTROL_TIMEOUT_MS,
+		);
+	}
+
+	private requestClientControl(
+		state: SocketState,
+		frame: ServerFrame & { requestId: string },
+		timeoutMs: number,
+	): Promise<PiSessionControlResult> {
 		if (state.closed) return Promise.reject(new Error("Pi session is disconnected"));
 		if (state.pendingControls.size >= MAX_SESSION_CONTROL_QUEUE) {
 			return Promise.reject(new Error("Pi session control IPC queue is full"));
 		}
-		const existing = state.pendingControls.get(request.requestId);
+		const existing = state.pendingControls.get(frame.requestId);
 		if (existing) return Promise.reject(new Error("Pi session control request is already pending"));
+		const resultType = frame.type === "manager_control" ? "manager_control_result" : "control_result";
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
-				state.pendingControls.delete(request.requestId);
-				reject(new Error(`Pi session control timed out after ${SESSION_CONTROL_TIMEOUT_MS}ms`));
-			}, SESSION_CONTROL_TIMEOUT_MS);
+				state.pendingControls.delete(frame.requestId);
+				reject(new Error(`Pi session control timed out after ${timeoutMs}ms`));
+			}, timeoutMs);
 			timer.unref();
-			state.pendingControls.set(request.requestId, { resolve, reject, timer });
-			if (!this.write(state, { type: "control", requestId: request.requestId, action: request.action })) {
+			state.pendingControls.set(frame.requestId, { resolve, reject, timer, resultType });
+			if (!this.write(state, frame)) {
 				clearTimeout(timer);
-				state.pendingControls.delete(request.requestId);
+				state.pendingControls.delete(frame.requestId);
 				reject(new Error("Local Discord relay response queue is full"));
 			}
 		});
