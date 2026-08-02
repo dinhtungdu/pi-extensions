@@ -66,7 +66,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				cwd: project.projectIdentity,
 				projectIdentityResolved: true,
 				sessionId: ctx.sessionManager.getSessionId(),
-				sessionName: await discoverTaskTitle(project.checkoutRoot) ?? pi.getSessionName(),
+				sessionName: pi.getSessionName() ?? await discoverTaskTitle(project.checkoutRoot),
 			};
 		}
 

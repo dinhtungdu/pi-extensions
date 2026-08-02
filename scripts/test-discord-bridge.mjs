@@ -157,6 +157,7 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName, entrie
 	const userWaiters = [];
 	let idle = true;
 	let injectionError = false;
+	let currentSessionName = sessionName;
 	const pi = {
 		on(name, handler) {
 			const handlers = events.get(name) ?? [];
@@ -173,7 +174,7 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName, entrie
 			userWaiters.shift()?.(message);
 		},
 		getSessionName() {
-			return sessionName;
+			return currentSessionName;
 		},
 		appendEntry(customType, data) {
 			entries.push({ type: "custom", customType, data });
@@ -199,6 +200,7 @@ function createExtensionHarness(extension, { cwd, sessionId, sessionName, entrie
 		entries,
 		setIdle(value) { idle = value; },
 		setInjectionError(value) { injectionError = value; },
+		setSessionName(value) { currentSessionName = value; },
 		nextUserMessage() {
 			return new Promise((resolveMessage) => userWaiters.push(resolveMessage));
 		},
@@ -974,21 +976,67 @@ try {
 		sessionName: "Second session",
 	});
 	await second.emit("session_start", { reason: "startup" });
+	const taskNamedSessionId = "33333333-tasktitle";
 	const taskNamed = createExtensionHarness(extension, {
 		cwd: linkedSubdirectory,
-		sessionId: "tasktitle-33333333",
-		sessionName: "Generic Pi session",
+		sessionId: taskNamedSessionId,
+		sessionName: "Named Pi session",
 	});
 	await taskNamed.emit("session_start", { reason: "startup" });
-	const taskNamedMapping = await new DiscordStateStore(stateFile).getSession("tasktitle-33333333");
-	const taskThreadName = sessionThreadName("tasktitle-33333333", "Implement task-title thread naming");
-	assert.ok(FakeGateway.instances[0].threadRequests.some((request) => request.name === taskThreadName), "explicit worktree task title must override the Pi session name at registration");
+	const taskNamedSiblingSessionId = "44444444-tasktitle";
+	const taskNamedSibling = createExtensionHarness(extension, {
+		cwd: linkedSubdirectory,
+		sessionId: taskNamedSiblingSessionId,
+		sessionName: "Named Pi session",
+	});
+	await taskNamedSibling.emit("session_start", { reason: "startup" });
+	const taskFallbackSessionId = "55555555-tasktitle";
+	const taskFallback = createExtensionHarness(extension, {
+		cwd: linkedSubdirectory,
+		sessionId: taskFallbackSessionId,
+		sessionName: undefined,
+	});
+	await taskFallback.emit("session_start", { reason: "startup" });
+	const metadataAbsentSessionId = "66666666-generic";
+	const metadataAbsent = createExtensionHarness(extension, {
+		cwd: nonGitDirectory,
+		sessionId: metadataAbsentSessionId,
+		sessionName: undefined,
+	});
+	await metadataAbsent.emit("session_start", { reason: "startup" });
+
+	const namingState = new DiscordStateStore(stateFile);
+	const taskNamedMapping = await namingState.getSession(taskNamedSessionId);
+	const taskNamedSiblingMapping = await namingState.getSession(taskNamedSiblingSessionId);
+	const taskFallbackMapping = await namingState.getSession(taskFallbackSessionId);
+	const namedThreadName = sessionThreadName(taskNamedSessionId, "Named Pi session");
+	const namedSiblingThreadName = sessionThreadName(taskNamedSiblingSessionId, "Named Pi session");
+	assert.ok(FakeGateway.instances[0].threadRequests.some((request) => request.name === namedThreadName), "Pi session name must override TASK.md at registration");
+	assert.ok(FakeGateway.instances[0].threadRequests.some((request) => request.name === namedSiblingThreadName), "each named Pi session must retain its session-ID suffix");
+	assert.notEqual(namedThreadName, namedSiblingThreadName, "named sessions under one task must generate unique thread names");
+	assert.equal(taskNamedMapping.channelId, taskNamedSiblingMapping.channelId, "named sessions under one task must share its project channel");
+	assert.notEqual(taskNamedMapping.threadId, taskNamedSiblingMapping.threadId, "named sessions under one task must retain separate threads");
+	assert.ok(FakeGateway.instances[0].threadRequests.some(
+		(request) => request.name === sessionThreadName(taskFallbackSessionId, "Implement task-title thread naming"),
+	), "TASK.md must name a new thread when the Pi session has no display name");
+	assert.equal(taskFallbackMapping.channelId, taskNamedMapping.channelId, "TASK.md fallback must preserve worktree project routing");
+	assert.ok(FakeGateway.instances[0].threadRequests.some(
+		(request) => request.name === sessionThreadName(metadataAbsentSessionId),
+	), "absent Pi and task metadata must use the generic session fallback");
+
+	const threadRequestCountBeforeRename = FakeGateway.instances[0].threadRequests.length;
+	taskNamed.setSessionName("Renamed Pi session");
 	await writeFile(join(linkedWorktree, "TASK.md"), "# A changed task title must not rename an existing thread\n");
 	await taskNamed.runCommand("discord", "reconnect");
+	assert.deepEqual(
+		FakeGateway.instances[0].threadRequests.slice(threadRequestCountBeforeRename),
+		[{ channelId: taskNamedMapping.channelId, mappedThreadId: taskNamedMapping.threadId, name: sessionThreadName(taskNamedSessionId, "Renamed Pi session") }],
+		"reconnecting must resolve current naming metadata while targeting the existing mapping",
+	);
 	assert.equal(
-		(await new DiscordStateStore(stateFile).getSession("tasktitle-33333333")).threadId,
+		(await new DiscordStateStore(stateFile).getSession(taskNamedSessionId)).threadId,
 		taskNamedMapping.threadId,
-		"rediscovered task titles must not rename an existing session thread",
+		"changed naming metadata must not rename an existing session thread",
 	);
 	assert.equal(FakeGateway.instances.length, 1, "concurrent Pi clients must share one Discord gateway");
 	assert.equal(FakeGateway.activeConnections, 1);
@@ -1006,6 +1054,9 @@ try {
 	assert.deepEqual(first.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
 	assert.deepEqual(second.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
 	assert.deepEqual(taskNamed.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
+	assert.deepEqual(taskNamedSibling.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
+	assert.deepEqual(taskFallback.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
+	assert.deepEqual(metadataAbsent.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"]);
 	assert.ok(FakeGateway.instances[0].threadRequests.some(
 		(request) => request.name === sessionThreadName("session-11111111", "First session"),
 	), "absent task metadata must preserve the Pi session name");
@@ -1263,6 +1314,9 @@ try {
 	await resumed.emit("session_shutdown", { reason: "quit" });
 
 	await taskNamed.emit("session_shutdown", { reason: "quit" });
+	await taskNamedSibling.emit("session_shutdown", { reason: "quit" });
+	await taskFallback.emit("session_shutdown", { reason: "quit" });
+	await metadataAbsent.emit("session_shutdown", { reason: "quit" });
 	await second.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "zero-client relay child shutdown");
 	FakeGateway.catchUpByThread.set(inactiveThread, [
@@ -1330,7 +1384,7 @@ try {
 	assert.equal(rolloverA.statuses.at(-1)?.[1], "💬");
 	await rolloverA.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "rollover relay shutdown");
-	for (const harness of [first, second, taskNamed, failedInjection, retriedInjection, inactive, resumed, restarted, rolloverA, rolloverB]) {
+	for (const harness of [first, second, taskNamed, taskNamedSibling, taskFallback, metadataAbsent, failedInjection, retriedInjection, inactive, resumed, restarted, rolloverA, rolloverB]) {
 		for (const [key, text] of harness.statuses) {
 			assert.equal(key, PACKAGE_FOOTER_STATUS_KEYS.discord);
 			assert.ok(text === undefined || text === "💬" || text === "🔄" || text === "⚠️", `footer status must be compact: ${text}`);
