@@ -358,32 +358,82 @@ try {
 		'console.log(readFileSync(join(process.cwd(), "status.json"), "utf8"));',
 		"",
 	].join("\n"));
-	let managerStatus = {
+	const focusedManagerStatus = {
 		ok: true,
 		command: "status",
 		schema_version: 1,
+		summary: { tasks: 3, pending_events: 0, ready_tasks: 1, orphan_events: 0 },
+		tasks: [{
+			task_id: "discord-manager-task-summary",
+			title: "Discord manager task summary",
+			project: "pi-extensions",
+			status: "ready",
+			current_action: "review",
+			current_run: "review-3",
+		}, {
+			task_id: "legacy-task-id",
+			project: "wordpress",
+			status: "planning",
+			current_action: "none",
+			current_run: "none",
+		}, {
+			task_id: "product-filters-drawer-visibility",
+			title: "Add Product Filters drawer for @everyone",
+			project: "woocommerce",
+			status: "active",
+			current_action: "implement",
+			current_run: "implement-4",
+		}],
+	};
+	assert.equal(formatManagerTaskSummary(focusedManagerStatus), [
+		"📋 **Tasks** · 3 total · 1 active · 1 ready",
+		"",
+		"**Active**",
+		"🟡 **WooCommerce** — Add Product Filters drawer for @\u200beveryone",
+		"  `implement · run 4`",
+		"",
+		"**Ready**",
+		"✅ **Pi Extensions** — Discord manager task summary",
+		"",
+		"**Planning**",
+		"⚪ **WordPress** — Legacy Task ID",
+	].join("\n"), "formatter must group statuses, prefer canonical titles, and retain compatible fallbacks");
+	assert.doesNotMatch(formatManagerTaskSummary({
+		...focusedManagerStatus,
+		tasks: [{ ...focusedManagerStatus.tasks[0], title: "Never ``` use a code block" }],
+		summary: { ...focusedManagerStatus.summary, tasks: 1, ready_tasks: 1 },
+	}), /```/, "task summary must escape title content instead of creating a code block");
+	assert.throws(() => formatManagerTaskSummary({
+		...focusedManagerStatus,
+		tasks: [{ ...focusedManagerStatus.tasks[0], title: 42 }],
+	}), /invalid task/, "non-string canonical titles must be rejected safely");
+
+	let managerStatus = {
+		...focusedManagerStatus,
 		summary: { tasks: 1, pending_events: 0, ready_tasks: 0, orphan_events: 0 },
 		tasks: [{
-			task_id: "discord-@everyone",
+			task_id: "discord-manager-task-summary",
+			title: "Discord @everyone summary",
 			project: "pi-extensions",
 			status: "active",
+			current_action: "implement",
 			current_run: "implement-1",
-			pending_events: [],
 		}],
 	};
 	const formattedManagerStatus = formatManagerTaskSummary(managerStatus);
-	assert.match(formattedManagerStatus, /pi-extensions\/discord-@\u200beveryone · active · implement-1/);
+	assert.match(formattedManagerStatus, /🟡 \*\*Pi Extensions\*\* — Discord @\u200beveryone summary\n  `implement · run 1`/);
 	assert.ok(formattedManagerStatus.length <= 2_000);
 	const oversizedManagerStatus = formatManagerTaskSummary({
 		...managerStatus,
 		summary: { tasks: 100, pending_events: 0, ready_tasks: 0, orphan_events: 0 },
 		tasks: Array.from({ length: 100 }, (_, index) => ({
 			...managerStatus.tasks[0],
+			title: undefined,
 			task_id: `task-${index}-${"x".repeat(100)}`,
 		})),
 	});
 	assert.ok(oversizedManagerStatus.length <= 2_000, "manager snapshot must fit exactly one Discord message");
-	assert.match(oversizedManagerStatus, /… \d+ more$/);
+	assert.match(oversizedManagerStatus, /… \d+ more tasks$/);
 	const managerWatchListeners = [];
 	const producedSummaries = [];
 	const producerErrors = [];
@@ -405,12 +455,13 @@ try {
 	managerStatus = {
 		...managerStatus,
 		summary: { tasks: 1, pending_events: 1, ready_tasks: 1, orphan_events: 0 },
-		tasks: [{ ...managerStatus.tasks[0], status: "ready", current_run: "review-1", pending_events: ["event"] }],
+		tasks: [{ ...managerStatus.tasks[0], status: "ready", current_action: "review", current_run: "review-1" }],
 	};
 	managerWatchListeners[0]();
 	await waitFor(() => producedSummaries.length === 2, "task-change manager snapshot");
-	assert.match(producedSummaries[1], /1 ready · 1 pending/);
-	assert.match(producedSummaries[1], /ready · review-1 · 1 events/);
+	assert.match(producedSummaries[1], /📋 \*\*Tasks\*\* · 1 total · 0 active · 1 ready/);
+	assert.match(producedSummaries[1], /\*\*Ready\*\*[\s\S]*✅ \*\*Pi Extensions\*\* — Discord @\u200beveryone summary/);
+	assert.doesNotMatch(producedSummaries[1], /`review · run 1`/, "ready tasks must omit active-run details");
 	assert.deepEqual(producerErrors, []);
 	managerProducer.stop();
 	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
@@ -1226,17 +1277,17 @@ try {
 	});
 	await managerSummarySession.emit("session_start", { reason: "startup" });
 	const managerSummaryMapping = await new DiscordStateStore(stateFile).getSession("manager-summary-session");
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text.includes("ready · review-1"),
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text.includes("✅ **Pi Extensions** — Discord @\u200beveryone summary"),
 		"extension-produced initial manager summary");
 	const managerSummaryMessageId = FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id;
 	managerStatus = {
 		...managerStatus,
 		summary: { tasks: 1, pending_events: 0, ready_tasks: 0, orphan_events: 0 },
-		tasks: [{ ...managerStatus.tasks[0], status: "active", current_run: "implement-2", pending_events: [] }],
+		tasks: [{ ...managerStatus.tasks[0], status: "active", current_action: "implement", current_run: "implement-2" }],
 	};
 	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
 	await writeFile(join(managerFixture, "data", "tasks", "changed.md"), "changed\n");
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text.includes("active · implement-2"),
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text.includes("`implement · run 2`"),
 		"extension-produced manager task-change reconciliation");
 	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
 		"producer task change must edit the latest parent summary");

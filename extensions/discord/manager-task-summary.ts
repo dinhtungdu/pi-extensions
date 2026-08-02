@@ -10,10 +10,11 @@ export const MAX_PROJECT_SUMMARY_LENGTH = 2_000;
 
 interface ManagerTaskStatus {
 	task_id: string;
+	title?: string;
 	project: string;
 	status: string;
+	current_action: string;
 	current_run: string;
-	pending_events: unknown[];
 }
 
 interface ManagerStatus {
@@ -53,15 +54,17 @@ function parseManagerStatus(value: unknown): ManagerStatus {
 	}
 	const tasks = value.tasks.map((task) => {
 		if (!isRecord(task) || typeof task.task_id !== "string" || typeof task.project !== "string" ||
-			typeof task.status !== "string" || typeof task.current_run !== "string" || !Array.isArray(task.pending_events)) {
+			typeof task.status !== "string" || typeof task.current_action !== "string" || typeof task.current_run !== "string" ||
+			(task.title !== undefined && typeof task.title !== "string")) {
 			throw new Error("the-manager status returned an invalid task");
 		}
 		return {
 			task_id: task.task_id,
+			...(typeof task.title === "string" ? { title: task.title } : {}),
 			project: task.project,
 			status: task.status,
+			current_action: task.current_action,
 			current_run: task.current_run,
-			pending_events: task.pending_events,
 		};
 	});
 	return {
@@ -78,25 +81,104 @@ function compact(value: string, maximum = 80): string {
 	return safe.length <= maximum ? safe : `${safe.slice(0, maximum - 1)}…`;
 }
 
+const MARKDOWN_CHARACTERS = new Set("\\`*_{}[]()~|>");
+const HUMANIZED_NAMES: Record<string, string> = {
+	api: "API",
+	cli: "CLI",
+	github: "GitHub",
+	id: "ID",
+	pi: "Pi",
+	pr: "PR",
+	ui: "UI",
+	ux: "UX",
+	wc: "WC",
+	woocommerce: "WooCommerce",
+	wordpress: "WordPress",
+};
+
+function humanizeIdentifier(value: string): string {
+	const identifier = compact(value, 120);
+	const known = HUMANIZED_NAMES[identifier.toLowerCase()];
+	if (known) return known;
+	return identifier
+		.split(/[-_./]+/)
+		.filter(Boolean)
+		.map((word) => HUMANIZED_NAMES[word.toLowerCase()] ?? `${word.charAt(0).toUpperCase()}${word.slice(1)}`)
+		.join(" ") || "Unknown";
+}
+
+function markdownText(value: string, maximum: number): string {
+	return [...compact(value, maximum)].map((character) => MARKDOWN_CHARACTERS.has(character) ? `\\${character}` : character).join("");
+}
+
+function normalizedStatus(value: string): string {
+	return compact(value, 32).toLowerCase() || "other";
+}
+
+function statusIcon(status: string): string {
+	if (status === "active") return "🟡";
+	if (status === "ready") return "✅";
+	if (status === "planning") return "⚪";
+	if (status === "blocked") return "⛔";
+	if (status === "paused") return "⏸️";
+	return "🔹";
+}
+
+function activeTaskDetail(task: ManagerTaskStatus): string | undefined {
+	const action = compact(task.current_action, 40).replaceAll("`", "'");
+	const runOrdinal = /(?:^|[-_])(\d+)$/.exec(task.current_run)?.[1];
+	const parts = [action && action !== "none" ? action : undefined, runOrdinal ? `run ${runOrdinal}` : undefined]
+		.filter((part): part is string => Boolean(part));
+	return parts.length ? `  \`${parts.join(" · ")}\`` : undefined;
+}
+
+function taskLines(task: ManagerTaskStatus, status: string): string[] {
+	const project = markdownText(humanizeIdentifier(task.project), 64);
+	const rawTitle = task.title?.trim() || humanizeIdentifier(task.task_id);
+	const lines = [`${statusIcon(status)} **${project}** — ${markdownText(rawTitle, 180)}`];
+	if (status === "active") {
+		const detail = activeTaskDetail(task);
+		if (detail) lines.push(detail);
+	}
+	return lines;
+}
+
+function sectionLabel(status: string): string {
+	return humanizeIdentifier(status);
+}
+
 export function formatManagerTaskSummary(value: unknown): string {
 	const status = parseManagerStatus(value);
-	const { summary } = status;
-	const header = summary.tasks === 0
-		? "📋 the-manager · no active tasks"
-		: `📋 the-manager · ${summary.tasks} tasks · ${summary.ready_tasks} ready · ${summary.pending_events} pending`;
-	const lines = [header];
-	for (let index = 0; index < status.tasks.length; index++) {
-		const task = status.tasks[index]!;
-		const events = task.pending_events.length ? ` · ${task.pending_events.length} events` : "";
-		const run = task.current_run && task.current_run !== "none" ? ` · ${compact(task.current_run, 48)}` : "";
-		const line = `• ${compact(task.project, 48)}/${compact(task.task_id)} · ${compact(task.status, 24)}${run}${events}`;
-		const remaining = status.tasks.length - index;
-		const omitted = `… ${remaining} more`;
-		if ([...lines, line].join("\n").length > MAX_PROJECT_SUMMARY_LENGTH) {
+	const groups = new Map<string, ManagerTaskStatus[]>();
+	for (const task of status.tasks) {
+		const key = normalizedStatus(task.status);
+		const group = groups.get(key) ?? [];
+		group.push(task);
+		groups.set(key, group);
+	}
+	const orderedStatuses = ["active", "ready", ...[...groups.keys()].filter((key) => key !== "active" && key !== "ready")]
+		.filter((key) => groups.has(key));
+	const orderedTasks = orderedStatuses.flatMap((key) => groups.get(key)!.map((task) => ({ status: key, task })));
+	const activeCount = groups.get("active")?.length ?? 0;
+	const readyCount = groups.get("ready")?.length ?? 0;
+	const lines = [`📋 **Tasks** · ${status.summary.tasks} total · ${activeCount} active · ${readyCount} ready`];
+	let renderedTasks = 0;
+	let previousStatus: string | undefined;
+
+	for (const entry of orderedTasks) {
+		const section = entry.status === previousStatus ? [] : ["", `**${markdownText(sectionLabel(entry.status), 40)}**`];
+		const renderedLines = taskLines(entry.task, entry.status);
+		const candidate = [...lines, ...section, ...renderedLines];
+		const remainingAfter = orderedTasks.length - renderedTasks - 1;
+		const reserve = remainingAfter > 0 ? `… ${remainingAfter} more tasks` : undefined;
+		if ([...candidate, ...(reserve ? [reserve] : [])].join("\n").length > MAX_PROJECT_SUMMARY_LENGTH) {
+			const omitted = `… ${orderedTasks.length - renderedTasks} more tasks`;
 			if ([...lines, omitted].join("\n").length <= MAX_PROJECT_SUMMARY_LENGTH) lines.push(omitted);
 			break;
 		}
-		lines.push(line);
+		lines.push(...section, ...renderedLines);
+		previousStatus = entry.status;
+		renderedTasks++;
 	}
 	return lines.join("\n");
 }
