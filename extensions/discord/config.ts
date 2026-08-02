@@ -25,6 +25,7 @@ export interface RelayPaths {
 	recoveryLock: string;
 	authToken: string;
 	configIntent: string;
+	attachments: string;
 }
 
 export function relayPaths(directory = DISCORD_BRIDGE_DIR): RelayPaths {
@@ -37,6 +38,7 @@ export function relayPaths(directory = DISCORD_BRIDGE_DIR): RelayPaths {
 		recoveryLock: join(directory, "relay-recovery.lock"),
 		authToken: join(directory, "relay-token"),
 		configIntent: join(directory, "relay-config-intent.json"),
+		attachments: join(directory, "attachments"),
 	};
 }
 

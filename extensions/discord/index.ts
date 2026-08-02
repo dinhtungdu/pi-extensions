@@ -209,9 +209,9 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				config,
 				session,
 				{
-					onUserText(text) {
-						if (ctx.isIdle()) pi.sendUserMessage(text);
-						else pi.sendUserMessage(text, { deliverAs: "followUp" });
+					onUserMessage(content) {
+						if (ctx.isIdle()) pi.sendUserMessage(content);
+						else pi.sendUserMessage(content, { deliverAs: "followUp" });
 					},
 					onError(error) {
 						ctx.ui.setStatus(STATUS_KEY, STATUS_ERROR);

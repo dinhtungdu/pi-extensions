@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { DiscordBridgeConfig } from "./config.js";
 import type { RelaySessionRegistration } from "./relay-core.js";
 import type { DiscordLifecycleStatus } from "./reactions.js";
+import { isQueuedInboundImage, MAX_INBOUND_IMAGES, type QueuedInboundImage } from "./inbound-images.js";
 import {
 	isPiModelCatalogue,
 	isPiSessionControlAction,
@@ -20,6 +21,7 @@ export type ClientFrame =
 		configFingerprint: string;
 		configEpoch: number;
 		sessionControls?: { modelCatalogue: PiModelCatalogueEntry[] };
+		inboundImages?: true;
 	} & RelaySessionRegistration)
 	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
 	| { type: "project_summary"; requestId: string; text: string }
@@ -39,8 +41,9 @@ export type ServerFrame =
 		lifecycleReactions?: true;
 		projectSummaries?: true;
 		sessionControls?: true;
+		inboundImages?: true;
 	}
-	| { type: "inbound"; messageId: string; text: string }
+	| { type: "inbound"; messageId: string; text: string; images?: QueuedInboundImage[] }
 	| { type: "control"; requestId: string; action: PiSessionControlAction }
 	| { type: "inbound_acked"; requestId: string; messageId: string }
 	| { type: "outbound_queued"; requestId: string; messageId: string }
@@ -74,6 +77,7 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 		) && typeof frame.configEpoch === "number" &&
 			(frame.projectIdentityResolved === undefined || typeof frame.projectIdentityResolved === "boolean") &&
 			(frame.sessionName === undefined || typeof frame.sessionName === "string") &&
+			(frame.inboundImages === undefined || frame.inboundImages === true) &&
 			(frame.sessionControls === undefined || (
 				Boolean(frame.sessionControls) && typeof frame.sessionControls === "object" && !Array.isArray(frame.sessionControls) &&
 				isPiModelCatalogue((frame.sessionControls as Record<string, unknown>).modelCatalogue)
@@ -107,9 +111,14 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 			(frame.leaderNonce === undefined || (typeof frame.leaderNonce === "string" && frame.leaderNonce.length > 0)) &&
 			(frame.lifecycleReactions === undefined || frame.lifecycleReactions === true) &&
 			(frame.projectSummaries === undefined || frame.projectSummaries === true) &&
-			(frame.sessionControls === undefined || frame.sessionControls === true);
+			(frame.sessionControls === undefined || frame.sessionControls === true) &&
+			(frame.inboundImages === undefined || frame.inboundImages === true);
 	}
-	if (frame.type === "inbound") return typeof frame.messageId === "string" && typeof frame.text === "string";
+	if (frame.type === "inbound") {
+		return typeof frame.messageId === "string" && typeof frame.text === "string" &&
+			(frame.images === undefined || (Array.isArray(frame.images) && frame.images.length <= MAX_INBOUND_IMAGES &&
+				frame.images.every(isQueuedInboundImage)));
+	}
 	if (frame.type === "control") return typeof frame.requestId === "string" && isPiSessionControlAction(frame.action);
 	if (frame.type === "inbound_acked") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	if (frame.type === "outbound_queued") return typeof frame.requestId === "string" && typeof frame.messageId === "string";

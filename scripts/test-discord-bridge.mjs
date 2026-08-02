@@ -13,6 +13,7 @@ import { ChannelType } from "discord.js";
 const root = resolve(import.meta.dirname, "..");
 const output = await mkdtemp(join(root, ".discord-bridge-test-"));
 const dataDir = await mkdtemp(join(tmpdir(), "pi-discord-bridge-data-"));
+const originalFetch = globalThis.fetch;
 let compatibilityDirectory;
 
 function compileExtensions() {
@@ -327,6 +328,13 @@ try {
 	const { formatManagerTaskSummary, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
+	const {
+		InboundImageStore,
+		INBOUND_IMAGE_DOWNLOAD_ATTEMPTS,
+		MAX_INBOUND_IMAGE_BYTES,
+		MAX_INBOUND_IMAGES,
+		loadInboundImages,
+	} = await importBuilt("extensions/discord/inbound-images.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
 	const {
@@ -969,6 +977,181 @@ try {
 	assert.equal(isClientFrame({ type: "control_result", requestId: "control-1", ok: true, message: "done" }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "high" } }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "turbo" } }), false);
+
+	const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+	const validAttachmentUrl = "https://cdn.discordapp.com/attachments/12345/67890/image.png?ex=signed";
+	const imageUnitDirectory = join(dataDir, "image-unit");
+	const imageFetchCalls = [];
+	const imageStore = new InboundImageStore(imageUnitDirectory, async (url, init) => {
+		imageFetchCalls.push({ url, init });
+		return new Response(pngBytes, {
+			status: 200,
+			headers: { "content-type": "image/png", "content-length": String(pngBytes.length) },
+		});
+	});
+	await imageStore.initialize(new Set());
+	const [downloadedImage] = await imageStore.download([{
+		id: "67890",
+		url: validAttachmentUrl,
+		contentType: "image/png",
+		size: pngBytes.length,
+	}]);
+	assert.equal(imageFetchCalls.length, 1);
+	assert.equal(imageFetchCalls[0].url, validAttachmentUrl);
+	assert.equal(imageFetchCalls[0].init.redirect, "manual");
+	assert.equal(imageFetchCalls[0].init.credentials, "omit");
+	assert.equal((await stat(downloadedImage.localPath)).mode & 0o777, 0o600);
+	assert.deepEqual(await loadInboundImages(imageUnitDirectory, [downloadedImage]), [{
+		type: "image",
+		data: pngBytes.toString("base64"),
+		mimeType: "image/png",
+	}]);
+	assert.equal(isServerFrame({ type: "inbound", messageId: "image", text: "", images: [downloadedImage] }), true);
+	assert.equal(isServerFrame({
+		type: "inbound",
+		messageId: "overflow",
+		text: "",
+		images: Array.from({ length: MAX_INBOUND_IMAGES + 1 }, () => downloadedImage),
+	}), false, "inbound image IPC metadata must be count-bounded");
+	assert.equal(isServerFrame({
+		type: "inbound",
+		messageId: "path-overflow",
+		text: "",
+		images: [{ ...downloadedImage, localPath: "x".repeat(4_097) }],
+	}), false, "inbound image IPC paths must be bounded");
+	await assert.rejects(() => loadInboundImages(imageUnitDirectory, [{ ...downloadedImage, localPath: "/etc/passwd" }]), /outside the relay image directory/);
+	const outsideImage = join(dataDir, "outside.image");
+	await writeFile(outsideImage, pngBytes);
+	const symlinkImage = join(imageUnitDirectory, "00000000-0000-4000-8000-000000000000.image");
+	await symlink(outsideImage, symlinkImage);
+	await assert.rejects(() => loadInboundImages(imageUnitDirectory, [{ ...downloadedImage, localPath: symlinkImage }]), /file metadata does not match/);
+	await rm(symlinkImage);
+	let hostileFetches = 0;
+	const hostileStore = new InboundImageStore(join(dataDir, "hostile-image"), async () => {
+		hostileFetches++;
+		return new Response(pngBytes);
+	});
+	await assert.rejects(() => hostileStore.download([{
+		id: "67890",
+		url: "https://example.com/attachments/12345/67890/image.png",
+		contentType: "image/png",
+		size: pngBytes.length,
+	}]), /outside the Discord attachment CDN/);
+	assert.equal(hostileFetches, 0, "arbitrary hosts must never be fetched");
+	assert.deepEqual(await hostileStore.download([{
+		id: "67890",
+		url: validAttachmentUrl,
+		contentType: "image/svg+xml",
+		size: 100,
+	}]), [], "unsupported image MIME types must never be fetched or injected");
+	assert.equal(hostileFetches, 0);
+	await assert.rejects(() => hostileStore.download(Array.from({ length: MAX_INBOUND_IMAGES + 1 }, (_, index) => ({
+		id: String(80_000 + index),
+		url: `https://cdn.discordapp.com/attachments/12345/${80_000 + index}/image.png`,
+		contentType: "image/png",
+		size: pngBytes.length,
+	}))), /more than 4 supported images/);
+	assert.equal(hostileFetches, 0, "over-count messages must fail before network access");
+	await assert.rejects(() => hostileStore.download([{
+		id: "67890",
+		url: validAttachmentUrl,
+		contentType: "image/png",
+		size: MAX_INBOUND_IMAGE_BYTES + 1,
+	}]), /declared size/);
+	let redirectAttempts = 0;
+	await assert.rejects(() => new InboundImageStore(join(dataDir, "redirect-image"), async () => {
+		redirectAttempts++;
+		return new Response(null, { status: 302, headers: { location: "https://example.com/image.png" } });
+	}).download([{ id: "67890", url: validAttachmentUrl, contentType: "image/png", size: pngBytes.length }]), /redirects are not allowed/);
+	assert.equal(redirectAttempts, 1, "redirect failures must not be retried or followed");
+	await assert.rejects(() => new InboundImageStore(join(dataDir, "mime-image"), async () => new Response(pngBytes, {
+		status: 200,
+		headers: { "content-type": "image/jpeg", "content-length": String(pngBytes.length) },
+	})).download([{ id: "67890", url: validAttachmentUrl, contentType: "image/png", size: pngBytes.length }]), /response MIME type/);
+	await assert.rejects(() => new InboundImageStore(join(dataDir, "signature-image"), async () => new Response(Buffer.from("not-png!"), {
+		status: 200,
+		headers: { "content-type": "image/png", "content-length": "8" },
+	})).download([{ id: "67890", url: validAttachmentUrl, contentType: "image/png", size: 8 }]), /file signature/);
+	await assert.rejects(() => new InboundImageStore(join(dataDir, "stream-overflow-image"), async () => new Response(Buffer.concat([pngBytes, Buffer.from([0])]), {
+		status: 200,
+		headers: { "content-type": "image/png" },
+	})).download([{ id: "67890", url: validAttachmentUrl, contentType: "image/png", size: pngBytes.length }]), /exceeds declared/);
+	let retryAttempts = 0;
+	const retryStore = new InboundImageStore(join(dataDir, "retry-image"), async () => {
+		retryAttempts++;
+		if (retryAttempts < INBOUND_IMAGE_DOWNLOAD_ATTEMPTS) return new Response("unavailable", { status: 503 });
+		return new Response(pngBytes, {
+			status: 200,
+			headers: { "content-type": "image/png", "content-length": String(pngBytes.length) },
+		});
+	});
+	const retriedImages = await retryStore.download([{ id: "67890", url: validAttachmentUrl, contentType: "image/png", size: pngBytes.length }]);
+	assert.equal(retryAttempts, INBOUND_IMAGE_DOWNLOAD_ATTEMPTS, "transient CDN failures must use the bounded retry budget");
+	const orphanPath = join(imageUnitDirectory, "11111111-1111-4111-8111-111111111111.image");
+	await writeFile(orphanPath, pngBytes);
+	await imageStore.initialize(new Set([downloadedImage.localPath]));
+	await assert.rejects(() => readFile(orphanPath), { code: "ENOENT" });
+	assert.deepEqual(await readFile(downloadedImage.localPath), pngBytes, "restart cleanup must preserve referenced images");
+	await imageStore.remove([downloadedImage.localPath, "/etc/passwd"]);
+	await assert.rejects(() => readFile(downloadedImage.localPath), { code: "ENOENT" });
+	await retryStore.remove(retriedImages.map((image) => image.localPath));
+
+	const rollingImageDirectory = join(dataDir, "rolling-images");
+	const rollingImageState = new DiscordStateStore(join(dataDir, "rolling-images-state.json"));
+	const rollingImageGateway = new FakeGateway();
+	const rollingImageCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		rollingImageState,
+		rollingImageGateway,
+		() => {},
+		new InboundImageStore(rollingImageDirectory, async () => new Response(pngBytes, {
+			status: 200,
+			headers: { "content-type": "image/png", "content-length": String(pngBytes.length) },
+		})),
+	);
+	await rollingImageCore.start();
+	const rollingPrepared = await rollingImageCore.prepareRegistration("old-client", "old-generation", {
+		cwd: "/rolling-images",
+		sessionId: "rolling-image-session",
+	});
+	const oldClientDeliveries = [];
+	await rollingImageCore.activateRegistration(
+		"old-client",
+		"old-generation",
+		"rolling-image-session",
+		(message) => { oldClientDeliveries.push(message); return true; },
+		undefined,
+		false,
+	);
+	await rollingImageGateway.emit({
+		id: "70000",
+		channelId: rollingPrepared.threadId,
+		content: "do not downgrade",
+		authorBot: false,
+		attachments: [{ id: "70000", url: validAttachmentUrl, contentType: "image/png", size: pngBytes.length }],
+	});
+	assert.equal(oldClientDeliveries.length, 0, "old clients must not receive or acknowledge downgraded image messages");
+	assert.equal((await rollingImageState.pendingMessages("rolling-image-session")).length, 1);
+	rollingImageCore.unregisterClient("old-client", "old-generation");
+	await rollingImageCore.prepareRegistration("new-client", "new-generation", {
+		cwd: "/rolling-images",
+		sessionId: "rolling-image-session",
+	});
+	const upgradedDeliveries = [];
+	await rollingImageCore.activateRegistration(
+		"new-client",
+		"new-generation",
+		"rolling-image-session",
+		(message) => { upgradedDeliveries.push(message); return true; },
+		undefined,
+		true,
+	);
+	assert.equal(upgradedDeliveries.length, 1, "queued images must resume after a compatible client registers");
+	assert.equal(upgradedDeliveries[0].images.length, 1);
+	await rollingImageCore.acknowledge("new-client", "new-generation", "rolling-image-session", "70000");
+	await assert.rejects(() => readFile(upgradedDeliveries[0].images[0].localPath), { code: "ENOENT" });
+	await rollingImageCore.stop();
+
 	const autocompleteCatalogue = Array.from({ length: 40 }, (_, index) => ({
 		provider: "provider",
 		id: `model-${index}`,
@@ -1040,7 +1223,9 @@ try {
 	assert.deepEqual(previousHostRegistrations[0].sessionControls.modelCatalogue, [
 		{ provider: "compat", id: "model", name: "Compatibility Model" },
 	], "new clients may advertise controls to older relays because registration fields are additive");
+	assert.equal(previousHostRegistrations[0].inboundImages, true, "new clients may advertise additive image support to older relays");
 	assert.equal(compatibilityClient.status().sessionControls, undefined, "an older relay must not advertise unsupported controls");
+	assert.equal(compatibilityClient.status().inboundImages, undefined, "an older relay must preserve text-only rolling compatibility");
 	compatibilityClient.updateLifecycle("compatibility-inbound", "thinking");
 	await compatibilityClient.sendInteractiveUserText("hot **reload**");
 	assert.equal(previousHostFrames.length, 1);
@@ -1562,6 +1747,72 @@ try {
 	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: routedSecondMessage.text }] } });
 	await waitFor(() => second.entries.some((entry) => entry.data?.messageId === "10"), "durable Pi acceptance receipt");
 	assert.equal(first.userMessages.length, 0, "Discord input must route only to its Pi session");
+
+	const integrationImageFetchAttempts = new Map();
+	globalThis.fetch = async (url, init) => {
+		assert.equal(new URL(url).hostname, "cdn.discordapp.com", "detached relay must fetch only validated Discord CDN URLs");
+		assert.equal(init?.redirect, "manual");
+		const key = String(url);
+		integrationImageFetchAttempts.set(key, (integrationImageFetchAttempts.get(key) ?? 0) + 1);
+		return new Response(pngBytes, {
+			status: 200,
+			headers: { "content-type": "image/png", "content-length": String(pngBytes.length) },
+		});
+	};
+	const captionImageUrl = "https://cdn.discordapp.com/attachments/12345/10001/caption.png?ex=signed";
+	second.setIdle(true);
+	const captionImageDelivery = second.nextUserMessage();
+	await gateway.emit({
+		id: "10001",
+		channelId: secondThread,
+		content: "inspect this caption",
+		authorBot: false,
+		attachments: [{ id: "10001", url: captionImageUrl, contentType: "image/png", size: pngBytes.length }],
+	});
+	const captionImageMessage = await captionImageDelivery;
+	assert.equal(captionImageMessage.options, undefined, "idle image prompts must route immediately");
+	assert.equal(Array.isArray(captionImageMessage.text), true);
+	assert.equal(stripInboundMarker(captionImageMessage.text[0].text), "inspect this caption");
+	assert.equal(inboundMessageId(captionImageMessage.text[0].text), "10001");
+	assert.deepEqual(captionImageMessage.text[1], { type: "image", data: pngBytes.toString("base64"), mimeType: "image/png" });
+	const captionPending = (await new DiscordStateStore(stateFile).getSession("session-22222222")).pendingMessages
+		.find((message) => message.id === "10001");
+	assert.equal(captionPending.images.length, 1);
+	assert.deepEqual(await readFile(captionPending.images[0].localPath), pngBytes, "relay must retain image files until Pi acceptance");
+	const captionContext = await second.emit("context", { messages: [{ role: "user", content: captionImageMessage.text }] });
+	assert.equal(captionContext.messages[0].content[0].text, "inspect this caption");
+	assert.deepEqual(captionContext.messages[0].content[1], captionImageMessage.text[1]);
+	await second.emit("message_end", { message: { role: "user", content: captionImageMessage.text } });
+	await waitFor(async () => !(await new DiscordStateStore(stateFile).getSession("session-22222222")).pendingMessages
+		.some((message) => message.id === "10001"), "caption image acknowledgement");
+	await assert.rejects(() => readFile(captionPending.images[0].localPath), { code: "ENOENT" });
+
+	const imageOnlyUrl = "https://cdn.discordapp.com/attachments/12345/10002/image-only.png?ex=signed";
+	second.setIdle(false);
+	const imageOnlyDelivery = second.nextUserMessage();
+	await gateway.emit({
+		id: "10002",
+		channelId: secondThread,
+		content: "",
+		authorBot: false,
+		attachments: [{ id: "10002", url: imageOnlyUrl, contentType: "image/png", size: pngBytes.length }],
+	});
+	const imageOnlyMessage = await imageOnlyDelivery;
+	assert.deepEqual(imageOnlyMessage.options, { deliverAs: "followUp" }, "busy image prompts must retain follow-up routing");
+	assert.equal(stripInboundMarker(imageOnlyMessage.text[0].text), "", "image-only prompts must not gain a visible caption");
+	assert.equal(inboundMessageId(imageOnlyMessage.text[0].text), "10002");
+	assert.deepEqual(imageOnlyMessage.text[1], { type: "image", data: pngBytes.toString("base64"), mimeType: "image/png" });
+	await second.emit("message_end", { message: { role: "user", content: imageOnlyMessage.text } });
+	await second.emit("before_agent_start", { prompt: imageOnlyMessage.text[0].text });
+	await second.emit("agent_start", {});
+	await second.emit("message_start", { message: { role: "user", content: imageOnlyMessage.text } });
+	await waitFor(() => FakeGateway.lifecycleReactions.get("10002") === "🤔", "image-only lifecycle association");
+	await second.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+	await second.emit("agent_settled", {});
+	await waitFor(() => FakeGateway.lifecycleReactions.get("10002") === "✅", "image-only settled lifecycle");
+	assert.equal(integrationImageFetchAttempts.get(captionImageUrl), 1);
+	assert.equal(integrationImageFetchAttempts.get(imageOnlyUrl), 1);
+
 	assert.deepEqual(gateway.modelAutocomplete(firstThread, "claude"), [{
 		name: "Claude Test (anthropic/claude-test)",
 		value: "anthropic/claude-test",
@@ -1625,10 +1876,11 @@ try {
 		ok: false,
 		message: "Pi is idle; there is no active turn to abort.",
 	}, "idle abort must not falsely claim confirmation");
+	const deliveriesBeforeIgnoredMessages = second.userMessages.length;
 	await gateway.emit({ id: "10", channelId: secondThread, content: "duplicate", authorBot: false });
-	assert.equal(second.userMessages.length, 1, "duplicate Discord IDs must not deliver twice");
+	assert.equal(second.userMessages.length, deliveriesBeforeIgnoredMessages, "duplicate Discord IDs must not deliver twice");
 	await gateway.emit({ id: "11", channelId: secondThread, content: "bot", authorBot: true });
-	assert.equal(second.userMessages.length, 1, "bot output must not loop back into Pi");
+	assert.equal(second.userMessages.length, deliveriesBeforeIgnoredMessages, "bot output must not loop back into Pi");
 
 	await waitFor(() => FakeGateway.lifecycleReactions.get("10") === "👀", "accepted lifecycle reaction");
 	await second.emit("before_agent_start", { prompt: routedSecondMessage.text });
@@ -1792,7 +2044,14 @@ try {
 	const failedThread = (await new DiscordStateStore(stateFile).getSession("session-44444444")).threadId;
 	failedInjection.setInjectionError(true);
 	FakeGateway.hangLifecycleFor.add("15:👀");
-	await gateway.emit({ id: "15", channelId: failedThread, content: "must remain pending", authorBot: false });
+	const failedImageUrl = "https://cdn.discordapp.com/attachments/12345/15000/retry.png?ex=signed";
+	await gateway.emit({
+		id: "15",
+		channelId: failedThread,
+		content: "must remain pending",
+		authorBot: false,
+		attachments: [{ id: "15000", url: failedImageUrl, contentType: "image/png", size: pngBytes.length }],
+	});
 	await waitFor(() => failedInjection.notifications.some(([text]) => text.includes("injected Pi acceptance failure")), "Pi injection failure");
 	assert.deepEqual(failedInjection.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "⚠️"]);
 	assert.equal(failedInjection.userMessages.length, 0);
@@ -1800,7 +2059,17 @@ try {
 	await failedInjection.emit("session_shutdown", { reason: "quit" });
 	assert.ok(Date.now() - shutdownStarted < 2_500, "unconfirmed inbound must not block shutdown");
 	const failedState = await new DiscordStateStore(stateFile).getSession("session-44444444");
-	assert.deepEqual(failedState.pendingMessages, [{ id: "15", content: "must remain pending" }]);
+	assert.equal(failedState.pendingMessages.length, 1);
+	assert.equal(failedState.pendingMessages[0].id, "15");
+	assert.equal(failedState.pendingMessages[0].content, "must remain pending");
+	assert.equal(failedState.pendingMessages[0].images.length, 1);
+	const failedImagePath = failedState.pendingMessages[0].images[0].localPath;
+	assert.deepEqual(await readFile(failedImagePath), pngBytes, "failed Pi injection must retain the relay-owned image");
+	const imageRestartGatewayCount = FakeGateway.instances.length;
+	await second.runCommand("discord", "restart");
+	await waitFor(() => FakeGateway.instances.length > imageRestartGatewayCount, "image persistence relay restart");
+	gateway = FakeGateway.instances.at(-1);
+	assert.deepEqual(await readFile(failedImagePath), pngBytes, "relay restart orphan cleanup must retain queued images");
 	const retriedInjection = createExtensionHarness(extension, {
 		cwd: "/work/failing",
 		sessionId: "session-44444444",
@@ -1809,10 +2078,54 @@ try {
 	const retriedDelivery = retriedInjection.nextUserMessage();
 	await retriedInjection.emit("session_start", { reason: "resume" });
 	const retriedMessage = await retriedDelivery;
-	assert.equal(stripInboundMarker(retriedMessage.text), "must remain pending");
-	await retriedInjection.emit("message_end", { message: { role: "user", content: [{ type: "text", text: retriedMessage.text }] } });
+	assert.equal(stripInboundMarker(retriedMessage.text[0].text), "must remain pending");
+	assert.deepEqual(retriedMessage.text[1], { type: "image", data: pngBytes.toString("base64"), mimeType: "image/png" });
+	assert.equal(integrationImageFetchAttempts.get(failedImageUrl), 1, "recovery must read the durable local file without redownloading");
+	await retriedInjection.emit("message_end", { message: { role: "user", content: retriedMessage.text } });
 	await waitFor(() => retriedInjection.entries.some((entry) => entry.data?.messageId === "15"), "retried Pi acceptance receipt");
+	await waitFor(async () => {
+		try {
+			await readFile(failedImagePath);
+			return false;
+		} catch (error) {
+			return error.code === "ENOENT";
+		}
+	}, "acknowledged retry image cleanup");
 	await retriedInjection.emit("session_shutdown", { reason: "quit" });
+
+	const acceptedCleanupSeed = createExtensionHarness(extension, {
+		cwd: "/work/accepted-cleanup",
+		sessionId: "session-accepted-cleanup",
+		sessionName: "Accepted cleanup",
+	});
+	await acceptedCleanupSeed.emit("session_start", { reason: "startup" });
+	const acceptedCleanupThread = (await new DiscordStateStore(stateFile).getSession("session-accepted-cleanup")).threadId;
+	await acceptedCleanupSeed.emit("session_shutdown", { reason: "quit" });
+	const acceptedCleanupUrl = "https://cdn.discordapp.com/attachments/12345/16000/accepted.png?ex=signed";
+	await gateway.emit({
+		id: "16000",
+		channelId: acceptedCleanupThread,
+		content: "already persisted",
+		authorBot: false,
+		attachments: [{ id: "16000", url: acceptedCleanupUrl, contentType: "image/png", size: pngBytes.length }],
+	});
+	await waitFor(async () => (await new DiscordStateStore(stateFile).getSession("session-accepted-cleanup")).pendingMessages.length === 1,
+		"accepted cleanup image persistence");
+	const acceptedCleanupPath = (await new DiscordStateStore(stateFile).getSession("session-accepted-cleanup"))
+		.pendingMessages[0].images[0].localPath;
+	await writeFile(acceptedCleanupPath, Buffer.from("tampered!"));
+	const acceptedCleanup = createExtensionHarness(extension, {
+		cwd: "/work/accepted-cleanup",
+		sessionId: "session-accepted-cleanup",
+		sessionName: "Accepted cleanup",
+		entries: [{ type: "custom", customType: "discord-bridge-inbound-accepted", data: { messageId: "16000" } }],
+	});
+	await acceptedCleanup.emit("session_start", { reason: "resume" });
+	await waitFor(async () => (await new DiscordStateStore(stateFile).getSession("session-accepted-cleanup")).pendingMessages.length === 0,
+		"accepted image acknowledgement cleanup");
+	assert.equal(acceptedCleanup.userMessages.length, 0, "durably accepted messages must acknowledge without rereading untrusted files");
+	await assert.rejects(() => readFile(acceptedCleanupPath), { code: "ENOENT" });
+	await acceptedCleanup.emit("session_shutdown", { reason: "quit" });
 
 	await first.emit("session_shutdown", { reason: "quit" });
 	assert.equal(gateway.connected, true, "relay child must survive the Pi client that launched it");
@@ -1921,7 +2234,8 @@ try {
 	assert.equal(rolloverA.statuses.at(-1)?.[1], "💬");
 	await rolloverA.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "rollover relay shutdown");
-	for (const harness of [first, second, taskNamed, taskNamedSibling, taskFallback, metadataAbsent, failedInjection, retriedInjection, inactive, resumed, restarted, rolloverA, rolloverB]) {
+	for (const harness of [first, second, taskNamed, taskNamedSibling, taskFallback, metadataAbsent, failedInjection, retriedInjection,
+		acceptedCleanupSeed, acceptedCleanup, inactive, resumed, restarted, rolloverA, rolloverB]) {
 		for (const [key, text] of harness.statuses) {
 			assert.equal(key, PACKAGE_FOOTER_STATUS_KEYS.discord);
 			assert.ok(text === undefined || text === "💬" || text === "🔄" || text === "⚠️", `footer status must be compact: ${text}`);
@@ -1930,6 +2244,7 @@ try {
 
 	console.log("[discord bridge test] passed");
 } finally {
+	globalThis.fetch = originalFetch;
 	if (compatibilityDirectory) await rm(compatibilityDirectory, { recursive: true, force: true });
 	await rm(output, { recursive: true, force: true });
 	await rm(dataDir, { recursive: true, force: true }).catch(() => {});

@@ -11,6 +11,7 @@ import { lifecycleReaction, type DiscordLifecycleStatus } from "./reactions.js";
 import { resolveProjectIdentity } from "./project-identity.js";
 import { normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
 import type { DiscordInboundMessage, DiscordTransport } from "./transport.js";
+import { InboundImageStore } from "./inbound-images.js";
 import {
 	boundedControlResult,
 	isPiThinkingLevel,
@@ -46,6 +47,7 @@ interface ActiveSession {
 	deliveredIds: Set<string>;
 	modelCatalogue: PiModelCatalogueEntry[];
 	executeControl?: (request: PiSessionControlRequest) => Promise<PiSessionControlResult>;
+	inboundImages: boolean;
 }
 
 const OUTBOUND_RETRY_MIN_MS = 100;
@@ -77,6 +79,7 @@ export class DiscordRelayCore {
 	private readonly clientSessions = new Map<string, Set<string>>();
 	private readonly activeThreadSessions = new Map<string, string>();
 	private readonly catchingUpSessions = new Set<string>();
+	private readonly inboundCursorBlockedSessions = new Set<string>();
 	private unsubscribe: (() => void) | undefined;
 	private unsubscribeControls: (() => void) | undefined;
 	private unsubscribeAutocomplete: (() => void) | undefined;
@@ -106,10 +109,12 @@ export class DiscordRelayCore {
 		private readonly state: DiscordStateStore,
 		private readonly transport: DiscordTransport,
 		private readonly onTerminalError: (error: Error) => void = () => {},
+		private readonly imageStore?: InboundImageStore,
 	) {}
 
 	async start(): Promise<void> {
 		if (this.started) return;
+		if (this.imageStore) await this.imageStore.initialize(await this.state.pendingImagePaths());
 		await this.transport.connect(this.config);
 		this.unsubscribeTerminal = this.transport.onTerminalError(this.onTerminalError);
 		this.unsubscribe = this.transport.onMessage((message) => {
@@ -140,6 +145,7 @@ export class DiscordRelayCore {
 		await this.inboundQueue;
 		this.activeSessions.clear();
 		this.activeThreadSessions.clear();
+		this.inboundCursorBlockedSessions.clear();
 		this.reservedSessions.clear();
 		this.clientSessions.clear();
 		this.controlQueues.clear();
@@ -198,8 +204,10 @@ export class DiscordRelayCore {
 			this.inboundQueue = catchUp.catch(() => {});
 			await catchUp;
 			this.catchingUpSessions.delete(registration.sessionId);
+			this.inboundCursorBlockedSessions.delete(registration.sessionId);
 			return { channelId, threadId: mapping.threadId };
 		} catch (error) {
+			this.catchingUpSessions.delete(registration.sessionId);
 			const reserved = this.reservedSessions.get(registration.sessionId);
 			if (reserved?.clientId === clientId && reserved.generation === generation) this.reservedSessions.delete(registration.sessionId);
 			throw error;
@@ -215,6 +223,7 @@ export class DiscordRelayCore {
 			modelCatalogue: PiModelCatalogueEntry[];
 			execute(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
 		},
+		inboundImages = false,
 	): Promise<void> {
 		const reserved = this.reservedSessions.get(sessionId);
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
@@ -235,6 +244,7 @@ export class DiscordRelayCore {
 			deliveredIds: new Set(),
 			modelCatalogue: controls?.modelCatalogue.map((model) => ({ ...model })) ?? [],
 			...(controls ? { executeControl: controls.execute } : {}),
+			inboundImages,
 		};
 		const replaced = this.activeSessions.get(sessionId);
 		if (replaced && this.activeThreadSessions.get(replaced.threadId) === sessionId) this.activeThreadSessions.delete(replaced.threadId);
@@ -348,7 +358,8 @@ export class DiscordRelayCore {
 
 	async acknowledge(clientId: string, generation: string, sessionId: string, messageId: string): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
-		await this.state.acknowledgeMessage(sessionId, messageId);
+		const paths = await this.state.acknowledgeMessage(sessionId, messageId);
+		await this.imageStore?.remove(paths).catch(() => {});
 	}
 
 	queueLifecycleUpdate(
@@ -615,20 +626,42 @@ export class DiscordRelayCore {
 		sessionId: string,
 		message: DiscordInboundMessage,
 		deliver: boolean,
-		advanceCursor = !this.catchingUpSessions.has(sessionId),
+		advanceCursor = !this.catchingUpSessions.has(sessionId) && !this.inboundCursorBlockedSessions.has(sessionId),
 	): Promise<void> {
-		const result = await this.state.recordDiscordMessage(sessionId, message, advanceCursor);
-		if (result.lifecycle) this.scheduleReaction(result.lifecycle);
-		if (!result.queued || !result.message || !deliver) return;
-		const active = this.activeSessions.get(sessionId);
-		if (active) this.deliverMessage(active, result.message);
+		let imagePaths: string[] = [];
+		try {
+			const images = !message.authorBot && message.attachments?.length
+				? await this.requireImageStore().download(message.attachments)
+				: [];
+			imagePaths = images.map((image) => image.localPath);
+			const result = await this.state.recordDiscordMessage(
+				sessionId,
+				{ ...message, ...(images.length ? { images } : {}) },
+				advanceCursor,
+			);
+			if (!result.queued) await this.imageStore?.remove(imagePaths);
+			if (result.lifecycle) this.scheduleReaction(result.lifecycle);
+			if (!result.queued || !result.message || !deliver) return;
+			const active = this.activeSessions.get(sessionId);
+			if (active) this.deliverMessage(active, result.message);
+		} catch (error) {
+			if (advanceCursor) this.inboundCursorBlockedSessions.add(sessionId);
+			await this.imageStore?.remove(imagePaths).catch(() => {});
+			throw error;
+		}
 	}
 
 	private deliverMessage(active: ActiveSession, message: QueuedDiscordMessage): boolean {
+		if (message.images?.length && !active.inboundImages) return false;
 		if (active.deliveredIds.has(message.id)) return true;
 		if (!active.deliver(message)) return false;
 		active.deliveredIds.add(message.id);
 		return true;
+	}
+
+	private requireImageStore(): InboundImageStore {
+		if (!this.imageStore) throw new Error("Discord relay image storage is unavailable");
+		return this.imageStore;
 	}
 
 	private assertClientSession(clientId: string, generation: string, sessionId: string): void {

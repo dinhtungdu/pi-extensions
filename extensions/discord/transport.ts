@@ -12,6 +12,7 @@ import {
 	type TextChannel,
 } from "discord.js";
 import type { DiscordBridgeConfig } from "./config.js";
+import type { DiscordInboundAttachment } from "./inbound-images.js";
 import { DISCORD_LIFECYCLE_REACTIONS, type DiscordLifecycleReaction } from "./reactions.js";
 import {
 	boundedControlResult,
@@ -32,6 +33,7 @@ export interface DiscordInboundMessage {
 	channelId: string;
 	content: string;
 	authorBot: boolean;
+	attachments?: DiscordInboundAttachment[];
 }
 
 export interface ProjectChannelRequest {
@@ -174,6 +176,12 @@ export class DiscordJsTransport implements DiscordTransport {
 				channelId: message.channelId,
 				content: message.content,
 				authorBot: message.author.bot,
+				attachments: [...message.attachments.values()].map((attachment) => ({
+					id: attachment.id,
+					url: attachment.url,
+					...(attachment.contentType ? { contentType: attachment.contentType } : {}),
+					size: attachment.size,
+				})),
 			};
 			for (const listener of this.listeners) listener(normalized);
 		});
@@ -285,6 +293,12 @@ export class DiscordJsTransport implements DiscordTransport {
 				channelId: message.channelId,
 				content: message.content,
 				authorBot: message.author.bot,
+				attachments: [...message.attachments.values()].map((attachment) => ({
+					id: attachment.id,
+					url: attachment.url,
+					...(attachment.contentType ? { contentType: attachment.contentType } : {}),
+					size: attachment.size,
+				})),
 			}));
 		}, afterId);
 	}

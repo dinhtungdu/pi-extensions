@@ -263,16 +263,23 @@ export class LocalRelayHost {
 				lifecycleReactions: true,
 				projectSummaries: true,
 				sessionControls: true,
+				inboundImages: true,
 			})) throw new Error("Local Discord relay response queue is full");
 			await this.options.core.activateRegistration(
 				parsed.clientId,
 				parsed.generation,
 				parsed.sessionId,
-				(message) => this.write(state, { type: "inbound", messageId: message.id, text: message.content }),
+				(message) => this.write(state, {
+					type: "inbound",
+					messageId: message.id,
+					text: message.content,
+					...(message.images?.length ? { images: message.images } : {}),
+				}),
 				parsed.sessionControls ? {
 					modelCatalogue: parsed.sessionControls.modelCatalogue,
 					execute: (request) => this.requestControl(state, request),
 				} : undefined,
+				parsed.inboundImages === true,
 			);
 			if (state.closed) {
 				this.options.core.unregisterClient(parsed.clientId, parsed.generation);

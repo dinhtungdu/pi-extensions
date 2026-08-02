@@ -5,6 +5,7 @@ import { DiscordRelayCore } from "./relay-core.js";
 import { LocalRelayHost } from "./relay-host.js";
 import { DiscordStateStore } from "./state.js";
 import { DiscordJsTransport, type DiscordTransport } from "./transport.js";
+import { InboundImageStore } from "./inbound-images.js";
 
 export interface RelayChildDependencies {
 	createStateStore(): DiscordStateStore;
@@ -28,7 +29,7 @@ export async function runRelayChild(
 		const intent = await loadRelayConfigIntent(paths);
 		const core = new DiscordRelayCore(intent.config, childDependencies.createStateStore(), childDependencies.createTransport(), () => {
 			void host?.stop();
-		});
+		}, new InboundImageStore(paths.attachments));
 		host = new LocalRelayHost({
 			paths,
 			token,

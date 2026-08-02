@@ -8,6 +8,7 @@ import type { RelaySessionRegistration } from "./relay-core.js";
 import { interactiveUserChunks } from "./text.js";
 import type { DiscordLifecycleStatus } from "./reactions.js";
 import { restartOwnedRelay } from "./leader.js";
+import type { QueuedInboundImage } from "./inbound-images.js";
 import {
 	boundedControlResult,
 	MAX_MODEL_CATALOGUE_ITEMS,
@@ -33,10 +34,11 @@ export interface RelayClientStatus {
 	threadId?: string;
 	projectSummaries?: true;
 	sessionControls?: true;
+	inboundImages?: true;
 }
 
 export interface RelayClientCallbacks {
-	onInbound(messageId: string, text: string): void | Promise<void>;
+	onInbound(messageId: string, text: string, images: readonly QueuedInboundImage[]): void | Promise<void>;
 	onError(error: Error): void;
 	onStatus(status: RelayClientStatus): void;
 	modelCatalogue?(): PiModelCatalogueEntry[];
@@ -305,6 +307,7 @@ export class LocalRelayClient {
 					configFingerprint: this.fingerprint,
 					configEpoch: this.config.epoch,
 					...this.registration,
+					inboundImages: true,
 					...(modelCatalogue ? { sessionControls: { modelCatalogue } } : {}),
 				};
 				if (!writer.write(encodeFrame(frame))) {
@@ -365,6 +368,7 @@ export class LocalRelayClient {
 				threadId: frame.threadId,
 				...(frame.projectSummaries ? { projectSummaries: true as const } : {}),
 				...(frame.sessionControls ? { sessionControls: true as const } : {}),
+				...(frame.inboundImages ? { inboundImages: true as const } : {}),
 			});
 			this.flushLifecycleStatuses();
 			return;
@@ -386,7 +390,10 @@ export class LocalRelayClient {
 		}
 		if (frame.type === "inbound") {
 			try {
-				await this.callbacks.onInbound(frame.messageId, frame.text);
+				if (frame.images?.length && !this.currentStatus.inboundImages) {
+					throw new Error("Local Discord relay sent images without negotiating image support");
+				}
+				await this.callbacks.onInbound(frame.messageId, frame.text, frame.images ?? []);
 			} catch (error) {
 				this.callbacks.onError(asError(error));
 			}

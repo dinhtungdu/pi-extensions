@@ -2,6 +2,7 @@ import type { DiscordBridgeConfig } from "./config.js";
 import { LocalRelayClient, type RelayClientDependencies, type RelayClientStatus } from "./relay-client.js";
 import { assistantText } from "./text.js";
 import type { PiModelCatalogueEntry, PiSessionControlRequest, PiSessionControlResult } from "./controls.js";
+import { loadInboundImages, type NativeInboundImage, type QueuedInboundImage } from "./inbound-images.js";
 
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
@@ -15,7 +16,7 @@ export interface BridgeSession {
 }
 
 export interface BridgeCallbacks {
-	onUserText(text: string): void;
+	onUserMessage(content: string | ({ type: "text"; text: string } | NativeInboundImage)[]): void;
 	onError(error: Error): void;
 	onStatus(status: BridgeStatus): void;
 	modelCatalogue?(): PiModelCatalogueEntry[];
@@ -63,13 +64,13 @@ export class DiscordBridge {
 		config: DiscordBridgeConfig,
 		session: BridgeSession,
 		private readonly callbacks: BridgeCallbacks,
-		dependencies: RelayClientDependencies,
+		private readonly dependencies: RelayClientDependencies,
 	) {
 		this.relay = new LocalRelayClient(
 			config,
 			session,
 			{
-				onInbound: (messageId, text) => this.receiveInbound(messageId, text),
+				onInbound: (messageId, text, images) => this.receiveInbound(messageId, text, images),
 				onError: callbacks.onError,
 				onStatus: callbacks.onStatus,
 				...(callbacks.modelCatalogue ? { modelCatalogue: callbacks.modelCatalogue } : {}),
@@ -174,7 +175,11 @@ export class DiscordBridge {
 		this.terminalRunFailed = false;
 	}
 
-	private async receiveInbound(messageId: string, text: string): Promise<void> {
+	private async receiveInbound(
+		messageId: string,
+		text: string,
+		images: readonly QueuedInboundImage[],
+	): Promise<void> {
 		if (this.acceptedInboundIds.has(messageId)) {
 			await this.relay.acknowledgeInbound(messageId);
 			return;
@@ -182,7 +187,12 @@ export class DiscordBridge {
 		if (this.submittedInboundIds.has(messageId)) return;
 		this.submittedInboundIds.add(messageId);
 		try {
-			this.callbacks.onUserText(`${markerFor(messageId)}${text}`);
+			const markedText = `${markerFor(messageId)}${text}`;
+			if (images.length === 0) this.callbacks.onUserMessage(markedText);
+			else {
+				const nativeImages = await loadInboundImages(this.dependencies.paths.attachments, images);
+				this.callbacks.onUserMessage([{ type: "text", text: markedText }, ...nativeImages]);
+			}
 		} catch (error) {
 			this.submittedInboundIds.delete(messageId);
 			throw error;

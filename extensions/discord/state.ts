@@ -4,6 +4,11 @@ import { dirname } from "node:path";
 import { DISCORD_STATE_FILE } from "./config.js";
 import { collidingProjectChannelName, normalizeCwd, projectChannelName } from "./text.js";
 import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reactions.js";
+import {
+	isQueuedInboundImage,
+	MAX_INBOUND_IMAGES,
+	type QueuedInboundImage,
+} from "./inbound-images.js";
 
 const STATE_VERSION = 1;
 const MAX_RECENT_MESSAGE_IDS = 2_000;
@@ -43,6 +48,7 @@ export interface ProjectChannelMapping {
 export interface QueuedDiscordMessage {
 	id: string;
 	content: string;
+	images?: QueuedInboundImage[];
 }
 
 export interface DiscordLifecycleMessage {
@@ -142,10 +148,17 @@ function parsePendingMessages(value: unknown, file: string): QueuedDiscordMessag
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) throw new Error(`Discord bridge state ${file} has an invalid pending message queue`);
 	return value.map((message) => {
-		if (!isRecord(message) || typeof message.id !== "string" || typeof message.content !== "string") {
+		if (!isRecord(message) || typeof message.id !== "string" || typeof message.content !== "string" ||
+			(message.images !== undefined && (!Array.isArray(message.images) || message.images.length > MAX_INBOUND_IMAGES ||
+				!message.images.every(isQueuedInboundImage)))) {
 			throw new Error(`Discord bridge state ${file} has an invalid pending message`);
 		}
-		return { id: message.id, content: message.content };
+		const images = message.images as QueuedInboundImage[] | undefined;
+		return {
+			id: message.id,
+			content: message.content,
+			...(images?.length ? { images: images.map((image) => ({ ...image })) } : {}),
+		};
 	});
 }
 
@@ -398,7 +411,7 @@ export class DiscordStateStore {
 
 	async recordDiscordMessage(
 		sessionId: string,
-		message: { id: string; channelId: string; content: string; authorBot: boolean },
+		message: { id: string; channelId: string; content: string; authorBot: boolean; images?: QueuedInboundImage[] },
 		advanceCursor = true,
 	): Promise<{ queued: boolean; message?: QueuedDiscordMessage; lifecycle?: DiscordLifecycleMessage }> {
 		return this.mutate(async (state) => {
@@ -407,12 +420,19 @@ export class DiscordStateStore {
 			if (advanceCursor) {
 				session.threadCursors[message.channelId] = laterDiscordId(session.threadCursors[message.channelId], message.id);
 			}
-			if (message.authorBot || !message.content.trim() || state.recentMessageIds.includes(message.id)) {
+			if (message.authorBot || (!message.content.trim() && !message.images?.length) || state.recentMessageIds.includes(message.id)) {
 				return { queued: false };
+			}
+			if (message.images && (message.images.length > MAX_INBOUND_IMAGES || !message.images.every(isQueuedInboundImage))) {
+				throw new Error("Discord inbound image metadata is invalid");
 			}
 			state.recentMessageIds.push(message.id);
 			state.recentMessageIds = state.recentMessageIds.slice(-MAX_RECENT_MESSAGE_IDS);
-			const queued = { id: message.id, content: message.content };
+			const queued: QueuedDiscordMessage = {
+				id: message.id,
+				content: message.content,
+				...(message.images?.length ? { images: message.images.map((image) => ({ ...image })) } : {}),
+			};
 			if (!session.pendingMessages.some((candidate) => candidate.id === message.id)) {
 				session.pendingMessages.push(queued);
 			}
@@ -440,11 +460,21 @@ export class DiscordStateStore {
 		});
 	}
 
-	async acknowledgeMessage(sessionId: string, messageId: string): Promise<void> {
-		await this.mutate(async (state) => {
+	async acknowledgeMessage(sessionId: string, messageId: string): Promise<string[]> {
+		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
-			if (session) session.pendingMessages = session.pendingMessages.filter((message) => message.id !== messageId);
+			if (!session) return [];
+			const acknowledged = session.pendingMessages.find((message) => message.id === messageId);
+			session.pendingMessages = session.pendingMessages.filter((message) => message.id !== messageId);
+			return acknowledged?.images?.map((image) => image.localPath) ?? [];
 		});
+	}
+
+	async pendingImagePaths(): Promise<Set<string>> {
+		const state = await this.load();
+		return new Set(Object.values(state.sessions).flatMap((session) =>
+			session.pendingMessages.flatMap((message) => message.images?.map((image) => image.localPath) ?? []),
+		));
 	}
 
 	async enqueueOutbound(sessionId: string, message: OutboundMessage): Promise<void> {
