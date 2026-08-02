@@ -20,6 +20,7 @@ import { ManagerControlExecutor } from "./manager-controls.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
 	modelChoiceValue,
+	type ManagerProjectCatalogueEntry,
 	type ManagerTaskCatalogueEntry,
 	type PiModelCatalogueEntry,
 	type PiSessionControlRequest,
@@ -69,6 +70,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		let bridge: DiscordBridge | undefined;
 		let taskSummaryProducer: ManagerTaskSummaryProducer | undefined;
 		let managerTaskCatalogue: ManagerTaskCatalogueEntry[] = [];
+		let managerProjectCatalogue: ManagerProjectCatalogueEntry[] = [];
 		let desiredTaskSummary: string | undefined;
 		let publishingTaskSummary: Promise<void> | undefined;
 		let taskSummaryPublishRequested = false;
@@ -185,6 +187,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			taskSummaryProducer?.stop();
 			taskSummaryProducer = undefined;
 			managerTaskCatalogue = [];
+			managerProjectCatalogue = [];
 			desiredTaskSummary = undefined;
 			taskSummaryPublishRequested = false;
 			const active = bridge;
@@ -220,10 +223,11 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					desiredTaskSummary = summary;
 					publishTaskSummary(ctx);
 				},
-				onTaskCatalogue(catalogue) {
-					managerTaskCatalogue = catalogue;
-					void bridge?.updateManagerTaskCatalogue(catalogue).catch((error) => {
-						ctx.ui.notify(`Discord manager task catalogue update deferred: ${errorMessage(error)}`, "warning");
+				onCatalogues(tasks, projects) {
+					managerTaskCatalogue = tasks;
+					managerProjectCatalogue = projects;
+					void bridge?.updateManagerCatalogues(tasks, projects).catch((error) => {
+						ctx.ui.notify(`Discord manager catalogue update deferred: ${errorMessage(error)}`, "warning");
 					});
 				},
 				onError(error) {
@@ -254,9 +258,18 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					onControl: (request) => executeSessionControl(request, ctx),
 					...(managerExecutor && managerProducer ? {
 						managerTaskCatalogue: () => managerTaskCatalogue,
+						managerProjectCatalogue: () => managerProjectCatalogue,
 						onManagerControl: async (request) => {
-							const result = await managerExecutor!.execute(request, managerTaskCatalogue);
-							managerProducer.requestRefresh(0);
+							const result = await managerExecutor!.execute(
+								request,
+								managerTaskCatalogue,
+								managerProjectCatalogue,
+								(message) => {
+									if (ctx.isIdle()) pi.sendUserMessage(message);
+									else pi.sendUserMessage(message, { deliverAs: "followUp" });
+								},
+							);
+							if (request.action !== "ask") managerProducer.requestRefresh(0);
 							return result;
 						},
 					} : {}),

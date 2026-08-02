@@ -2,6 +2,7 @@ import type { DiscordBridgeConfig } from "./config.js";
 import { LocalRelayClient, type RelayClientDependencies, type RelayClientStatus } from "./relay-client.js";
 import { assistantText } from "./text.js";
 import type {
+	ManagerProjectCatalogueEntry,
 	ManagerTaskCatalogueEntry,
 	PiManagerControlRequest,
 	PiModelCatalogueEntry,
@@ -34,6 +35,7 @@ export interface BridgeCallbacks {
 	modelCatalogue?(): PiModelCatalogueEntry[];
 	onControl?(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
 	managerTaskCatalogue?(): ManagerTaskCatalogueEntry[];
+	managerProjectCatalogue?(): ManagerProjectCatalogueEntry[];
 	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 }
 
@@ -92,6 +94,7 @@ export class DiscordBridge {
 				...(callbacks.modelCatalogue ? { modelCatalogue: callbacks.modelCatalogue } : {}),
 				...(callbacks.onControl ? { onControl: callbacks.onControl } : {}),
 				...(callbacks.managerTaskCatalogue ? { managerTaskCatalogue: callbacks.managerTaskCatalogue } : {}),
+				...(callbacks.managerProjectCatalogue ? { managerProjectCatalogue: callbacks.managerProjectCatalogue } : {}),
 				...(callbacks.onManagerControl ? { onManagerControl: callbacks.onManagerControl } : {}),
 			},
 			dependencies,
@@ -127,8 +130,11 @@ export class DiscordBridge {
 		return this.relay.sendProjectSummary(text);
 	}
 
-	async updateManagerTaskCatalogue(catalogue: readonly ManagerTaskCatalogueEntry[]): Promise<boolean> {
-		return this.relay.updateManagerTaskCatalogue(catalogue);
+	async updateManagerCatalogues(
+		tasks: readonly ManagerTaskCatalogueEntry[],
+		projects: readonly ManagerProjectCatalogueEntry[],
+	): Promise<boolean> {
+		return this.relay.updateManagerCatalogues(tasks, projects);
 	}
 
 	async mirrorUserText(text: string, interactive = false): Promise<void> {

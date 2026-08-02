@@ -134,8 +134,8 @@ class FakeGateway {
 			: { ok: false, message: "Discord relay is not ready for manager controls." };
 	}
 
-	managerAutocomplete(channelId, prefix) {
-		return this.managerAutocompleteListeners.values().next().value?.(channelId, prefix) ?? [];
+	managerAutocomplete(channelId, prefix, kind = "task") {
+		return this.managerAutocompleteListeners.values().next().value?.(channelId, prefix, kind) ?? [];
 	}
 
 	async ensureProjectChannel(request) {
@@ -348,7 +348,7 @@ try {
 	const { resolveProjectContext, resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
 	const { discoverTaskTitle, parseTaskTitle } = await importBuilt("extensions/discord/task-title.js");
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
-	const { formatManagerTaskSummary, managerTaskCatalogue, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
+	const { formatManagerTaskSummary, managerProjectCatalogue, managerTaskCatalogue, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
 	const { ManagerControlExecutor } = await importBuilt("extensions/discord/manager-controls.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
@@ -365,11 +365,14 @@ try {
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
 	const {
+		MAX_MANAGER_PROJECT_CATALOGUE_ITEMS,
+		MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES,
 		MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES,
 		MAX_MANAGER_TASK_CATALOGUE_ITEMS,
 		MAX_MODEL_AUTOCOMPLETE_CHOICES,
 		MAX_MODEL_CATALOGUE_ITEMS,
 		MAX_SESSION_CONTROL_QUEUE,
+		managerTargetAutocompleteChoices,
 		managerTaskAutocompleteChoices,
 		modelAutocompleteChoices,
 	} = await importBuilt("extensions/discord/controls.js");
@@ -543,16 +546,31 @@ try {
 		name: "Add Product Filters drawer for @everyone — woocommerce (@product-filters-drawer-visibility)",
 		value: "product-filters-drawer-visibility",
 	}], "task autocomplete labels must include title, project, and task ID");
+	const focusedProjects = managerProjectCatalogue("---\nprojects:\n  woocommerce:\n    repository: /tmp/woocommerce\n  legacy-task-id:\n    repository: /tmp/collision\n---\n");
+	assert.deepEqual(focusedProjects, [{ projectId: "woocommerce" }, { projectId: "legacy-task-id" }]);
+	assert.deepEqual(managerTargetAutocompleteChoices(focusedProjects, managerTaskCatalogue(focusedManagerStatus), "legacy"), [{
+		name: "Project — Legacy Task Id (legacy-task-id)",
+		value: "project:legacy-task-id",
+	}, {
+		name: "Task — Legacy Task ID — wordpress (@legacy-task-id)",
+		value: "task:legacy-task-id",
+	}], "ask target autocomplete must preserve collision-safe typed project and task values");
+	assert.deepEqual(managerTargetAutocompleteChoices([], [{
+		taskId: "completed-task", project: "woocommerce", title: "Completed task", status: "complete",
+	}], "completed"), [], "ask targets must include only current active manager tasks");
 	const managerDefinition = managerCommandDefinition();
 	assert.equal(managerDefinition.name, "manager");
-	assert.deepEqual(managerDefinition.options.map((option) => option.name), ["handoff", "takeback", "archive", "merge-and-archive"]);
-	for (const option of managerDefinition.options) {
+	assert.deepEqual(managerDefinition.options.map((option) => option.name), ["handoff", "takeback", "archive", "merge-and-archive", "ask"]);
+	for (const option of managerDefinition.options.slice(0, 4)) {
 		assert.deepEqual(option.options.map(({ name, required, autocomplete }) => ({ name, required, autocomplete })), [
 			{ name: "task", required: true, autocomplete: true },
-		], `${option.name} must expose exactly one required dynamic task option`);
+		], `${option.name} must retain exactly one required dynamic task option`);
 	}
-	assert.equal(JSON.stringify(managerDefinition).includes("project"), false, "/manager must not expose a project option");
-	assert.equal(JSON.stringify(managerDefinition).includes('"ask"'), false, "/manager must not expose ask");
+	assert.deepEqual(managerDefinition.options[4].options.map(({ name, required, autocomplete, maxLength }) => ({
+		name, required, autocomplete, maxLength,
+	})), [{ name: "target", required: true, autocomplete: true, maxLength: undefined }, {
+		name: "request", required: true, autocomplete: undefined, maxLength: 2_000,
+	}], "ask must expose only the required dynamic target and bounded request options");
 	assert.equal(JSON.stringify(managerDefinition).includes('"status"'), false, "/manager must not expose status");
 	const timerTransport = new DiscordJsTransport();
 	let timerRequest;
@@ -597,6 +615,24 @@ try {
 		taskId: "timer-task",
 	});
 	assert.equal(managerInteractionReplies[0].content, "✅ settled");
+	await timerTransport.executeManagerControlInteraction({
+		id: "ask-manager-control",
+		channelId: "timer-manager-thread",
+		async deferReply() {},
+		options: {
+			getSubcommand: () => "ask",
+			getString: (name) => name === "target" ? "project:pi-extensions" : "Inspect it",
+		},
+		async editReply(reply) { managerInteractionReplies.push(reply); },
+	});
+	assert.deepEqual(timerRequest, {
+		requestId: "ask-manager-control",
+		channelId: "timer-manager-thread",
+		action: "ask",
+		target: "project:pi-extensions",
+		request: "Inspect it",
+	}, "Discord ask interactions must route both required options without task coercion");
+	assert.equal(managerInteractionReplies[1].content, "✅ settled");
 
 	let managerStatus = {
 		...focusedManagerStatus,
@@ -627,13 +663,17 @@ try {
 	const managerWatchListeners = [];
 	const producedSummaries = [];
 	const producedManagerCatalogues = [];
+	const producedProjectCatalogues = [];
+	let managerProjectsContent = "---\nprojects:\n  pi-extensions:\n    repository: /tmp/pi-extensions\n---\n";
 	const producerErrors = [];
 	const managerProducer = await ManagerTaskSummaryProducer.create(managerFixture, {
 		onSummary: (summary) => producedSummaries.push(summary),
 		onTaskCatalogue: (catalogue) => producedManagerCatalogues.push(catalogue),
+		onProjectCatalogue: (catalogue) => producedProjectCatalogues.push(catalogue),
 		onError: (error) => producerErrors.push(error),
 	}, {
 		readStatus: async () => structuredClone(managerStatus),
+		readProjects: async () => managerProjectsContent,
 		watchDirectory: (_path, listener) => {
 			managerWatchListeners.push(listener);
 			const watcher = new EventEmitter();
@@ -643,7 +683,8 @@ try {
 	});
 	assert.ok(managerProducer, "the-manager checkout must activate the canonical status producer");
 	managerProducer.start();
-	await waitFor(() => producedSummaries.length === 1 && producedManagerCatalogues.length === 1, "initial manager task snapshot");
+	await waitFor(() => producedSummaries.length === 1 && producedManagerCatalogues.length === 1 && producedProjectCatalogues.length === 1,
+		"initial manager task and project snapshot");
 	managerStatus = {
 		...managerStatus,
 		summary: { tasks: 1, pending_events: 1, ready_tasks: 1, orphan_events: 0 },
@@ -654,7 +695,12 @@ try {
 	assert.match(producedSummaries[1], /📋 \*\*Tasks\*\* · 1 total · 0 active · 1 ready/);
 	assert.match(producedSummaries[1], /\*\*Ready\*\*[\s\S]*✅ \*\*Pi Extensions\*\* — Discord @\u200beveryone summary/);
 	assert.doesNotMatch(producedSummaries[1], /`review · run 1`/, "ready tasks must omit active-run details");
-	assert.equal(producedManagerCatalogues[1][0].status, "ready", "filesystem events must refresh the autocomplete catalogue without polling");
+	assert.equal(producedManagerCatalogues[1][0].status, "ready", "filesystem events must refresh the task autocomplete catalogue without polling");
+	managerProjectsContent = "---\nprojects:\n  pi-extensions:\n    repository: /tmp/pi-extensions\n  wordpress:\n    repository: /tmp/wordpress\n---\n";
+	managerWatchListeners[2]();
+	await waitFor(() => producedProjectCatalogues.length === 3, "project registry manager catalogue refresh");
+	assert.deepEqual(producedProjectCatalogues[2], [{ projectId: "pi-extensions" }, { projectId: "wordpress" }],
+		"project registry changes must refresh without polling");
 	assert.deepEqual(producerErrors, []);
 	managerProducer.stop();
 	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
@@ -724,6 +770,59 @@ try {
 	assert.equal(managerActionCalls.every((call) => call.executable === process.execPath && call.options.cwd === managerExecutorRoot), true);
 	assert.equal(managerActionCalls.every((call) => call.args.includes(join(managerExecutorRoot, "data", "tasks", "safe-task.md"))), true,
 		"task selection must resolve only to the canonical active task path");
+	const deliveredAskRequests = [];
+	const executorProjects = [{ projectId: "pi-extensions" }, { projectId: "safe-task" }];
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "ask-project",
+		action: "ask",
+		target: "project:safe-task",
+		request: "Inspect the project",
+	}, executorCatalogue, executorProjects, (message) => deliveredAskRequests.push(message)), {
+		ok: true,
+		message: "Request sent to project safe-task.",
+	});
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "ask-task",
+		action: "ask",
+		target: "task:safe-task",
+		request: "Inspect the task",
+	}, executorCatalogue, executorProjects, (message) => deliveredAskRequests.push(message)), {
+		ok: true,
+		message: "Request sent to task safe-task.",
+	});
+	assert.deepEqual(deliveredAskRequests, [
+		"Project: safe-task\n\nInspect the project",
+		"Project: pi-extensions\nTask: safe-task\n\nInspect the task",
+	], "ask must derive exact project/task context without invoking a lifecycle composite");
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "ask-inactive-task",
+		action: "ask",
+		target: "task:safe-task",
+		request: "Do not send",
+	}, [{ ...executorCatalogue[0], status: "complete" }], executorProjects, () => assert.fail("inactive asks must not deliver")), {
+		ok: false,
+		message: "Select a target from this manager session's current autocomplete catalogue.",
+	});
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "ask-stale",
+		action: "ask",
+		target: "project:missing",
+		request: "Do not send",
+	}, executorCatalogue, executorProjects, () => assert.fail("stale asks must not deliver")), {
+		ok: false,
+		message: "Select a target from this manager session's current autocomplete catalogue.",
+	});
+	assert.deepEqual(await managerExecutor.execute({
+		requestId: "ask-oversize",
+		action: "ask",
+		target: "task:safe-task",
+		request: "x".repeat(2_001),
+	}, executorCatalogue, executorProjects, () => assert.fail("oversize asks must not deliver")), {
+		ok: false,
+		message: "Manager requests must contain 1-2000 characters.",
+	});
+	assert.equal(managerProcessCalls.filter((call) => !call.args.includes("validate")).length, 4,
+		"ask must not invoke or mutate manager lifecycle state");
 	const callsBeforeStale = managerProcessCalls.length;
 	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-stale", action: "archive", taskId: "missing-task" }, executorCatalogue), {
 		ok: false,
@@ -922,6 +1021,13 @@ try {
 		taskId: "safe-task",
 	}), { ok: false, message: "This live Pi session is not a verified the-manager client." },
 	"manager controls must reject mapped live ordinary Pi sessions");
+	assert.deepEqual(await rollingIdentityGateway.executeManagerControl({
+		requestId: "rolling-non-manager-ask",
+		channelId: legacyMainRegistration.threadId,
+		action: "ask",
+		target: "project:pi-extensions",
+		request: "Do not route",
+	}), { ok: false, message: "This live Pi session is not a verified the-manager client." });
 	await rollingIdentityCore.stop();
 
 	const controlState = new DiscordStateStore(join(dataDir, "control-state.json"));
@@ -1010,6 +1116,7 @@ try {
 	const deliveredManagerMessages = [];
 	const executedManagerControls = [];
 	const liveManagerCatalogue = [{ taskId: "safe-task", project: "pi-extensions", title: "Safe task", status: "active" }];
+	const liveManagerProjects = [{ projectId: "pi-extensions" }, { projectId: "safe-task" }];
 	await managerControlCore.activateRegistration(
 		"manager-client",
 		"manager-generation",
@@ -1019,9 +1126,10 @@ try {
 		true,
 		{
 			taskCatalogue: liveManagerCatalogue,
+			projectCatalogue: liveManagerProjects,
 			async execute(request) {
 				executedManagerControls.push(request);
-				return { ok: true, message: `${request.action} ${request.taskId}` };
+				return { ok: true, message: `${request.action} ${request.action === "ask" ? request.target : request.taskId}` };
 			},
 		},
 	);
@@ -1030,6 +1138,13 @@ try {
 		value: "safe-task",
 	}], "autocomplete must be scoped to the mapped live manager thread");
 	assert.deepEqual(managerControlGateway.managerAutocomplete("not-manager-thread", "safe"), []);
+	assert.deepEqual(managerControlGateway.managerAutocomplete(managerControlPrepared.threadId, "safe", "target"), [{
+		name: "Project — Safe Task (safe-task)",
+		value: "project:safe-task",
+	}, {
+		name: "Task — Safe task — pi-extensions (@safe-task)",
+		value: "task:safe-task",
+	}], "ask autocomplete must combine typed configured-project and active-task targets");
 	assert.deepEqual(await managerControlGateway.executeManagerControl({
 		requestId: "stale-manager-task",
 		channelId: managerControlPrepared.threadId,
@@ -1047,13 +1162,39 @@ try {
 		managerControlGateway.executeManagerControl(duplicateManagerRequest),
 	]), [{ ok: true, message: "handoff safe-task" }, { ok: true, message: "handoff safe-task" }]);
 	assert.equal(executedManagerControls.length, 1, "Discord retries must execute each manager mutation once");
-	managerControlCore.updateManagerTaskCatalogue("manager-client", "manager-generation", "manager-session", [{
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "relay-ask-task",
+		channelId: managerControlPrepared.threadId,
+		action: "ask",
+		target: "task:safe-task",
+		request: "Review it",
+	}), { ok: true, message: "ask task:safe-task" }, "relay must route a current typed ask target");
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "relay-ask-stale",
+		channelId: managerControlPrepared.threadId,
+		action: "ask",
+		target: "project:missing",
+		request: "Do not route",
+	}), { ok: false, message: "Select a target from this manager session's current autocomplete catalogue." });
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "relay-ask-invalid",
+		channelId: managerControlPrepared.threadId,
+		action: "ask",
+		target: "project:../hostile",
+		request: "Do not route",
+	}), { ok: false, message: "Invalid manager control request." });
+	managerControlCore.updateManagerCatalogues("manager-client", "manager-generation", "manager-session", [{
 		taskId: "new-task", project: "wordpress", title: "New task", status: "ready",
-	}]);
+	}], [{ projectId: "wordpress" }]);
 	assert.deepEqual(managerControlGateway.managerAutocomplete(managerControlPrepared.threadId, ""), [{
 		name: "New task — wordpress (@new-task)",
 		value: "new-task",
 	}], "live manager task-state refreshes must replace the cached catalogue");
+	assert.deepEqual(managerControlGateway.managerAutocomplete(managerControlPrepared.threadId, "", "target"), [{
+		name: "Project — Wordpress (wordpress)", value: "project:wordpress",
+	}, {
+		name: "Task — New task — wordpress (@new-task)", value: "task:new-task",
+	}], "live manager project/task refreshes must atomically replace ask targets");
 	assert.deepEqual(await managerControlGateway.executeManagerControl({ ...duplicateManagerRequest, requestId: "removed-task", taskId: "safe-task" }), {
 		ok: false,
 		message: "Select a task from this manager session's current autocomplete catalogue.",
@@ -1069,8 +1210,9 @@ try {
 	assert.deepEqual(await managerControlGateway.executeManagerControl({
 		requestId: "offline-manager-control",
 		channelId: managerControlPrepared.threadId,
-		action: "takeback",
-		taskId: "new-task",
+		action: "ask",
+		target: "project:wordpress",
+		request: "Do not route",
 	}), { ok: false, message: "The manager session mapped to this thread is offline." });
 	assert.deepEqual(await managerControlGateway.executeManagerControl({
 		requestId: "unmapped-manager-control",
@@ -1275,16 +1417,37 @@ try {
 	}), false, "registration model catalogues must be bounded");
 	assert.equal(isClientFrame({ type: "control_result", requestId: "control-1", ok: true, message: "done" }), true);
 	const managerTask = { taskId: "safe-task", project: "pi-extensions", title: "Safe task", status: "active" };
-	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, managerControls: { taskCatalogue: [managerTask] } }), true);
+	const managerProject = { projectId: "pi-extensions" };
 	assert.equal(isClientFrame({
 		...resolvedRegistrationFrame,
-		managerControls: { taskCatalogue: Array.from({ length: MAX_MANAGER_TASK_CATALOGUE_ITEMS + 1 }, () => managerTask) },
-	}), false, "manager registration catalogues must be bounded");
+		managerControls: { taskCatalogue: [managerTask], projectCatalogue: [managerProject] },
+	}), true);
 	assert.equal(isClientFrame({
 		...resolvedRegistrationFrame,
-		managerControls: { taskCatalogue: [{ ...managerTask, taskId: "../hostile" }] },
+		managerControls: {
+			taskCatalogue: Array.from({ length: MAX_MANAGER_TASK_CATALOGUE_ITEMS + 1 }, () => managerTask),
+			projectCatalogue: [managerProject],
+		},
+	}), false, "manager registration task catalogues must be bounded");
+	assert.equal(isClientFrame({
+		...resolvedRegistrationFrame,
+		managerControls: {
+			taskCatalogue: [managerTask],
+			projectCatalogue: Array.from({ length: MAX_MANAGER_PROJECT_CATALOGUE_ITEMS + 1 }, (_, index) => ({ projectId: `project-${index}` })),
+		},
+	}), false, "manager registration project catalogues must be bounded");
+	assert.equal(isClientFrame({
+		...resolvedRegistrationFrame,
+		managerControls: { taskCatalogue: [{ ...managerTask, taskId: "../hostile" }], projectCatalogue: [managerProject] },
 	}), false, "manager task IDs must be safe canonical IDs");
-	assert.equal(isClientFrame({ type: "manager_catalogue", requestId: "catalogue-1", taskCatalogue: [managerTask] }), true);
+	assert.equal(isClientFrame({
+		type: "manager_catalogue",
+		requestId: "catalogue-1",
+		taskCatalogue: [managerTask],
+		projectCatalogue: [managerProject],
+	}), true);
+	assert.equal(isClientFrame({ type: "manager_catalogue", requestId: "catalogue-rolling-client", taskCatalogue: [managerTask] }), true,
+		"older lifecycle-only manager clients must remain protocol-compatible without ask targets");
 	assert.equal(isClientFrame({ type: "manager_control_result", requestId: "manager-1", ok: true, message: "done" }), true);
 	assert.equal(isClientFrame({ type: "release_inbound_images", requestId: "release-1", messageId: "message-1" }), true);
 	assert.equal(isServerFrame({ type: "inbound_images_released", requestId: "release-1", messageId: "message-1" }), true);
@@ -1293,11 +1456,23 @@ try {
 	for (const action of ["handoff", "takeback", "archive", "merge-and-archive"]) {
 		assert.equal(isServerFrame({ type: "manager_control", requestId: `manager-${action}`, action, taskId: "safe-task" }), true);
 	}
-	for (const action of ["ask", "status", "merge", "handoff-now"]) {
+	assert.equal(isServerFrame({
+		type: "manager_control",
+		requestId: "manager-ask",
+		action: "ask",
+		target: "task:safe-task",
+		request: "Inspect it",
+	}), true);
+	for (const action of ["status", "merge", "handoff-now"]) {
 		assert.equal(isServerFrame({ type: "manager_control", requestId: `manager-${action}`, action, taskId: "safe-task" }), false,
 			`unsupported manager action ${action} must fail closed`);
 	}
 	assert.equal(isServerFrame({ type: "manager_control", requestId: "manager-hostile", action: "archive", taskId: "../safe-task" }), false);
+	assert.equal(isServerFrame({ type: "manager_control", requestId: "manager-hostile-ask", action: "ask", target: "task:../safe", request: "x" }), false);
+	assert.equal(isServerFrame({ type: "manager_control", requestId: "manager-empty-ask", action: "ask", target: "task:safe-task", request: "" }), false);
+	assert.equal(isServerFrame({
+		type: "manager_control", requestId: "manager-oversize-ask", action: "ask", target: "project:pi-extensions", request: "x".repeat(2_001),
+	}), false);
 
 	const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 	const validAttachmentUrl = "https://cdn.discordapp.com/attachments/12345/67890/image.png?ex=signed";
@@ -1680,6 +1855,11 @@ try {
 	}));
 	assert.equal(managerTaskAutocompleteChoices(managerAutocompleteCatalogue, "matching").length, MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES);
 	assert.ok(managerTaskAutocompleteChoices(managerAutocompleteCatalogue, "task-39").some((choice) => choice.value === "task-39"));
+	const projectAutocompleteCatalogue = Array.from({ length: 40 }, (_, index) => ({ projectId: `project-${index}` }));
+	assert.equal(managerTargetAutocompleteChoices(projectAutocompleteCatalogue, managerAutocompleteCatalogue, "").length,
+		MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES, "combined ask target autocomplete must return at most 25 choices");
+	assert.ok(managerTargetAutocompleteChoices(projectAutocompleteCatalogue, managerAutocompleteCatalogue, "task-39").some((choice) =>
+		choice.value === "task:task-39"), "ask target filtering must search task IDs beyond the first unfiltered page");
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "summary" }), true);
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "x".repeat(2_001) }), false);
 	const previousValidator = (frame) => frame?.type === "outbound" && typeof frame.requestId === "string" &&
@@ -2196,6 +2376,12 @@ try {
 		name: "Discord @everyone summary — pi-extensions (@discord-manager-task-summary)",
 		value: "discord-manager-task-summary",
 	}]);
+	await writeFile(join(managerFixture, "data", "PROJECTS.md"), [
+		"---", "projects:", "  pi-extensions:", "    repository: /tmp/pi-extensions", "  wordpress:",
+		"    repository: /tmp/wordpress", "---", "",
+	].join("\n"));
+	await waitFor(() => FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "wordpress", "target").some((choice) =>
+		choice.value === "project:wordpress"), "extension project-registry ask-target refresh without polling");
 	assert.deepEqual(await FakeGateway.instances[0].executeManagerControl({
 		requestId: "manager-end-to-end-handoff",
 		channelId: managerSummaryMapping.threadId,
@@ -2203,6 +2389,32 @@ try {
 		taskId: "discord-manager-task-summary",
 	}), { ok: true, message: "Direct handoff started for @discord-manager-task-summary." },
 	"mapped manager controls must traverse Discord, relay IPC, verified client, runtime validation, and canonical manager CLI");
+	assert.ok(FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "pi", "target").some((choice) =>
+		choice.value === "project:pi-extensions"), "ask targets must include every configured project");
+	assert.deepEqual(await FakeGateway.instances[0].executeManagerControl({
+		requestId: "manager-end-to-end-project-ask",
+		channelId: managerSummaryMapping.threadId,
+		action: "ask",
+		target: "project:pi-extensions",
+		request: "Inspect the extension",
+	}), { ok: true, message: "Request sent to project pi-extensions." });
+	assert.deepEqual(managerSummarySession.userMessages.at(-1), {
+		text: "Project: pi-extensions\n\nInspect the extension",
+		options: undefined,
+	}, "idle manager asks must send immediately with exact project context");
+	managerSummarySession.setIdle(false);
+	assert.deepEqual(await FakeGateway.instances[0].executeManagerControl({
+		requestId: "manager-end-to-end-task-ask",
+		channelId: managerSummaryMapping.threadId,
+		action: "ask",
+		target: "task:discord-manager-task-summary",
+		request: "Inspect the active task",
+	}), { ok: true, message: "Request sent to task discord-manager-task-summary." });
+	assert.deepEqual(managerSummarySession.userMessages.at(-1), {
+		text: "Project: pi-extensions\nTask: discord-manager-task-summary\n\nInspect the active task",
+		options: { deliverAs: "followUp" },
+	}, "busy manager asks must queue as Pi follow-ups with canonical task project metadata");
+	managerSummarySession.setIdle(true);
 
 	const namingState = new DiscordStateStore(stateFile);
 	const taskNamedMapping = await namingState.getSession(taskNamedSessionId);
@@ -2708,6 +2920,10 @@ try {
 		"manager task catalogue republish after relay restart");
 	assert.equal(gateway.managerAutocomplete(managerSummaryMapping.threadId, "")[0].value, "discord-manager-task-summary",
 		"manager reconnects must re-register the latest bounded task catalogue without polling");
+	await waitFor(() => gateway.managerAutocomplete(managerSummaryMapping.threadId, "pi-extensions", "target").length > 0,
+		"manager target catalogue republish after relay restart");
+	assert.ok(gateway.managerAutocomplete(managerSummaryMapping.threadId, "pi-extensions", "target").some((choice) =>
+		choice.value === "project:pi-extensions"), "reconnect must retain configured project ask targets");
 	await waitFor(() => FakeGateway.lifecycleReactionEvents.some((event) =>
 		event.messageId === "19" && event.reaction === "🤔" && event.gateway === gateway), "lifecycle replay after reconnect");
 	assert.notEqual(gateway, preReconnectGateway);

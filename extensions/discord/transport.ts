@@ -17,6 +17,8 @@ import { DISCORD_LIFECYCLE_REACTIONS, type DiscordLifecycleReaction } from "./re
 import {
 	boundedControlResult,
 	MANAGER_CONTROL_ACTIONS,
+	MANAGER_LIFECYCLE_ACTIONS,
+	MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES,
 	MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES,
 	MAX_MODEL_AUTOCOMPLETE_CHOICES,
 	MAX_SESSION_CONTROL_TEXT_LENGTH,
@@ -61,7 +63,7 @@ export interface DiscordTransport {
 	onSessionControl(listener: (request: DiscordSessionControlRequest) => Promise<PiSessionControlResult>): () => void;
 	onModelAutocomplete(listener: (channelId: string, prefix: string) => DiscordModelChoice[]): () => void;
 	onManagerControl(listener: (request: DiscordManagerControlRequest) => Promise<PiSessionControlResult>): () => void;
-	onManagerAutocomplete(listener: (channelId: string, prefix: string) => DiscordModelChoice[]): () => void;
+	onManagerAutocomplete(listener: (channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]): () => void;
 	ensureProjectChannel(request: ProjectChannelRequest): Promise<string>;
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
@@ -161,19 +163,39 @@ export function managerCommandDefinition(): ChatInputApplicationCommandData {
 	} as const;
 	return {
 		name: MANAGER_COMMAND_NAME,
-		description: "Control a task from the live the-manager session",
-		options: MANAGER_CONTROL_ACTIONS.map((action) => ({
-			type: ApplicationCommandOptionType.Subcommand,
-			name: action,
-			description: descriptions[action],
-			options: [{
-				type: ApplicationCommandOptionType.String,
-				name: "task",
-				description: "Managed task",
-				required: true,
-				autocomplete: true,
-			}],
-		})),
+		description: "Control tasks and send requests from the live the-manager session",
+		options: [
+			...MANAGER_LIFECYCLE_ACTIONS.map((action) => ({
+				type: ApplicationCommandOptionType.Subcommand as const,
+				name: action,
+				description: descriptions[action],
+				options: [{
+					type: ApplicationCommandOptionType.String as const,
+					name: "task",
+					description: "Managed task",
+					required: true,
+					autocomplete: true,
+				}],
+			})),
+			{
+				type: ApplicationCommandOptionType.Subcommand,
+				name: "ask",
+				description: "Send a request with project or task context",
+				options: [{
+					type: ApplicationCommandOptionType.String,
+					name: "target",
+					description: "Configured project or active task",
+					required: true,
+					autocomplete: true,
+				}, {
+					type: ApplicationCommandOptionType.String,
+					name: "request",
+					description: "Request for the manager",
+					required: true,
+					maxLength: MAX_SESSION_CONTROL_TEXT_LENGTH,
+				}],
+			},
+		],
 	};
 }
 
@@ -183,7 +205,7 @@ export class DiscordJsTransport implements DiscordTransport {
 	private readonly controlListeners = new Set<(request: DiscordSessionControlRequest) => Promise<PiSessionControlResult>>();
 	private readonly autocompleteListeners = new Set<(channelId: string, prefix: string) => DiscordModelChoice[]>();
 	private readonly managerControlListeners = new Set<(request: DiscordManagerControlRequest) => Promise<PiSessionControlResult>>();
-	private readonly managerAutocompleteListeners = new Set<(channelId: string, prefix: string) => DiscordModelChoice[]>();
+	private readonly managerAutocompleteListeners = new Set<(channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]>();
 	private readonly terminalListeners = new Set<(error: Error) => void>();
 
 	async connect(config: DiscordBridgeConfig): Promise<void> {
@@ -222,16 +244,24 @@ export class DiscordJsTransport implements DiscordTransport {
 		client.on(Events.InteractionCreate, (interaction) => {
 			if (interaction.isAutocomplete()) {
 				const focused = interaction.options.getFocused(true);
-				const manager = interaction.commandName === MANAGER_COMMAND_NAME && focused.name === "task";
+				const managerKind = interaction.commandName === MANAGER_COMMAND_NAME &&
+					(focused.name === "task" || focused.name === "target") ? focused.name : undefined;
 				const pi = interaction.commandName === PI_COMMAND_NAME && focused.name === "model";
-				if (!manager && !pi) return;
+				if (!managerKind && !pi) return;
 				let choices: DiscordModelChoice[] = [];
-				const listeners = manager ? this.managerAutocompleteListeners : this.autocompleteListeners;
-				for (const listener of listeners) {
-					choices = listener(interaction.channelId, String(focused.value));
-					break;
+				if (managerKind) {
+					for (const listener of this.managerAutocompleteListeners) {
+						choices = listener(interaction.channelId, String(focused.value), managerKind);
+						break;
+					}
+				} else {
+					for (const listener of this.autocompleteListeners) {
+						choices = listener(interaction.channelId, String(focused.value));
+						break;
+					}
 				}
-				const maximum = manager ? MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES : MAX_MODEL_AUTOCOMPLETE_CHOICES;
+				const maximum = managerKind === "target" ? MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES
+					: managerKind === "task" ? MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES : MAX_MODEL_AUTOCOMPLETE_CHOICES;
 				void interaction.respond(choices.slice(0, maximum)).catch((error) => {
 					console.error("[discord-bridge] Discord autocomplete response failed:", error);
 				});
@@ -285,7 +315,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		return () => this.managerControlListeners.delete(listener);
 	}
 
-	onManagerAutocomplete(listener: (channelId: string, prefix: string) => DiscordModelChoice[]): () => void {
+	onManagerAutocomplete(listener: (channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]): () => void {
 		this.managerAutocompleteListeners.add(listener);
 		return () => this.managerAutocompleteListeners.delete(listener);
 	}
@@ -534,13 +564,20 @@ export class DiscordJsTransport implements DiscordTransport {
 			const listener = this.managerControlListeners.values().next().value;
 			if (!listener) result = { ok: false, message: "Discord relay is not ready for manager controls." };
 			else {
+				const request: DiscordManagerControlRequest = action === "ask" ? {
+					requestId: command.id,
+					channelId: command.channelId,
+					action: "ask",
+					target: command.options.getString("target", true),
+					request: command.options.getString("request", true),
+				} : {
+					requestId: command.id,
+					channelId: command.channelId,
+					action: action as Exclude<DiscordManagerControlRequest["action"], "ask">,
+					taskId: command.options.getString("task", true),
+				};
 				result = await Promise.race([
-					listener({
-						requestId: command.id,
-						channelId: command.channelId,
-						action: action as DiscordManagerControlRequest["action"],
-						taskId: command.options.getString("task", true),
-					}),
+					listener(request),
 					new Promise<PiSessionControlResult>((resolveResult) => {
 						timer = setTimeout(() => resolveResult({ ok: false, message: "Manager control timed out." }), MANAGER_CONTROL_EXECUTION_TIMEOUT_MS);
 						timer.unref();

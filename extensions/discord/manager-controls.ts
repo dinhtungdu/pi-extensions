@@ -3,6 +3,8 @@ import { stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import {
 	boundedControlResult,
+	isActiveManagerTask,
+	type ManagerProjectCatalogueEntry,
 	type ManagerTaskCatalogueEntry,
 	type PiManagerControlRequest,
 	type PiSessionControlResult,
@@ -99,9 +101,12 @@ export class ManagerControlExecutor {
 
 	async execute(
 		request: PiManagerControlRequest,
-		catalogue: readonly ManagerTaskCatalogueEntry[],
+		tasks: readonly ManagerTaskCatalogueEntry[],
+		projects: readonly ManagerProjectCatalogueEntry[] = [],
+		deliverAsk?: (message: string) => void | Promise<void>,
 	): Promise<PiSessionControlResult> {
-		const task = catalogue.find((candidate) => candidate.taskId === request.taskId);
+		if (request.action === "ask") return this.executeAsk(request, tasks, projects, deliverAsk);
+		const task = tasks.find((candidate) => candidate.taskId === request.taskId);
 		if (!task) return { ok: false, message: "Select a task from this manager session's current autocomplete catalogue." };
 		try {
 			await this.validateRuntime();
@@ -135,6 +140,41 @@ export class ManagerControlExecutor {
 					: request.action === "archive" ? `@${task.taskId} archived without merging.`
 						: `@${task.taskId} merged locally and archived.`;
 			return { ok: true, message };
+		} catch (error) {
+			return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
+		}
+	}
+
+	private async executeAsk(
+		request: Extract<PiManagerControlRequest, { action: "ask" }>,
+		tasks: readonly ManagerTaskCatalogueEntry[],
+		projects: readonly ManagerProjectCatalogueEntry[],
+		deliverAsk?: (message: string) => void | Promise<void>,
+	): Promise<PiSessionControlResult> {
+		if (!request.request || request.request.length > 2_000) {
+			return { ok: false, message: "Manager requests must contain 1-2000 characters." };
+		}
+		let context: string;
+		let label: string;
+		if (request.target.startsWith("project:")) {
+			const projectId = request.target.slice("project:".length);
+			if (!projects.some((project) => project.projectId === projectId)) {
+				return { ok: false, message: "Select a target from this manager session's current autocomplete catalogue." };
+			}
+			context = `Project: ${projectId}`;
+			label = `project ${projectId}`;
+		} else if (request.target.startsWith("task:")) {
+			const taskId = request.target.slice("task:".length);
+			const task = tasks.find((candidate) => candidate.taskId === taskId && isActiveManagerTask(candidate));
+			if (!task) return { ok: false, message: "Select a target from this manager session's current autocomplete catalogue." };
+			context = `Project: ${task.project}\nTask: ${task.taskId}`;
+			label = `task ${task.taskId}`;
+		} else return { ok: false, message: "Select a target from this manager session's current autocomplete catalogue." };
+		if (!deliverAsk) return { ok: false, message: "The verified manager client cannot deliver requests." };
+		try {
+			await this.validateRuntime();
+			await deliverAsk(`${context}\n\n${request.request}`);
+			return { ok: true, message: `Request sent to ${label}.` };
 		} catch (error) {
 			return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
 		}

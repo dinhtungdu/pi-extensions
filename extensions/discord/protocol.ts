@@ -4,10 +4,12 @@ import type { RelaySessionRegistration } from "./relay-core.js";
 import type { DiscordLifecycleStatus } from "./reactions.js";
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
 import {
+	isManagerProjectCatalogue,
 	isManagerTaskCatalogue,
 	isPiManagerControlRequest,
 	isPiModelCatalogue,
 	isPiSessionControlAction,
+	type ManagerProjectCatalogueEntry,
 	type ManagerTaskCatalogueEntry,
 	type PiManagerControlRequest,
 	type PiModelCatalogueEntry,
@@ -25,7 +27,7 @@ export type ClientFrame =
 		configFingerprint: string;
 		configEpoch: number;
 		sessionControls?: { modelCatalogue: PiModelCatalogueEntry[] };
-		managerControls?: { taskCatalogue: ManagerTaskCatalogueEntry[] };
+		managerControls?: { taskCatalogue: ManagerTaskCatalogueEntry[]; projectCatalogue?: ManagerProjectCatalogueEntry[] };
 		inboundImages?: true;
 	} & RelaySessionRegistration)
 	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
@@ -34,7 +36,7 @@ export type ClientFrame =
 	| { type: "release_inbound_images"; requestId: string; messageId: string }
 	| { type: "lifecycle"; messageId: string; status: DiscordLifecycleStatus }
 	| { type: "control_result"; requestId: string; ok: boolean; message: string }
-	| { type: "manager_catalogue"; requestId: string; taskCatalogue: ManagerTaskCatalogueEntry[] }
+	| { type: "manager_catalogue"; requestId: string; taskCatalogue: ManagerTaskCatalogueEntry[]; projectCatalogue?: ManagerProjectCatalogueEntry[] }
 	| { type: "manager_control_result"; requestId: string; ok: boolean; message: string }
 	| { type: "unregister" }
 	| { type: "ping" };
@@ -96,7 +98,9 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			)) &&
 			(frame.managerControls === undefined || (
 				Boolean(frame.managerControls) && typeof frame.managerControls === "object" && !Array.isArray(frame.managerControls) &&
-				isManagerTaskCatalogue((frame.managerControls as Record<string, unknown>).taskCatalogue)
+				isManagerTaskCatalogue((frame.managerControls as Record<string, unknown>).taskCatalogue) &&
+				((frame.managerControls as Record<string, unknown>).projectCatalogue === undefined ||
+					isManagerProjectCatalogue((frame.managerControls as Record<string, unknown>).projectCatalogue))
 			));
 	}
 	if (frame.type === "outbound") {
@@ -119,7 +123,8 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			typeof frame.message === "string" && frame.message.length <= 2_000;
 	}
 	if (frame.type === "manager_catalogue") {
-		return typeof frame.requestId === "string" && isManagerTaskCatalogue(frame.taskCatalogue);
+		return typeof frame.requestId === "string" && isManagerTaskCatalogue(frame.taskCatalogue) &&
+			(frame.projectCatalogue === undefined || isManagerProjectCatalogue(frame.projectCatalogue));
 	}
 	return frame.type === "unregister" || frame.type === "ping";
 }

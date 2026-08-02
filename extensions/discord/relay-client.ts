@@ -11,8 +11,10 @@ import { restartOwnedRelay } from "./leader.js";
 import type { QueuedInboundImage } from "./inbound-images.js";
 import {
 	boundedControlResult,
+	MAX_MANAGER_PROJECT_CATALOGUE_ITEMS,
 	MAX_MANAGER_TASK_CATALOGUE_ITEMS,
 	MAX_MODEL_CATALOGUE_ITEMS,
+	type ManagerProjectCatalogueEntry,
 	type ManagerTaskCatalogueEntry,
 	type PiManagerControlRequest,
 	type PiModelCatalogueEntry,
@@ -48,6 +50,7 @@ export interface RelayClientCallbacks {
 	modelCatalogue?(): PiModelCatalogueEntry[];
 	onControl?(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
 	managerTaskCatalogue?(): ManagerTaskCatalogueEntry[];
+	managerProjectCatalogue?(): ManagerProjectCatalogueEntry[];
 	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 }
 
@@ -201,12 +204,16 @@ export class LocalRelayClient {
 		return true;
 	}
 
-	async updateManagerTaskCatalogue(catalogue: readonly ManagerTaskCatalogueEntry[]): Promise<boolean> {
+	async updateManagerCatalogues(
+		tasks: readonly ManagerTaskCatalogueEntry[],
+		projects: readonly ManagerProjectCatalogueEntry[],
+	): Promise<boolean> {
 		if (!this.callbacks.onManagerControl || !this.currentStatus.managerControls) return false;
 		await this.sendRequest({
 			type: "manager_catalogue",
 			requestId: randomUUID(),
-			taskCatalogue: catalogue.slice(0, MAX_MANAGER_TASK_CATALOGUE_ITEMS).map((task) => ({ ...task })),
+			taskCatalogue: tasks.slice(0, MAX_MANAGER_TASK_CATALOGUE_ITEMS).map((task) => ({ ...task })),
+			projectCatalogue: projects.slice(0, MAX_MANAGER_PROJECT_CATALOGUE_ITEMS).map((project) => ({ ...project })),
 		}, REQUEST_TIMEOUT_MS);
 		return true;
 	}
@@ -322,6 +329,9 @@ export class LocalRelayClient {
 				const managerTaskCatalogue = this.callbacks.onManagerControl
 					? (this.callbacks.managerTaskCatalogue?.() ?? []).slice(0, MAX_MANAGER_TASK_CATALOGUE_ITEMS)
 					: undefined;
+				const managerProjectCatalogue = this.callbacks.onManagerControl
+					? (this.callbacks.managerProjectCatalogue?.() ?? []).slice(0, MAX_MANAGER_PROJECT_CATALOGUE_ITEMS)
+					: undefined;
 				const frame: ClientFrame = {
 					type: "register",
 					token: this.token!,
@@ -332,7 +342,9 @@ export class LocalRelayClient {
 					...this.registration,
 					inboundImages: true,
 					...(modelCatalogue ? { sessionControls: { modelCatalogue } } : {}),
-					...(managerTaskCatalogue ? { managerControls: { taskCatalogue: managerTaskCatalogue } } : {}),
+					...(managerTaskCatalogue && managerProjectCatalogue ? {
+						managerControls: { taskCatalogue: managerTaskCatalogue, projectCatalogue: managerProjectCatalogue },
+					} : {}),
 				};
 				if (!writer.write(encodeFrame(frame))) {
 					waiter.reject(new Error("Local Discord relay request queue is full during registration"));
@@ -443,12 +455,11 @@ export class LocalRelayClient {
 		if (frame.type === "manager_control") {
 			let result: PiSessionControlResult;
 			try {
+				const request: PiManagerControlRequest = frame.action === "ask"
+					? { requestId: frame.requestId, action: "ask", target: frame.target, request: frame.request }
+					: { requestId: frame.requestId, action: frame.action, taskId: frame.taskId };
 				result = this.callbacks.onManagerControl
-					? boundedControlResult(await this.callbacks.onManagerControl({
-						requestId: frame.requestId,
-						action: frame.action,
-						taskId: frame.taskId,
-					}))
+					? boundedControlResult(await this.callbacks.onManagerControl(request))
 					: { ok: false, message: "This Pi client does not support Discord manager controls." };
 			} catch (error) {
 				result = boundedControlResult({ ok: false, message: asError(error).message });

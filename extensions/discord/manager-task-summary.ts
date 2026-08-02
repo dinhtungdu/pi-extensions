@@ -1,10 +1,13 @@
 import { execFile } from "node:child_process";
 import { watch, type FSWatcher } from "node:fs";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
+	isManagerProjectCatalogue,
 	isManagerTaskCatalogue,
+	MAX_MANAGER_PROJECT_CATALOGUE_ITEMS,
 	MAX_MANAGER_TASK_CATALOGUE_ITEMS,
+	type ManagerProjectCatalogueEntry,
 	type ManagerTaskCatalogueEntry,
 } from "./controls.js";
 
@@ -38,11 +41,14 @@ interface ManagerStatus {
 export interface ManagerTaskSummaryCallbacks {
 	onSummary(summary: string): void;
 	onTaskCatalogue?(catalogue: ManagerTaskCatalogueEntry[]): void;
+	onProjectCatalogue?(catalogue: ManagerProjectCatalogueEntry[]): void;
+	onCatalogues?(tasks: ManagerTaskCatalogueEntry[], projects: ManagerProjectCatalogueEntry[]): void;
 	onError(error: Error): void;
 }
 
 export interface ManagerTaskSummaryDependencies {
 	readStatus?: (root: string) => Promise<unknown>;
+	readProjects?: (root: string) => Promise<string>;
 	watchDirectory?: (path: string, listener: () => void) => FSWatcher;
 }
 
@@ -169,6 +175,32 @@ export function managerTaskCatalogue(value: unknown): ManagerTaskCatalogueEntry[
 	return catalogue;
 }
 
+export function managerProjectCatalogue(content: string): ManagerProjectCatalogueEntry[] {
+	if (Buffer.byteLength(content) > STATUS_MAX_BYTES) throw new Error("the-manager project registry is too large");
+	const lines = content.split(/\r?\n/);
+	if (lines[0] !== "---") throw new Error("the-manager project registry is malformed");
+	const end = lines.indexOf("---", 1);
+	if (end < 2 || lines[1] !== "projects:") throw new Error("the-manager project registry is malformed");
+	const catalogue: ManagerProjectCatalogueEntry[] = [];
+	let currentProject = false;
+	for (const line of lines.slice(2, end)) {
+		if (!line) continue;
+		const match = /^  ([a-z0-9]+(?:-[a-z0-9]+)*):$/.exec(line);
+		if (match) {
+			catalogue.push({ projectId: match[1]! });
+			currentProject = true;
+			continue;
+		}
+		if (!currentProject || !/^    [a-z_]+: \S(?:.*\S)?$/.test(line)) {
+			throw new Error("the-manager project registry is malformed");
+		}
+	}
+	if (catalogue.length > MAX_MANAGER_PROJECT_CATALOGUE_ITEMS || !isManagerProjectCatalogue(catalogue)) {
+		throw new Error("the-manager project registry returned an invalid project catalogue");
+	}
+	return catalogue;
+}
+
 export function formatManagerTaskSummary(value: unknown): string {
 	const status = parseManagerStatus(value);
 	const groups = new Map<string, ManagerTaskStatus[]>();
@@ -226,6 +258,10 @@ async function defaultReadStatus(root: string): Promise<unknown> {
 	});
 }
 
+async function defaultReadProjects(root: string): Promise<string> {
+	return readFile(join(root, "data", "PROJECTS.md"), "utf8");
+}
+
 async function isDirectory(path: string): Promise<boolean> {
 	return stat(path).then((entry) => entry.isDirectory(), () => false);
 }
@@ -256,6 +292,7 @@ export class ManagerTaskSummaryProducer {
 		if (!await isFile(join(root, "bin", "manager.mjs")) || !await isDirectory(tasks)) return undefined;
 		return new ManagerTaskSummaryProducer(root, callbacks, {
 			readStatus: dependencies.readStatus ?? defaultReadStatus,
+			readProjects: dependencies.readProjects ?? defaultReadProjects,
 			watchDirectory: dependencies.watchDirectory ?? ((path, listener) => watch(path, listener)),
 		});
 	}
@@ -263,7 +300,11 @@ export class ManagerTaskSummaryProducer {
 	start(): void {
 		if (!this.stopped) return;
 		this.stopped = false;
-		for (const directory of [join(this.root, "data", "tasks"), join(this.root, ".manager", "events")]) {
+		for (const directory of [
+			join(this.root, "data", "tasks"),
+			join(this.root, ".manager", "events"),
+			join(this.root, "data"),
+		]) {
 			try {
 				const watcher = this.dependencies.watchDirectory(directory, () => this.requestRefresh());
 				watcher.on("error", (error) => this.callbacks.onError(error));
@@ -307,9 +348,12 @@ export class ManagerTaskSummaryProducer {
 					const status = await this.dependencies.readStatus(this.root);
 					const summary = formatManagerTaskSummary(status);
 					const catalogue = managerTaskCatalogue(status);
+					const projects = managerProjectCatalogue(await this.dependencies.readProjects(this.root));
 					if (!this.stopped) {
 						this.callbacks.onSummary(summary);
 						this.callbacks.onTaskCatalogue?.(catalogue);
+						this.callbacks.onProjectCatalogue?.(projects);
+						this.callbacks.onCatalogues?.(catalogue, projects);
 					}
 				} catch (error) {
 					if (!this.stopped) this.callbacks.onError(error instanceof Error ? error : new Error(String(error)));

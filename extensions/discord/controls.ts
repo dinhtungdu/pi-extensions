@@ -1,7 +1,9 @@
 export const MAX_MODEL_CATALOGUE_ITEMS = 500;
 export const MAX_MODEL_AUTOCOMPLETE_CHOICES = 25;
 export const MAX_MANAGER_TASK_CATALOGUE_ITEMS = 500;
+export const MAX_MANAGER_PROJECT_CATALOGUE_ITEMS = 500;
 export const MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES = 25;
+export const MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES = 25;
 export const MAX_SESSION_CONTROL_TEXT_LENGTH = 2_000;
 export const MAX_SESSION_CONTROL_QUEUE = 32;
 export const MAX_RECENT_SESSION_CONTROLS = 2_000;
@@ -52,8 +54,11 @@ export interface DiscordModelChoice {
 	value: string;
 }
 
-export const MANAGER_CONTROL_ACTIONS = ["handoff", "takeback", "archive", "merge-and-archive"] as const;
+export const MANAGER_LIFECYCLE_ACTIONS = ["handoff", "takeback", "archive", "merge-and-archive"] as const;
+export const MANAGER_CONTROL_ACTIONS = [...MANAGER_LIFECYCLE_ACTIONS, "ask"] as const;
+export type ManagerLifecycleAction = typeof MANAGER_LIFECYCLE_ACTIONS[number];
 export type ManagerControlAction = typeof MANAGER_CONTROL_ACTIONS[number];
+const MANAGER_ACTIVE_TASK_STATUSES = new Set(["planning", "active", "needs-input", "ready"]);
 
 export interface ManagerTaskCatalogueEntry {
 	taskId: string;
@@ -62,20 +67,25 @@ export interface ManagerTaskCatalogueEntry {
 	status: string;
 }
 
-export interface PiManagerControlRequest {
-	requestId: string;
-	action: ManagerControlAction;
-	taskId: string;
+export interface ManagerProjectCatalogueEntry {
+	projectId: string;
 }
 
-export interface DiscordManagerControlRequest extends PiManagerControlRequest {
-	channelId: string;
-}
+export type PiManagerControlRequest = { requestId: string } & (
+	| { action: ManagerLifecycleAction; taskId: string }
+	| { action: "ask"; target: string; request: string }
+);
+
+export type DiscordManagerControlRequest = PiManagerControlRequest & { channelId: string };
 
 const MANAGER_TASK_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 export function isManagerControlAction(value: unknown): value is ManagerControlAction {
 	return typeof value === "string" && (MANAGER_CONTROL_ACTIONS as readonly string[]).includes(value);
+}
+
+export function isManagerLifecycleAction(value: unknown): value is ManagerLifecycleAction {
+	return typeof value === "string" && (MANAGER_LIFECYCLE_ACTIONS as readonly string[]).includes(value);
 }
 
 export function isManagerTaskCatalogue(value: unknown): value is ManagerTaskCatalogueEntry[] {
@@ -93,11 +103,28 @@ export function isManagerTaskCatalogue(value: unknown): value is ManagerTaskCata
 	});
 }
 
+export function isManagerProjectCatalogue(value: unknown): value is ManagerProjectCatalogueEntry[] {
+	if (!Array.isArray(value) || value.length > MAX_MANAGER_PROJECT_CATALOGUE_ITEMS) return false;
+	const projectIds = new Set<string>();
+	return value.every((project) => {
+		if (!project || typeof project !== "object" || Array.isArray(project)) return false;
+		const entry = project as Record<string, unknown>;
+		if (typeof entry.projectId !== "string" || projectIds.has(entry.projectId)) return false;
+		projectIds.add(entry.projectId);
+		return entry.projectId.length <= 100 && MANAGER_TASK_ID.test(entry.projectId);
+	});
+}
+
 export function isPiManagerControlRequest(value: unknown): value is PiManagerControlRequest {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const request = value as Record<string, unknown>;
-	return typeof request.requestId === "string" && request.requestId.length > 0 &&
-		isManagerControlAction(request.action) && typeof request.taskId === "string" &&
+	if (typeof request.requestId !== "string" || request.requestId.length === 0) return false;
+	if (request.action === "ask") {
+		return typeof request.target === "string" && /^(?:project|task):[a-z0-9]+(?:-[a-z0-9]+)*$/.test(request.target) &&
+			request.target.length <= 108 && typeof request.request === "string" && request.request.length > 0 &&
+			request.request.length <= MAX_SESSION_CONTROL_TEXT_LENGTH;
+	}
+	return isManagerLifecycleAction(request.action) && typeof request.taskId === "string" &&
 		request.taskId.length <= 100 && MANAGER_TASK_ID.test(request.taskId);
 }
 
@@ -113,6 +140,38 @@ export function managerTaskAutocompleteChoices(
 			name: truncate(`${task.title} — ${task.project} (@${task.taskId})`, 100),
 			value: task.taskId,
 		}));
+}
+
+function humanizeManagerId(value: string): string {
+	return value.split("-").filter(Boolean).map((word) => `${word.charAt(0).toUpperCase()}${word.slice(1)}`).join(" ");
+}
+
+export function isActiveManagerTask(task: Pick<ManagerTaskCatalogueEntry, "status">): boolean {
+	return MANAGER_ACTIVE_TASK_STATUSES.has(task.status);
+}
+
+export function managerTargetAutocompleteChoices(
+	projects: readonly ManagerProjectCatalogueEntry[],
+	tasks: readonly ManagerTaskCatalogueEntry[],
+	prefix: string,
+): DiscordModelChoice[] {
+	const query = prefix.trim().toLocaleLowerCase();
+	const choices = [
+		...projects.map((project) => ({
+			name: `Project — ${humanizeManagerId(project.projectId)} (${project.projectId})`,
+			value: `project:${project.projectId}`,
+			search: `project ${project.projectId} ${humanizeManagerId(project.projectId)}`,
+		})),
+		...tasks.filter(isActiveManagerTask).map((task) => ({
+			name: `Task — ${task.title} — ${task.project} (@${task.taskId})`,
+			value: `task:${task.taskId}`,
+			search: `task ${task.taskId} ${task.project} ${task.title} ${task.status}`,
+		})),
+	];
+	return choices
+		.filter((choice) => !query || choice.search.toLocaleLowerCase().includes(query) || choice.value.includes(query))
+		.slice(0, MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES)
+		.map((choice) => ({ name: truncate(choice.name, 100), value: choice.value }));
 }
 
 export function isPiThinkingLevel(value: unknown): value is PiThinkingLevel {

@@ -289,6 +289,7 @@ export class LocalRelayHost {
 				parsed.inboundImages === true,
 				parsed.managerControls ? {
 					taskCatalogue: parsed.managerControls.taskCatalogue,
+					projectCatalogue: parsed.managerControls.projectCatalogue,
 					execute: (request) => this.requestManagerControl(state, request),
 				} : undefined,
 			);
@@ -314,7 +315,13 @@ export class LocalRelayHost {
 		if (parsed.type === "manager_catalogue") {
 			if (!state.managerControls) throw new Error("Local client is not registered for manager controls");
 			try {
-				this.options.core.updateManagerTaskCatalogue(clientId, generation, sessionId, parsed.taskCatalogue);
+				this.options.core.updateManagerCatalogues(
+					clientId,
+					generation,
+					sessionId,
+					parsed.taskCatalogue,
+					parsed.projectCatalogue,
+				);
 			} catch (error) {
 				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
 				return;
@@ -374,11 +381,10 @@ export class LocalRelayHost {
 	}
 
 	private requestManagerControl(state: SocketState, request: PiManagerControlRequest): Promise<PiSessionControlResult> {
-		return this.requestClientControl(
-			state,
-			{ type: "manager_control", requestId: request.requestId, action: request.action, taskId: request.taskId },
-			MANAGER_CONTROL_TIMEOUT_MS,
-		);
+		const frame: Extract<ServerFrame, { type: "manager_control" }> = request.action === "ask"
+			? { type: "manager_control", requestId: request.requestId, action: "ask", target: request.target, request: request.request }
+			: { type: "manager_control", requestId: request.requestId, action: request.action, taskId: request.taskId };
+		return this.requestClientControl(state, frame, MANAGER_CONTROL_TIMEOUT_MS);
 	}
 
 	private requestControl(state: SocketState, request: PiSessionControlRequest): Promise<PiSessionControlResult> {

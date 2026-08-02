@@ -19,6 +19,9 @@ import {
 import {
 	boundedControlResult,
 	isPiThinkingLevel,
+	isActiveManagerTask,
+	isPiManagerControlRequest,
+	managerTargetAutocompleteChoices,
 	managerTaskAutocompleteChoices,
 	MAX_RECENT_SESSION_CONTROLS,
 	MAX_SESSION_CONTROL_QUEUE,
@@ -28,6 +31,7 @@ import {
 	type DiscordManagerControlRequest,
 	type DiscordModelChoice,
 	type DiscordSessionControlRequest,
+	type ManagerProjectCatalogueEntry,
 	type ManagerTaskCatalogueEntry,
 	type PiManagerControlRequest,
 	type PiModelCatalogueEntry,
@@ -56,6 +60,8 @@ interface ActiveSession {
 	modelCatalogue: PiModelCatalogueEntry[];
 	executeControl?: (request: PiSessionControlRequest) => Promise<PiSessionControlResult>;
 	managerTaskCatalogue: ManagerTaskCatalogueEntry[];
+	managerProjectCatalogue: ManagerProjectCatalogueEntry[];
+	managerAsk: boolean;
 	executeManagerControl?: (request: PiManagerControlRequest) => Promise<PiSessionControlResult>;
 	inboundImages: boolean;
 }
@@ -148,8 +154,8 @@ export class DiscordRelayCore {
 			return this.modelAutocomplete(channelId, prefix);
 		});
 		this.unsubscribeManagerControls = this.transport.onManagerControl((request) => this.executeDiscordManagerControl(request));
-		this.unsubscribeManagerAutocomplete = this.transport.onManagerAutocomplete((channelId, prefix) => {
-			return this.managerAutocomplete(channelId, prefix);
+		this.unsubscribeManagerAutocomplete = this.transport.onManagerAutocomplete((channelId, prefix, kind) => {
+			return this.managerAutocomplete(channelId, prefix, kind);
 		});
 		this.started = true;
 		for (const { cwd } of await this.state.projectSummaries()) this.scheduleProjectSummaryReconciliation(cwd);
@@ -260,6 +266,7 @@ export class DiscordRelayCore {
 		inboundImages = false,
 		managerControls?: {
 			taskCatalogue: ManagerTaskCatalogueEntry[];
+			projectCatalogue?: ManagerProjectCatalogueEntry[];
 			execute(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 		},
 	): Promise<void> {
@@ -283,6 +290,8 @@ export class DiscordRelayCore {
 			modelCatalogue: controls?.modelCatalogue.map((model) => ({ ...model })) ?? [],
 			...(controls ? { executeControl: controls.execute } : {}),
 			managerTaskCatalogue: managerControls?.taskCatalogue.map((task) => ({ ...task })) ?? [],
+			managerProjectCatalogue: managerControls?.projectCatalogue?.map((project) => ({ ...project })) ?? [],
+			managerAsk: managerControls?.projectCatalogue !== undefined,
 			...(managerControls ? { executeManagerControl: managerControls.execute } : {}),
 			inboundImages,
 		};
@@ -322,22 +331,30 @@ export class DiscordRelayCore {
 		return active?.executeControl ? modelAutocompleteChoices(active.modelCatalogue, prefix) : [];
 	}
 
-	managerAutocomplete(channelId: string, prefix: string): DiscordModelChoice[] {
+	managerAutocomplete(channelId: string, prefix: string, kind: "task" | "target"): DiscordModelChoice[] {
 		const sessionId = this.activeThreadSessions.get(channelId);
 		const active = sessionId ? this.activeSessions.get(sessionId) : undefined;
-		return active?.executeManagerControl ? managerTaskAutocompleteChoices(active.managerTaskCatalogue, prefix) : [];
+		if (!active?.executeManagerControl) return [];
+		return kind === "task"
+			? managerTaskAutocompleteChoices(active.managerTaskCatalogue, prefix)
+			: active.managerAsk ? managerTargetAutocompleteChoices(active.managerProjectCatalogue, active.managerTaskCatalogue, prefix) : [];
 	}
 
-	updateManagerTaskCatalogue(
+	updateManagerCatalogues(
 		clientId: string,
 		generation: string,
 		sessionId: string,
-		catalogue: readonly ManagerTaskCatalogueEntry[],
+		tasks: readonly ManagerTaskCatalogueEntry[],
+		projects?: readonly ManagerProjectCatalogueEntry[],
 	): void {
 		this.assertClientSession(clientId, generation, sessionId);
 		const active = this.activeSessions.get(sessionId)!;
 		if (!active.executeManagerControl) throw new Error("Local client is not registered for manager controls");
-		active.managerTaskCatalogue = catalogue.map((task) => ({ ...task }));
+		active.managerTaskCatalogue = tasks.map((task) => ({ ...task }));
+		if (projects) {
+			active.managerProjectCatalogue = projects.map((project) => ({ ...project }));
+			active.managerAsk = true;
+		}
 	}
 
 	async executeDiscordManagerControl(request: DiscordManagerControlRequest): Promise<PiSessionControlResult> {
@@ -352,8 +369,22 @@ export class DiscordRelayCore {
 		if (!active?.executeManagerControl) {
 			return { ok: false, message: "This live Pi session is not a verified the-manager client." };
 		}
-		if (!active.managerTaskCatalogue.some((task) => task.taskId === request.taskId)) {
-			return { ok: false, message: "Select a task from this manager session's current autocomplete catalogue." };
+		if (!isPiManagerControlRequest(request)) return { ok: false, message: "Invalid manager control request." };
+		if (request.action === "ask" && !active.managerAsk) {
+			return { ok: false, message: "This verified manager client does not support ask; reconnect or reload it." };
+		}
+		const isCurrent = () => request.action === "ask"
+			? request.target.startsWith("project:")
+				? active.managerProjectCatalogue.some((project) => `project:${project.projectId}` === request.target)
+				: active.managerTaskCatalogue.some((task) => isActiveManagerTask(task) && `task:${task.taskId}` === request.target)
+			: active.managerTaskCatalogue.some((task) => task.taskId === request.taskId);
+		if (!isCurrent()) {
+			return {
+				ok: false,
+				message: request.action === "ask"
+					? "Select a target from this manager session's current autocomplete catalogue."
+					: "Select a task from this manager session's current autocomplete catalogue.",
+			};
 		}
 		const completed = this.completedManagerControls.get(request.requestId);
 		if (completed) return { ...completed };
@@ -367,15 +398,14 @@ export class DiscordRelayCore {
 			if (this.activeSessions.get(sessionId) !== active || !active.executeManagerControl) {
 				return { ok: false, message: "The manager session disconnected before this control executed." };
 			}
-			if (!active.managerTaskCatalogue.some((task) => task.taskId === request.taskId)) {
-				return { ok: false, message: "The selected task became stale before this control executed." };
+			if (!isCurrent()) {
+				return { ok: false, message: `The selected ${request.action === "ask" ? "target" : "task"} became stale before this control executed.` };
 			}
 			try {
-				return boundedControlResult(await active.executeManagerControl({
-					requestId: request.requestId,
-					action: request.action,
-					taskId: request.taskId,
-				}));
+				const control: PiManagerControlRequest = request.action === "ask"
+					? { requestId: request.requestId, action: "ask", target: request.target, request: request.request }
+					: { requestId: request.requestId, action: request.action, taskId: request.taskId };
+				return boundedControlResult(await active.executeManagerControl(control));
 			} catch (error) {
 				return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
 			}
