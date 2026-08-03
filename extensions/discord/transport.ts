@@ -200,6 +200,31 @@ export function managerCommandDefinition(): ChatInputApplicationCommandData {
 	};
 }
 
+const MAX_PENDING_INTERACTION_CHANNELS = 1_000;
+
+export class DiscordInteractionChannelResolver {
+	private readonly channels = new Map<string, string>();
+
+	observe(packet: unknown): void {
+		// Discord's raw channel_id is the invocation context; normalized partial channel data can disagree for threads.
+		if (!packet || typeof packet !== "object" || Array.isArray(packet)) return;
+		const event = packet as { t?: unknown; d?: unknown };
+		if (event.t !== "INTERACTION_CREATE" || !event.d || typeof event.d !== "object" || Array.isArray(event.d)) return;
+		const interaction = event.d as { id?: unknown; channel_id?: unknown };
+		if (typeof interaction.id !== "string" || typeof interaction.channel_id !== "string") return;
+		this.channels.set(interaction.id, interaction.channel_id);
+		while (this.channels.size > MAX_PENDING_INTERACTION_CHANNELS) {
+			this.channels.delete(this.channels.keys().next().value!);
+		}
+	}
+
+	resolve(interaction: { id: string; channelId: string | null }): string | undefined {
+		const channelId = this.channels.get(interaction.id);
+		this.channels.delete(interaction.id);
+		return channelId ?? interaction.channelId ?? undefined;
+	}
+}
+
 export class DiscordJsTransport implements DiscordTransport {
 	private client: Client | undefined;
 	private readonly listeners = new Set<(message: DiscordInboundMessage) => void>();
@@ -227,6 +252,8 @@ export class DiscordJsTransport implements DiscordTransport {
 			const error = new Error(`Discord gateway closed terminally with code ${event.code}`);
 			for (const listener of this.terminalListeners) listener(error);
 		});
+		const interactionChannels = new DiscordInteractionChannelResolver();
+		client.on(Events.Raw, (packet) => interactionChannels.observe(packet));
 		client.on(Events.MessageCreate, (message) => {
 			const normalized: DiscordInboundMessage = {
 				id: message.id,
@@ -243,6 +270,7 @@ export class DiscordJsTransport implements DiscordTransport {
 			for (const listener of this.listeners) listener(normalized);
 		});
 		client.on(Events.InteractionCreate, (interaction) => {
+			const channelId = interactionChannels.resolve(interaction);
 			if (interaction.isAutocomplete()) {
 				const focused = interaction.options.getFocused(true);
 				const managerKind = interaction.commandName === MANAGER_COMMAND_NAME &&
@@ -250,14 +278,14 @@ export class DiscordJsTransport implements DiscordTransport {
 				const pi = interaction.commandName === PI_COMMAND_NAME && focused.name === "model";
 				if (!managerKind && !pi) return;
 				let choices: DiscordModelChoice[] = [];
-				if (managerKind) {
+				if (channelId && managerKind) {
 					for (const listener of this.managerAutocompleteListeners) {
-						choices = listener(interaction.channelId, String(focused.value), managerKind);
+						choices = listener(channelId, String(focused.value), managerKind);
 						break;
 					}
-				} else {
+				} else if (channelId) {
 					for (const listener of this.autocompleteListeners) {
-						choices = listener(interaction.channelId, String(focused.value));
+						choices = listener(channelId, String(focused.value));
 						break;
 					}
 				}
@@ -269,8 +297,8 @@ export class DiscordJsTransport implements DiscordTransport {
 				return;
 			}
 			if (!interaction.isChatInputCommand()) return;
-			if (interaction.commandName === PI_COMMAND_NAME) void this.executeControlInteraction(interaction);
-			else if (interaction.commandName === MANAGER_COMMAND_NAME) void this.executeManagerControlInteraction(interaction);
+			if (interaction.commandName === PI_COMMAND_NAME) void this.executeControlInteraction(interaction, channelId);
+			else if (interaction.commandName === MANAGER_COMMAND_NAME) void this.executeManagerControlInteraction(interaction, channelId);
 		});
 
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -511,7 +539,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		}
 	}
 
-	private async executeControlInteraction(command: ChatInputCommandInteraction): Promise<void> {
+	private async executeControlInteraction(command: ChatInputCommandInteraction, channelId?: string): Promise<void> {
 		try {
 			await command.deferReply({ flags: MessageFlags.Ephemeral });
 		} catch {
@@ -519,6 +547,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		}
 		let result: PiSessionControlResult;
 		try {
+			if (!channelId) throw new Error("Discord interaction did not identify its channel.");
 			const subcommand = command.options.getSubcommand();
 			const action = subcommand === "status" || subcommand === "abort"
 				? { type: subcommand } as const
@@ -534,7 +563,7 @@ export class DiscordJsTransport implements DiscordTransport {
 			if (!listener) result = { ok: false, message: "Discord relay is not ready for Pi session controls." };
 			else {
 				result = await Promise.race([
-					listener({ requestId: command.id, channelId: command.channelId, action }),
+					listener({ requestId: command.id, channelId, action }),
 					new Promise<PiSessionControlResult>((resolve) => {
 						const timer = setTimeout(() => resolve({ ok: false, message: "Pi session control timed out." }), CONTROL_EXECUTION_TIMEOUT_MS);
 						timer.unref();
@@ -551,7 +580,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		}).catch(() => {});
 	}
 
-	private async executeManagerControlInteraction(command: ChatInputCommandInteraction): Promise<void> {
+	private async executeManagerControlInteraction(command: ChatInputCommandInteraction, channelId?: string): Promise<void> {
 		try {
 			await command.deferReply({ flags: MessageFlags.Ephemeral });
 		} catch {
@@ -560,6 +589,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		let result: PiSessionControlResult;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
+			if (!channelId) throw new Error("Discord interaction did not identify its channel.");
 			const action = command.options.getSubcommand();
 			if (!(MANAGER_CONTROL_ACTIONS as readonly string[]).includes(action)) throw new Error("Unknown /manager subcommand");
 			const listener = this.managerControlListeners.values().next().value;
@@ -569,7 +599,7 @@ export class DiscordJsTransport implements DiscordTransport {
 				if (action === "ask") {
 					request = {
 						requestId: command.id,
-						channelId: command.channelId,
+						channelId,
 						action: "ask",
 						target: command.options.getString("target", true),
 						request: command.options.getString("request", true),
@@ -578,14 +608,14 @@ export class DiscordJsTransport implements DiscordTransport {
 					const taskId = command.options.getString("task", false);
 					request = {
 						requestId: command.id,
-						channelId: command.channelId,
+						channelId,
 						action: "reconcile-pr",
 						...(taskId ? { taskId } : {}),
 					};
 				} else {
 					request = {
 						requestId: command.id,
-						channelId: command.channelId,
+						channelId,
 						action: action as Exclude<DiscordManagerControlRequest["action"], "ask" | "reconcile-pr">,
 						taskId: command.options.getString("task", true),
 					};

@@ -405,6 +405,7 @@ try {
 	const {
 		assertConfiguredCategory,
 		collectChronologicalMessages,
+		DiscordInteractionChannelResolver,
 		DiscordJsTransport,
 		MANAGER_CONTROL_INTERACTION_TIMEOUT_MS,
 		managerCommandDefinition,
@@ -633,7 +634,7 @@ try {
 				},
 			},
 			async editReply(reply) { managerInteractionReplies.push(reply); },
-		});
+		}, "timer-manager-thread");
 	} finally {
 		globalThis.setTimeout = originalSetTimeout;
 		globalThis.clearTimeout = originalClearTimeout;
@@ -659,7 +660,7 @@ try {
 			},
 		},
 		async editReply(reply) { managerInteractionReplies.push(reply); },
-	});
+	}, "timer-manager-thread");
 	assert.deepEqual(timerRequest, {
 		requestId: "reconcile-manager-control",
 		channelId: "timer-manager-thread",
@@ -678,7 +679,7 @@ try {
 			},
 		},
 		async editReply(reply) { managerInteractionReplies.push(reply); },
-	});
+	}, "timer-manager-thread");
 	assert.deepEqual(timerRequest, {
 		requestId: "reconcile-manager-all",
 		channelId: "timer-manager-thread",
@@ -693,7 +694,7 @@ try {
 			getString: (name) => name === "target" ? "project:pi-extensions" : "Inspect it",
 		},
 		async editReply(reply) { managerInteractionReplies.push(reply); },
-	});
+	}, "timer-manager-thread");
 	assert.deepEqual(timerRequest, {
 		requestId: "ask-manager-control",
 		channelId: "timer-manager-thread",
@@ -915,7 +916,7 @@ try {
 				getString: () => null,
 			},
 			async editReply(reply) { delayedReplies.push(reply); },
-		});
+		}, "delayed-manager-thread");
 		await delayedProcessStarted;
 		assert.deepEqual(delayedProcessArgs, [join(managerExecutorRoot, "bin", "manager.mjs"), "task-reconcile-pr",
 			"--root", managerExecutorRoot], "delayed taskless execution must preserve exact canonical argv");
@@ -1561,6 +1562,53 @@ try {
 		managerControlGateway.executeManagerControl(duplicateManagerRequest),
 	]), [{ ok: true, message: "handoff safe-task" }, { ok: true, message: "handoff safe-task" }]);
 	assert.equal(executedManagerControls.length, 1, "Discord retries must execute each manager mutation once");
+	const interactionChannels = new DiscordInteractionChannelResolver();
+	interactionChannels.observe({
+		t: "INTERACTION_CREATE",
+		d: { id: "manager-ask-autocomplete", channel_id: managerControlPrepared.threadId },
+	});
+	const autocompleteChannelId = interactionChannels.resolve({
+		id: "manager-ask-autocomplete",
+		channelId: managerControlPrepared.threadId,
+	});
+	assert.equal(autocompleteChannelId, managerControlPrepared.threadId,
+		"autocomplete must retain its mapped interaction thread");
+	assert.ok(managerControlGateway.managerAutocomplete(autocompleteChannelId, "pi-extensions", "target").some((choice) =>
+		choice.value === "project:pi-extensions"), "ask autocomplete must resolve through the raw mapped thread");
+	interactionChannels.observe({
+		t: "INTERACTION_CREATE",
+		d: { id: "manager-ask-execution", channel_id: managerControlPrepared.threadId },
+	});
+	const executionChannelId = interactionChannels.resolve({
+		id: "manager-ask-execution",
+		channelId: managerControlPrepared.channelId,
+	});
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "manager-ask-execution",
+		channelId: executionChannelId,
+		action: "ask",
+		target: "project:pi-extensions",
+		request: "Inspect the mapped project",
+	}), { ok: true, message: "ask project:pi-extensions" },
+	"ask execution must retain the same authoritative raw thread as autocomplete");
+	assert.deepEqual(executedManagerControls.at(-1), {
+		requestId: "manager-ask-execution",
+		action: "ask",
+		target: "project:pi-extensions",
+		request: "Inspect the mapped project",
+	});
+	interactionChannels.observe({
+		t: "INTERACTION_CREATE",
+		d: { id: "manager-ask-parent", channel_id: managerControlPrepared.channelId },
+	});
+	assert.deepEqual(await managerControlGateway.executeManagerControl({
+		requestId: "manager-ask-parent",
+		channelId: interactionChannels.resolve({ id: "manager-ask-parent", channelId: managerControlPrepared.threadId }),
+		action: "ask",
+		target: "project:pi-extensions",
+		request: "Do not route",
+	}), { ok: false, message: "This Discord thread is not mapped to a Pi session." },
+	"raw project-channel interactions must not borrow a normalized mapped thread");
 	assert.deepEqual(await managerControlGateway.executeManagerControl({
 		requestId: "relay-reconcile-pr",
 		channelId: managerControlPrepared.threadId,
@@ -3429,6 +3477,18 @@ try {
 		"manager target catalogue republish after relay restart");
 	assert.ok(gateway.managerAutocomplete(managerSummaryMapping.threadId, "pi-extensions", "target").some((choice) =>
 		choice.value === "project:pi-extensions"), "reconnect must retain configured project ask targets");
+	assert.deepEqual(await gateway.executeManagerControl({
+		requestId: "manager-ask-after-relay-restart",
+		channelId: managerSummaryMapping.threadId,
+		action: "ask",
+		target: "project:pi-extensions",
+		request: "Verify reconnect routing",
+	}), { ok: true, message: "Request sent to project pi-extensions." },
+	"manager ask must execute in the same mapped thread after relay re-registration");
+	assert.deepEqual(managerSummarySession.userMessages.at(-1), {
+		text: "Project: pi-extensions\n\nVerify reconnect routing",
+		options: undefined,
+	}, "re-registered manager ask must deliver exact canonical project context");
 	await waitFor(() => FakeGateway.lifecycleReactionEvents.some((event) =>
 		event.messageId === "19" && event.reaction === "🤔" && event.gateway === gateway), "lifecycle replay after reconnect");
 	assert.notEqual(gateway, preReconnectGateway);
