@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DiscordBridge, inboundMessageId, stripInboundMarker, type BridgeSession } from "./bridge.js";
 import {
 	DISCORD_CONFIG_FILE,
@@ -19,9 +20,13 @@ import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
 import { ManagerControlExecutor } from "./manager-controls.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
+	MAX_SESSION_CONTROL_TEXT_LENGTH,
+	boundedControlResult,
+	isManagerTaskAction,
 	modelChoiceValue,
 	type ManagerProjectCatalogueEntry,
 	type ManagerTaskCatalogueEntry,
+	type PiManagerControlRequest,
 	type PiModelCatalogueEntry,
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
@@ -32,6 +37,21 @@ const STATUS_CONNECTED = "💬";
 const STATUS_RECONNECTING = "🔄";
 const STATUS_ERROR = "⚠️";
 const ACCEPTED_INBOUND_ENTRY = "discord-bridge-inbound-accepted";
+export const MANAGER_CONTROL_RESULT_ENTRY = "discord-manager-control-result";
+
+interface ManagerControlResultEntryData {
+	action: Exclude<PiManagerControlRequest["action"], "ask">;
+	taskId?: string;
+	ok: boolean;
+	message: string;
+}
+
+function compactEntry(text: string) {
+	return {
+		render: (width: number) => [truncateToWidth(text, width)],
+		invalidate() {},
+	};
+}
 
 type ConfigLoader = () => Promise<DiscordBridgeConfig | null>;
 
@@ -67,6 +87,31 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		: () => launchRelayChild(paths));
 
 	return function discordExtension(pi: ExtensionAPI): void {
+		try {
+			pi.registerEntryRenderer<ManagerControlResultEntryData>(MANAGER_CONTROL_RESULT_ENTRY, (entry, _options, theme) => {
+				try {
+					const data: unknown = entry.data;
+					if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid manager control result");
+					const result = data as Partial<ManagerControlResultEntryData>;
+					if (!isManagerTaskAction(result.action) || typeof result.ok !== "boolean" ||
+						typeof result.message !== "string" || !result.message ||
+						result.message.length > MAX_SESSION_CONTROL_TEXT_LENGTH ||
+						(result.taskId !== undefined && (typeof result.taskId !== "string" || result.taskId.length > 100 ||
+							!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(result.taskId)))) {
+						throw new Error("invalid manager control result");
+					}
+					const status = result.ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const task = result.taskId ? ` @${result.taskId}` : "";
+					const message = result.message.replace(/\s+/g, " ");
+					return compactEntry(`${status} ${theme.fg("accent", `/manager ${result.action}${task}`)} — ${message}`);
+				} catch {
+					return compactEntry("⚠ /manager result unavailable");
+				}
+			});
+		} catch {
+			// History rendering is optional; manager controls must remain available without it.
+		}
+
 		let bridge: DiscordBridge | undefined;
 		let taskSummaryProducer: ManagerTaskSummaryProducer | undefined;
 		let managerTaskCatalogue: ManagerTaskCatalogueEntry[] = [];
@@ -260,16 +305,32 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 						managerTaskCatalogue: () => managerTaskCatalogue,
 						managerProjectCatalogue: () => managerProjectCatalogue,
 						onManagerControl: async (request) => {
-							const result = await managerExecutor!.execute(
-								request,
-								managerTaskCatalogue,
-								managerProjectCatalogue,
-								(message) => {
-									if (ctx.isIdle()) pi.sendUserMessage(message);
-									else pi.sendUserMessage(message, { deliverAs: "followUp" });
-								},
-							);
-							if (request.action !== "ask") managerProducer.requestRefresh(0);
+							let result: PiSessionControlResult;
+							try {
+								result = boundedControlResult(await managerExecutor!.execute(
+									request,
+									managerTaskCatalogue,
+									managerProjectCatalogue,
+									(message) => {
+										if (ctx.isIdle()) pi.sendUserMessage(message);
+										else pi.sendUserMessage(message, { deliverAs: "followUp" });
+									},
+								));
+							} catch (error) {
+								result = boundedControlResult({ ok: false, message: errorMessage(error) });
+							}
+							if (request.action !== "ask") {
+								try {
+									pi.appendEntry<ManagerControlResultEntryData>(MANAGER_CONTROL_RESULT_ENTRY, {
+										action: request.action,
+										...(request.taskId ? { taskId: request.taskId } : {}),
+										...result,
+									});
+								} catch {
+									// Session history is best-effort and must not alter the Discord result.
+								}
+								managerProducer.requestRefresh(0);
+							}
 							return result;
 						},
 					} : {}),

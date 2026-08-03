@@ -233,6 +233,7 @@ function createExtensionHarness(extension, {
 	sessionId,
 	sessionName,
 	entries = [],
+	entryRendererError = false,
 	models = [
 		{ provider: "openai", id: "gpt-test", name: "GPT Test", input: ["text", "image"] },
 		{ provider: "anthropic", id: "claude-test", name: "Claude Test", input: ["text", "image"] },
@@ -240,6 +241,7 @@ function createExtensionHarness(extension, {
 }) {
 	const events = new Map();
 	const commands = new Map();
+	const entryRenderers = new Map();
 	const notifications = [];
 	const statuses = [];
 	const userMessages = [];
@@ -250,6 +252,8 @@ function createExtensionHarness(extension, {
 	let currentModel = models[0];
 	let thinkingLevel = "medium";
 	let pendingMessages = false;
+	let appendError = false;
+	let appendCalls = 0;
 	let abortRequests = 0;
 	const pi = {
 		on(name, handler) {
@@ -259,6 +263,10 @@ function createExtensionHarness(extension, {
 		},
 		registerCommand(name, definition) {
 			commands.set(name, definition);
+		},
+		registerEntryRenderer(customType, renderer) {
+			if (entryRendererError) throw new Error("injected entry renderer registration failure");
+			entryRenderers.set(customType, renderer);
 		},
 		sendUserMessage(text, options) {
 			if (injectionError) throw new Error("injected Pi acceptance failure");
@@ -270,6 +278,8 @@ function createExtensionHarness(extension, {
 			return currentSessionName;
 		},
 		appendEntry(customType, data) {
+			appendCalls++;
+			if (appendError) throw new Error("injected custom-entry append failure");
 			entries.push({ type: "custom", customType, data });
 		},
 		async setModel(model) {
@@ -307,6 +317,7 @@ function createExtensionHarness(extension, {
 	extension(pi);
 	return {
 		commands,
+		entryRenderers,
 		events,
 		notifications,
 		statuses,
@@ -314,6 +325,8 @@ function createExtensionHarness(extension, {
 		entries,
 		setIdle(value) { idle = value; },
 		setPendingMessages(value) { pendingMessages = value; },
+		setAppendError(value) { appendError = value; },
+		appendCalls: () => appendCalls,
 		abortRequests: () => abortRequests,
 		currentModel: () => currentModel,
 		thinkingLevel: () => thinkingLevel,
@@ -347,7 +360,7 @@ try {
 	const { LocalRelayClient } = await importBuilt("extensions/discord/relay-client.js");
 	const { resolveProjectContext, resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
 	const { discoverTaskTitle, parseTaskTitle } = await importBuilt("extensions/discord/task-title.js");
-	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
+	const { createDiscordExtension, MANAGER_CONTROL_RESULT_ENTRY } = await importBuilt("extensions/discord/index.js");
 	const { formatManagerTaskSummary, managerProjectCatalogue, managerTaskCatalogue, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
 	const {
 		MANAGER_CONTROL_PROCESS_TIMEOUT_MS,
@@ -467,11 +480,12 @@ try {
 	await mkdir(join(managerFixture, "bin"), { recursive: true });
 	await mkdir(join(managerFixture, "data", "tasks"), { recursive: true });
 	await mkdir(join(managerFixture, ".manager", "events"), { recursive: true });
-	await writeFile(join(managerFixture, "bin", "manager.mjs"), [
+	const managerFixtureScript = [
 		'import { readFileSync } from "node:fs";',
 		'import { join } from "node:path";',
 		'const command = process.argv[2];',
 		'if (command === "status") console.log(readFileSync(join(process.cwd(), "status.json"), "utf8"));',
+		'else if (command === "task-reconcile-pr" && !process.argv.includes("--task")) console.log(JSON.stringify({ ok: true, command, scope: "all", scanned: 0, results: [], summary: { merged: 0, open: 0, closed: 0, not_found: 0, failed: 0 } }));',
 		'else {',
 		'  const taskPath = process.argv[process.argv.indexOf("--task") + 1];',
 		'  const taskId = taskPath.split("/").at(-1).replace(/\\.md$/, "");',
@@ -479,7 +493,8 @@ try {
 		'  console.log(JSON.stringify({ ok: true, command, task_id: taskId, ...state, replay: false }));',
 		'}',
 		"",
-	].join("\n"));
+	].join("\n");
+	await writeFile(join(managerFixture, "bin", "manager.mjs"), managerFixtureScript);
 	await writeFile(join(managerFixture, "bin", "manager-runtime.mjs"), 'console.log(JSON.stringify({ valid: true }));\n');
 	await writeFile(join(managerFixture, "data", "PROJECTS.md"), "---\nprojects:\n  pi-extensions:\n    repository: /tmp/pi-extensions\n    base_ref: origin/main\n    landing_ref: main\n    checkout_mode: repository\n---\n");
 	const focusedManagerStatus = {
@@ -2788,6 +2803,8 @@ try {
 	].join("\n"));
 	await waitFor(() => FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "wordpress", "target").some((choice) =>
 		choice.value === "project:wordpress"), "extension project-registry ask-target refresh without polling");
+	const managerMessagesBeforeControls = managerSummarySession.userMessages.length;
+	const managerAppendCallsBeforeControls = managerSummarySession.appendCalls();
 	assert.deepEqual(await FakeGateway.instances[0].executeManagerControl({
 		requestId: "manager-end-to-end-handoff",
 		channelId: managerSummaryMapping.threadId,
@@ -2795,6 +2812,78 @@ try {
 		taskId: "discord-manager-task-summary",
 	}), { ok: true, message: "Direct handoff started for @discord-manager-task-summary." },
 	"mapped manager controls must traverse Discord, relay IPC, verified client, runtime validation, and canonical manager CLI");
+	assert.equal(managerSummarySession.appendCalls(), managerAppendCallsBeforeControls + 1,
+		"a settled manager command must append exactly one result entry and no pending entry");
+	const managerHistory = () => managerSummarySession.entries.filter((entry) => entry.customType === MANAGER_CONTROL_RESULT_ENTRY);
+	assert.deepEqual(managerHistory().at(-1), {
+		type: "custom",
+		customType: MANAGER_CONTROL_RESULT_ENTRY,
+		data: {
+			action: "handoff",
+			taskId: "discord-manager-task-summary",
+			ok: true,
+			message: "Direct handoff started for @discord-manager-task-summary.",
+		},
+	}, "successful manager results must persist bounded command and final result data in the Pi session");
+	const managerResultRenderer = managerSummarySession.entryRenderers.get(MANAGER_CONTROL_RESULT_ENTRY);
+	assert.equal(typeof managerResultRenderer, "function", "manager result history must register a TUI entry renderer");
+	const identityTheme = { fg: (_color, text) => text };
+	assert.equal(managerResultRenderer(managerHistory().at(-1), {}, identityTheme).render(200)[0].trimEnd(),
+		"✓ /manager handoff @discord-manager-task-summary — Direct handoff started for @discord-manager-task-summary.",
+		"manager result renderer must compactly show the command and successful final result");
+	assert.doesNotThrow(() => managerResultRenderer({ data: { action: "hostile", message: 42 } }, {}, identityTheme).render(80),
+		"malformed persisted history must fall back instead of failing TUI rendering");
+	assert.deepEqual(await FakeGateway.instances[0].executeManagerControl({
+		requestId: "manager-end-to-end-reconcile-all",
+		channelId: managerSummaryMapping.threadId,
+		action: "reconcile-pr",
+	}), { ok: true, message: "Reconciled 0 tasks: 0 merged, 0 open, 0 closed, 0 not found, 0 failed." });
+	assert.deepEqual(managerHistory().at(-1).data, {
+		action: "reconcile-pr",
+		ok: true,
+		message: "Reconciled 0 tasks: 0 merged, 0 open, 0 closed, 0 not found, 0 failed.",
+	}, "taskless manager results must omit taskId while preserving the final result");
+	await writeFile(join(managerFixture, "bin", "manager.mjs"), [
+		'import { readFileSync } from "node:fs";',
+		'import { join } from "node:path";',
+		'if (process.argv[2] === "status") console.log(readFileSync(join(process.cwd(), "status.json"), "utf8"));',
+		'else { console.error("injected canonical failure"); process.exitCode = 1; }',
+		"",
+	].join("\n"));
+	assert.deepEqual(await FakeGateway.instances[0].executeManagerControl({
+		requestId: "manager-end-to-end-failure",
+		channelId: managerSummaryMapping.threadId,
+		action: "takeback",
+		taskId: "discord-manager-task-summary",
+	}), { ok: false, message: "injected canonical failure" });
+	assert.deepEqual(managerHistory().at(-1).data, {
+		action: "takeback",
+		taskId: "discord-manager-task-summary",
+		ok: false,
+		message: "injected canonical failure",
+	}, "failed canonical manager results must persist only their settled failure");
+	assert.equal(managerResultRenderer(managerHistory().at(-1), {}, identityTheme).render(200)[0].trimEnd(),
+		"✗ /manager takeback @discord-manager-task-summary — injected canonical failure",
+		"manager result renderer must show final failures");
+	await writeFile(join(managerFixture, "bin", "manager.mjs"), managerFixtureScript);
+	const historyCountBeforeAuditFailure = managerHistory().length;
+	const appendCallsBeforeAuditFailure = managerSummarySession.appendCalls();
+	managerSummarySession.setAppendError(true);
+	const resultDespiteAuditFailure = await FakeGateway.instances[0].executeManagerControl({
+		requestId: "manager-end-to-end-audit-failure",
+		channelId: managerSummaryMapping.threadId,
+		action: "archive",
+		taskId: "discord-manager-task-summary",
+	});
+	managerSummarySession.setAppendError(false);
+	assert.deepEqual(resultDespiteAuditFailure, { ok: true, message: "@discord-manager-task-summary archived without merging." },
+		"custom-entry append failure must not alter the canonical Discord result");
+	assert.equal(managerSummarySession.appendCalls(), appendCallsBeforeAuditFailure + 1,
+		"failed history persistence must be attempted once without retries or pending entries");
+	assert.equal(managerHistory().length, historyCountBeforeAuditFailure, "failed history persistence must not create a partial entry");
+	assert.equal(managerSummarySession.userMessages.length, managerMessagesBeforeControls,
+		"non-ask manager controls and their history must not trigger or queue model work");
+	const historyCountBeforeAsk = managerHistory().length;
 	assert.ok(FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "pi", "target").some((choice) =>
 		choice.value === "project:pi-extensions"), "ask targets must include every configured project");
 	assert.deepEqual(await FakeGateway.instances[0].executeManagerControl({
@@ -2820,7 +2909,17 @@ try {
 		text: "Project: pi-extensions\nTask: discord-manager-task-summary\n\nInspect the active task",
 		options: { deliverAs: "followUp" },
 	}, "busy manager asks must queue as Pi follow-ups with canonical task project metadata");
+	assert.equal(managerHistory().length, historyCountBeforeAsk,
+		"manager ask must rely on its user-message history instead of appending a duplicate custom entry");
 	managerSummarySession.setIdle(true);
+	const rendererFailureHarness = createExtensionHarness(extension, {
+		cwd: "/work/renderer-failure",
+		sessionId: "renderer-failure-session",
+		sessionName: undefined,
+		entryRendererError: true,
+	});
+	assert.ok(rendererFailureHarness.commands.has("discord"),
+		"entry-renderer registration failure must not prevent the Discord extension from loading");
 
 	const namingState = new DiscordStateStore(stateFile);
 	const taskNamedMapping = await namingState.getSession(taskNamedSessionId);
