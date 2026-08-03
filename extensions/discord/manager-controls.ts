@@ -13,7 +13,7 @@ import { managerProjectCatalogue, managerTaskCatalogue } from "./manager-task-su
 
 const STATUS_TIMEOUT_MS = 2_000;
 const VALIDATE_TIMEOUT_MS = 30_000;
-const CONTROL_TIMEOUT_MS = 120_000;
+export const MANAGER_CONTROL_PROCESS_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 1_048_576;
 const MAX_RECONCILE_BATCH_TASKS = 50;
 const MAX_FAILED_TASK_IDS = 10;
@@ -225,7 +225,7 @@ export class ManagerControlExecutor {
 						: [manager, request.action === "handoff" ? "handoff-start" : "handoff-return",
 							"--root", this.root, "--task", taskPath];
 			}
-			const result = await this.run(process.execPath, args, { cwd: this.root, timeout: CONTROL_TIMEOUT_MS });
+			const result = await this.run(process.execPath, args, { cwd: this.root, timeout: MANAGER_CONTROL_PROCESS_TIMEOUT_MS });
 			if (result.code !== 0) return boundedControlResult({ ok: false, message: failureMessage(result, `${request.action} failed with exit ${result.code}.`) });
 			const output = parseJson(result.stdout, request.action);
 			if (request.action === "reconcile-pr") {

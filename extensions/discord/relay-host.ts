@@ -43,7 +43,7 @@ interface SocketState {
 
 const ZERO_CLIENT_GRACE_MS = 1_000;
 const SESSION_CONTROL_TIMEOUT_MS = 10_000;
-const MANAGER_CONTROL_TIMEOUT_MS = 170_000;
+export const MANAGER_CONTROL_IPC_TIMEOUT_MS = 170_000;
 
 export class LocalRelayHost {
 	private server: Server | undefined;
@@ -386,7 +386,7 @@ export class LocalRelayHost {
 			: request.action === "reconcile-pr"
 				? { type: "manager_control", requestId: request.requestId, action: "reconcile-pr", ...(request.taskId ? { taskId: request.taskId } : {}) }
 				: { type: "manager_control", requestId: request.requestId, action: request.action, taskId: request.taskId };
-		return this.requestClientControl(state, frame, MANAGER_CONTROL_TIMEOUT_MS);
+		return this.requestClientControl(state, frame, MANAGER_CONTROL_IPC_TIMEOUT_MS);
 	}
 
 	private requestControl(state: SocketState, request: PiSessionControlRequest): Promise<PiSessionControlResult> {

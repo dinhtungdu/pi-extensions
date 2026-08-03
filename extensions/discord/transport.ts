@@ -31,7 +31,7 @@ import {
 
 const READY_TIMEOUT_MS = 30_000;
 const CONTROL_EXECUTION_TIMEOUT_MS = 12_000;
-const MANAGER_CONTROL_EXECUTION_TIMEOUT_MS = 180_000;
+export const MANAGER_CONTROL_INTERACTION_TIMEOUT_MS = 180_000;
 const PI_COMMAND_NAME = "pi";
 const MANAGER_COMMAND_NAME = "manager";
 
@@ -593,7 +593,7 @@ export class DiscordJsTransport implements DiscordTransport {
 				result = await Promise.race([
 					listener(request),
 					new Promise<PiSessionControlResult>((resolveResult) => {
-						timer = setTimeout(() => resolveResult({ ok: false, message: "Manager control timed out." }), MANAGER_CONTROL_EXECUTION_TIMEOUT_MS);
+						timer = setTimeout(() => resolveResult({ ok: false, message: "Manager control timed out." }), MANAGER_CONTROL_INTERACTION_TIMEOUT_MS);
 						timer.unref();
 					}),
 				]);

@@ -349,7 +349,11 @@ try {
 	const { discoverTaskTitle, parseTaskTitle } = await importBuilt("extensions/discord/task-title.js");
 	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
 	const { formatManagerTaskSummary, managerProjectCatalogue, managerTaskCatalogue, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
-	const { ManagerControlExecutor } = await importBuilt("extensions/discord/manager-controls.js");
+	const {
+		MANAGER_CONTROL_PROCESS_TIMEOUT_MS,
+		ManagerControlExecutor,
+	} = await importBuilt("extensions/discord/manager-controls.js");
+	const { MANAGER_CONTROL_IPC_TIMEOUT_MS } = await importBuilt("extensions/discord/relay-host.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const {
@@ -389,6 +393,7 @@ try {
 		assertConfiguredCategory,
 		collectChronologicalMessages,
 		DiscordJsTransport,
+		MANAGER_CONTROL_INTERACTION_TIMEOUT_MS,
 		managerCommandDefinition,
 		replaceOwnLifecycleReaction,
 		reuseSessionThread,
@@ -577,6 +582,13 @@ try {
 		name: "request", required: true, autocomplete: undefined, maxLength: 2_000,
 	}], "ask must expose only the required dynamic target and bounded request options");
 	assert.equal(JSON.stringify(managerDefinition).includes('"status"'), false, "/manager must not expose status");
+	const canonicalReconcileScanWindowMs = 60_000;
+	assert.ok(MANAGER_CONTROL_PROCESS_TIMEOUT_MS > canonicalReconcileScanWindowMs,
+		"bridge process timeout must exceed the canonical taskless scan window");
+	assert.ok(MANAGER_CONTROL_IPC_TIMEOUT_MS > MANAGER_CONTROL_PROCESS_TIMEOUT_MS,
+		"manager IPC timeout must exceed the bridge process timeout");
+	assert.ok(MANAGER_CONTROL_INTERACTION_TIMEOUT_MS > MANAGER_CONTROL_IPC_TIMEOUT_MS,
+		"Discord interaction timeout must exceed the full bridge and IPC execution envelope");
 	const timerTransport = new DiscordJsTransport();
 	let timerRequest;
 	timerTransport.onManagerControl(async (request) => {
@@ -590,7 +602,7 @@ try {
 	let clearedManagerInteractionTimer;
 	try {
 		globalThis.setTimeout = (_callback, milliseconds) => {
-			assert.equal(milliseconds, 180_000);
+			assert.equal(milliseconds, MANAGER_CONTROL_INTERACTION_TIMEOUT_MS);
 			return managerInteractionTimer;
 		};
 		globalThis.clearTimeout = (timer) => { clearedManagerInteractionTimer = timer; };
@@ -836,6 +848,78 @@ try {
 	});
 	assert.ok(managerExecutor, "a protected non-worker Herdr environment plus canonical runtime validation must verify manager controls");
 	const executorCatalogue = [{ taskId: "safe-task", project: "pi-extensions", title: "Safe task", status: "ready" }];
+	let delayedProcessArgs;
+	let delayedProcessOptions;
+	let settleDelayedProcess;
+	let markDelayedProcessStarted;
+	const delayedProcessStarted = new Promise((resolve) => { markDelayedProcessStarted = resolve; });
+	const delayedBatchOutput = {
+		ok: true, command: "task-reconcile-pr", scope: "all", scanned: 2,
+		results: [{
+			task_id: "finished-open", state: "open", archived: false, url: "https://github.com/acme/repo/pull/21", number: 21,
+		}, {
+			task_id: "window-exhausted", state: "error", archived: false,
+			error: "pull request reconciliation scan time budget exhausted",
+		}],
+		summary: { merged: 0, open: 1, closed: 0, not_found: 0, failed: 1 },
+	};
+	const delayedExecutor = await ManagerControlExecutor.create(managerExecutorRoot, {
+		environment: validManagerEnvironment,
+		async run(_executable, args, options) {
+			if (args.at(-1) === "validate") return { code: 0, stdout: '{"valid":true}\n', stderr: "" };
+			delayedProcessArgs = args;
+			delayedProcessOptions = options;
+			markDelayedProcessStarted();
+			return new Promise((resolve) => {
+				settleDelayedProcess = () => resolve({ code: 0, stdout: `${JSON.stringify(delayedBatchOutput)}\n`, stderr: "" });
+			});
+		},
+	});
+	assert.ok(delayedExecutor);
+	const delayedTransport = new DiscordJsTransport();
+	delayedTransport.onManagerControl((request) => delayedExecutor.execute(request, executorCatalogue));
+	const delayedReplies = [];
+	const delayedInteractionTimer = { unref() {} };
+	let clearedDelayedTimer;
+	let delayedTimeoutCallback;
+	const savedSetTimeout = globalThis.setTimeout;
+	const savedClearTimeout = globalThis.clearTimeout;
+	try {
+		globalThis.setTimeout = (callback, milliseconds) => {
+			assert.equal(milliseconds, MANAGER_CONTROL_INTERACTION_TIMEOUT_MS);
+			delayedTimeoutCallback = callback;
+			return delayedInteractionTimer;
+		};
+		globalThis.clearTimeout = (timer) => { clearedDelayedTimer = timer; };
+		const delayedInteraction = delayedTransport.executeManagerControlInteraction({
+			id: "delayed-reconcile-all",
+			channelId: "delayed-manager-thread",
+			async deferReply() {},
+			options: {
+				getSubcommand: () => "reconcile-pr",
+				getString: () => null,
+			},
+			async editReply(reply) { delayedReplies.push(reply); },
+		});
+		await delayedProcessStarted;
+		assert.deepEqual(delayedProcessArgs, [join(managerExecutorRoot, "bin", "manager.mjs"), "task-reconcile-pr",
+			"--root", managerExecutorRoot], "delayed taskless execution must preserve exact canonical argv");
+		assert.equal(delayedProcessOptions.timeout, MANAGER_CONTROL_PROCESS_TIMEOUT_MS);
+		assert.ok(delayedProcessOptions.timeout > canonicalReconcileScanWindowMs,
+			"delayed canonical scans retain headroom before the bridge process timeout");
+		assert.equal(delayedReplies.length, 0, "the interaction must remain pending while canonical reconciliation runs");
+		assert.equal(typeof delayedTimeoutCallback, "function", "the outer interaction timeout must remain armed while work runs");
+		settleDelayedProcess();
+		await delayedInteraction;
+	} finally {
+		globalThis.setTimeout = savedSetTimeout;
+		globalThis.clearTimeout = savedClearTimeout;
+	}
+	assert.equal(clearedDelayedTimer, delayedInteractionTimer,
+		"settled delayed canonical execution must clear the Discord interaction timer");
+	assert.deepEqual(delayedReplies.map((reply) => reply.content), [
+		"✅ Reconciled 2 tasks: 0 merged, 1 open, 0 closed, 0 not found, 1 failed. Failed: @window-exhausted.",
+	], "canonical partial results must win the timeout race and remain visible");
 	for (const action of ["handoff", "takeback", "archive", "merge-and-archive"]) {
 		assert.equal((await managerExecutor.execute({ requestId: `executor-${action}`, action, taskId: "safe-task" }, executorCatalogue)).ok, true);
 	}
