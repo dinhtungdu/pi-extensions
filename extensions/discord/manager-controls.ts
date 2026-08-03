@@ -217,11 +217,11 @@ export class ManagerControlExecutor {
 				if (!task || !taskPath) return { ok: false, message: "The selected task is no longer available." };
 				args = request.action === "archive"
 					? [manager, "task-archive", "--root", this.root, "--task", taskPath, "--activity-clear", "yes",
-						"--evidence", `User explicitly archived ${task.project} task ${task.taskId} without merging via Discord manager command.`,
+						"--evidence", `User explicitly archived ${task.project} task ${task.taskId} without merging via Discord /m command.`,
 						"--completion-authorized", "yes"]
 					: request.action === "merge-and-archive"
 						? [manager, "task-merge-and-archive", "--root", this.root, "--task", taskPath, "--activity-clear", "yes",
-							"--evidence", `User explicitly merged ${task.project} task ${task.taskId} locally and archived it via Discord manager command.`]
+							"--evidence", `User explicitly merged ${task.project} task ${task.taskId} locally and archived it via Discord /m command.`]
 						: [manager, request.action === "handoff" ? "handoff-start" : "handoff-return",
 							"--root", this.root, "--task", taskPath];
 			}

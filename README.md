@@ -129,6 +129,17 @@ The relay registers guild-scoped `/pi` controls for mapped session threads. Repl
 /pi abort
 ```
 
+Verified live `the-manager` session threads also expose only the guild-scoped `/m` command. Manager autocomplete and execution stay bound to the invoking mapped thread; project channels, arbitrary threads, offline sessions, stale catalogue entries, and ordinary Pi sessions fail closed.
+
+```text
+/m handoff <task>
+/m takeback <task>
+/m archive <task>
+/m merge-and-archive <task>
+/m reconcile-pr [task]
+/m ask <target> <request>
+```
+
 When Pi runs from a `the-manager` checkout, the extension watches canonical active-task and event changes and publishes one compact task snapshot from `manager status` in that project's parent channel. Normal Discord Markdown groups active, ready, and any additional statuses; task rows use canonical titles, with run details only under active tasks. A latest summary is edited in place. Once displaced, the old bot-owned summary is deleted before its replacement is sent. Desired text, message identity, and send nonce are durable across relay restarts; bounded backoff and nonce deduplication recover delete/send failures without blocking manager mutations or intentionally creating duplicate summaries. Producers submit text only—the relay always derives the project channel from the authenticated session registration.
 
 Commands:

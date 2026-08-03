@@ -103,9 +103,9 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					const status = result.ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const task = result.taskId ? ` @${result.taskId}` : "";
 					const message = result.message.replace(/\s+/g, " ");
-					return compactEntry(`${status} ${theme.fg("accent", `/manager ${result.action}${task}`)} — ${message}`);
+					return compactEntry(`${status} ${theme.fg("accent", `/m ${result.action}${task}`)} — ${message}`);
 				} catch {
-					return compactEntry("⚠ /manager result unavailable");
+					return compactEntry("⚠ /m result unavailable");
 				}
 			});
 		} catch {

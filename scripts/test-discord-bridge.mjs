@@ -580,7 +580,25 @@ try {
 		taskId: "completed-task", project: "woocommerce", title: "Completed task", status: "complete",
 	}], "completed"), [], "ask targets must include only current active manager tasks");
 	const managerDefinition = managerCommandDefinition();
-	assert.equal(managerDefinition.name, "manager");
+	assert.equal(managerDefinition.name, "m");
+	const commandRegistrationEvents = [];
+	const commandRegistrationTransport = new DiscordJsTransport();
+	commandRegistrationTransport.guild = async () => ({
+		commands: {
+			async fetch() {
+				return [{ id: "pi-command", name: "pi" }, { id: "legacy-manager-command", name: "manager" }];
+			},
+			async delete(id) { commandRegistrationEvents.push(["delete", id]); },
+			async edit(id, definition) { commandRegistrationEvents.push(["edit", id, definition.name]); },
+			async create(definition) { commandRegistrationEvents.push(["create", definition.name]); },
+		},
+	});
+	await commandRegistrationTransport.registerControls("guild");
+	assert.deepEqual(commandRegistrationEvents, [
+		["delete", "legacy-manager-command"],
+		["edit", "pi-command", "pi"],
+		["create", "m"],
+	], "command registration must remove /manager instead of retaining a compatibility alias");
 	assert.deepEqual(managerDefinition.options.map((option) => option.name), [
 		"handoff", "takeback", "archive", "merge-and-archive", "reconcile-pr", "ask",
 	]);
@@ -597,7 +615,7 @@ try {
 	})), [{ name: "target", required: true, autocomplete: true, maxLength: undefined }, {
 		name: "request", required: true, autocomplete: undefined, maxLength: 2_000,
 	}], "ask must expose only the required dynamic target and bounded request options");
-	assert.equal(JSON.stringify(managerDefinition).includes('"status"'), false, "/manager must not expose status");
+	assert.equal(JSON.stringify(managerDefinition).includes('"status"'), false, "/m must not expose status");
 	const canonicalReconcileScanWindowMs = 60_000;
 	assert.ok(MANAGER_CONTROL_PROCESS_TIMEOUT_MS > canonicalReconcileScanWindowMs,
 		"bridge process timeout must exceed the canonical taskless scan window");
@@ -2877,10 +2895,10 @@ try {
 	assert.equal(typeof managerResultRenderer, "function", "manager result history must register a TUI entry renderer");
 	const identityTheme = { fg: (_color, text) => text };
 	assert.equal(managerResultRenderer(managerHistory().at(-1), {}, identityTheme).render(200)[0].trimEnd(),
-		"✓ /manager handoff @discord-manager-task-summary — Direct handoff started for @discord-manager-task-summary.",
+		"✓ /m handoff @discord-manager-task-summary — Direct handoff started for @discord-manager-task-summary.",
 		"manager result renderer must compactly show the command and successful final result");
-	assert.doesNotThrow(() => managerResultRenderer({ data: { action: "hostile", message: 42 } }, {}, identityTheme).render(80),
-		"malformed persisted history must fall back instead of failing TUI rendering");
+	assert.equal(managerResultRenderer({ data: { action: "hostile", message: 42 } }, {}, identityTheme).render(80)[0].trimEnd(),
+		"⚠ /m result unavailable", "malformed persisted history must use the renamed fallback without failing TUI rendering");
 	assert.deepEqual(await FakeGateway.instances[0].executeManagerControl({
 		requestId: "manager-end-to-end-reconcile-all",
 		channelId: managerSummaryMapping.threadId,
@@ -2911,7 +2929,7 @@ try {
 		message: "injected canonical failure",
 	}, "failed canonical manager results must persist only their settled failure");
 	assert.equal(managerResultRenderer(managerHistory().at(-1), {}, identityTheme).render(200)[0].trimEnd(),
-		"✗ /manager takeback @discord-manager-task-summary — injected canonical failure",
+		"✗ /m takeback @discord-manager-task-summary — injected canonical failure",
 		"manager result renderer must show final failures");
 	await writeFile(join(managerFixture, "bin", "manager.mjs"), managerFixtureScript);
 	const historyCountBeforeAuditFailure = managerHistory().length;

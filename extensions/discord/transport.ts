@@ -33,7 +33,8 @@ const READY_TIMEOUT_MS = 30_000;
 const CONTROL_EXECUTION_TIMEOUT_MS = 12_000;
 export const MANAGER_CONTROL_INTERACTION_TIMEOUT_MS = 180_000;
 const PI_COMMAND_NAME = "pi";
-const MANAGER_COMMAND_NAME = "manager";
+const MANAGER_COMMAND_NAME = "m";
+const LEGACY_MANAGER_COMMAND_NAME = "manager";
 
 export interface DiscordInboundMessage {
 	id: string;
@@ -532,6 +533,8 @@ export class DiscordJsTransport implements DiscordTransport {
 		};
 		const managerDefinition = managerCommandDefinition();
 		const existing = await guild.commands.fetch();
+		const legacyManager = existing.find((candidate) => candidate.name === LEGACY_MANAGER_COMMAND_NAME);
+		if (legacyManager) await guild.commands.delete(legacyManager.id);
 		for (const command of [definition, managerDefinition]) {
 			const current = existing.find((candidate) => candidate.name === command.name);
 			if (current) await guild.commands.edit(current.id, command);
@@ -591,7 +594,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		try {
 			if (!channelId) throw new Error("Discord interaction did not identify its channel.");
 			const action = command.options.getSubcommand();
-			if (!(MANAGER_CONTROL_ACTIONS as readonly string[]).includes(action)) throw new Error("Unknown /manager subcommand");
+			if (!(MANAGER_CONTROL_ACTIONS as readonly string[]).includes(action)) throw new Error("Unknown /m subcommand");
 			const listener = this.managerControlListeners.values().next().value;
 			if (!listener) result = { ok: false, message: "Discord relay is not ready for manager controls." };
 			else {
