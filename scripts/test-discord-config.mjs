@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { fork, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { mkdir, mkdtemp, open, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -12,6 +13,9 @@ const root = resolve(import.meta.dirname, "..");
 const output = await mkdtemp(join(root, ".discord-config-test-"));
 const dataDir = await mkdtemp(join(tmpdir(), "pi-discord-config-data-"));
 let importSequence = 0;
+let requestSequence = 0;
+let retainedChild;
+const configProcessFixture = join(root, "scripts", "fixtures", "discord-config-process.mjs");
 
 function compileExtensions() {
 	const compile = spawnSync(
@@ -46,14 +50,51 @@ function wait(milliseconds) {
 	return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
 }
 
+async function startRetainedProcess() {
+	const child = fork(configProcessFixture, [output, "retained"], {
+		cwd: root,
+		stdio: ["ignore", "ignore", "inherit", "ipc"],
+	});
+	const [ready] = await once(child, "message");
+	assert.equal(ready.ready, true);
+	assert.equal(ready.pid, child.pid);
+	return child;
+}
+
+function requestChild(child, request) {
+	return new Promise((resolveRequest, rejectRequest) => {
+		const id = requestSequence++;
+		const cleanup = () => {
+			child.off("message", onMessage);
+			child.off("exit", onExit);
+		};
+		const onMessage = (response) => {
+			if (response?.id !== id) return;
+			cleanup();
+			if (response.ok) resolveRequest(response);
+			else rejectRequest(new Error(response.error));
+		};
+		const onExit = (code, signal) => {
+			cleanup();
+			rejectRequest(new Error(`config child exited before response (${String(code ?? signal)})`));
+		};
+		child.on("message", onMessage);
+		child.on("exit", onExit);
+		child.send({ ...request, id });
+	});
+}
+
 try {
 	compileExtensions();
 	await mkdir(dataDir, { recursive: true });
 
 	const evictionFile = join(dataDir, "eviction.json");
-	const staleProcess = await importFreshConfig();
+	retainedChild = await startRetainedProcess();
 	await writeConfig(evictionFile, "stale-token");
-	const staleFirst = await staleProcess.loadDiscordConfig(relative(process.cwd(), evictionFile), {});
+	const staleFirst = (await requestChild(retainedChild, {
+		action: "load",
+		file: relative(process.cwd(), evictionFile),
+	})).config;
 	assert.ok(staleFirst);
 
 	await writeConfig(evictionFile, "current-token", staleFirst.epoch + 1);
@@ -64,26 +105,89 @@ try {
 	const stableAuthorityStat = await stat(`${evictionFile}.authority.json`);
 	assert.deepEqual((await readAuthority(evictionFile)).sources, {}, "new processes must not add durable source history");
 
+	const launchedPids = new Set();
 	for (let launch = 0; launch < 257; launch++) {
-		const interveningProcess = await importFreshConfig();
-		const observed = await interveningProcess.loadDiscordConfig(evictionFile, {});
-		assert.equal(observed.epoch, current.epoch);
+		const launched = spawnSync(process.execPath, [configProcessFixture, output, "once", evictionFile], {
+			cwd: root,
+			encoding: "utf8",
+		});
+		assert.equal(launched.status, 0, launched.stderr);
+		const observed = JSON.parse(launched.stdout);
+		assert.equal(observed.config.epoch, current.epoch);
+		assert.equal(launchedPids.has(observed.pid), false, `child PID ${observed.pid} was reused`);
+		launchedPids.add(observed.pid);
 	}
+	assert.equal(launchedPids.size, 257, "the eviction boundary requires >256 distinct child processes");
+	assert.equal(launchedPids.has(retainedChild.pid), false, "the retained stale process must outlive distinct launch processes");
 	const authorityAfterLaunches = await stat(`${evictionFile}.authority.json`);
 	assert.equal(await readFile(`${evictionFile}.authority.json`, "utf8"), stableAuthorityText,
 		">256 process launches must not grow or rewrite stable authority state");
 	assert.equal(authorityAfterLaunches.size, stableAuthorityStat.size);
 	assert.equal(authorityAfterLaunches.mtimeMs, stableAuthorityStat.mtimeMs);
+	assert.equal(Object.keys((await readAuthority(evictionFile)).sources).length, 0);
 
-	const staleReconnect = await staleProcess.loadDiscordConfig(evictionFile, { DISCORD_TOKEN: "stale-token" });
-	assert.equal(staleReconnect.epoch, staleFirst.epoch, "an evicted long-lived stale process must not reclaim authority");
+	const staleReconnect = (await requestChild(retainedChild, {
+		action: "load",
+		file: evictionFile,
+		token: "stale-token",
+	})).config;
+	assert.equal(staleReconnect.epoch, staleFirst.epoch, "a long-lived stale process must not reclaim authority");
+	assert.equal(await readFile(`${evictionFile}.authority.json`, "utf8"), stableAuthorityText,
+		"a stale reconnect must not rewrite authority state");
+
+	const unsupportedAuthorityText = `${JSON.stringify({ ...JSON.parse(stableAuthorityText), version: 2 })}\n`;
+	const configBeforeFailedSave = await readFile(evictionFile, "utf8");
+	await writeFile(`${evictionFile}.authority.json`, unsupportedAuthorityText);
+	await assert.rejects(
+		() => requestChild(retainedChild, {
+			action: "save",
+			file: evictionFile,
+			config: { token: "stale-token", guildId: "12345" },
+		}),
+		/unsupported version 2/,
+	);
+	assert.equal(await readFile(`${evictionFile}.authority.json`, "utf8"), unsupportedAuthorityText,
+		"a failed save must not mutate authority state");
+	assert.equal(await readFile(evictionFile, "utf8"), configBeforeFailedSave,
+		"a failed save must not mutate config state");
+	await writeFile(`${evictionFile}.authority.json`, stableAuthorityText);
+	const staleAfterFailedSave = (await requestChild(retainedChild, {
+		action: "load",
+		file: evictionFile,
+		token: "stale-token",
+	})).config;
+	assert.equal(staleAfterFailedSave.epoch, staleFirst.epoch,
+		"a failed save must not convert old process-local history into intentional change");
+
+	await requestChild(retainedChild, {
+		action: "save",
+		file: evictionFile,
+		config: { token: "stale-token", guildId: "12345" },
+	});
+	assert.equal(await readFile(`${evictionFile}.authority.json`, "utf8"), stableAuthorityText,
+		"an explicit save must not mutate authority before its config is loaded");
+	const savedChange = (await requestChild(retainedChild, { action: "load", file: evictionFile })).config;
+	assert.ok(savedChange.epoch > current.epoch,
+		"a successful save of old stale config must advance beyond current global authority");
 	assert.equal((await readAuthority(evictionFile)).currentFingerprint,
-		fingerprint({ token: "current-token", guildId: "12345" }));
+		fingerprint({ token: "stale-token", guildId: "12345" }));
 
-	const intentionalChange = await staleProcess.loadDiscordConfig(evictionFile, { DISCORD_TOKEN: "changed-token" });
-	assert.ok(intentionalChange.epoch > current.epoch, "a same-process effective config change must advance authority");
-	const sameProcessReconnect = await staleProcess.loadDiscordConfig(evictionFile, { DISCORD_TOKEN: "changed-token" });
+	const intentionalChange = (await requestChild(retainedChild, {
+		action: "load",
+		file: evictionFile,
+		token: "changed-token",
+	})).config;
+	assert.ok(intentionalChange.epoch > savedChange.epoch, "a same-process effective config change must advance authority");
+	const sameProcessReconnect = (await requestChild(retainedChild, {
+		action: "load",
+		file: evictionFile,
+		token: "changed-token",
+	})).config;
 	assert.equal(sameProcessReconnect.epoch, intentionalChange.epoch, "a same-process reconnect must reuse its current epoch");
+	const retainedExit = once(retainedChild, "exit");
+	retainedChild.kill();
+	await retainedExit;
+	retainedChild = undefined;
 
 	const legacyFile = join(dataDir, "legacy-v1.json");
 	await writeConfig(legacyFile, "legacy-current");
@@ -180,6 +284,11 @@ try {
 
 	console.log("discord config authority tests passed");
 } finally {
+	if (retainedChild?.exitCode === null && retainedChild.signalCode === null) {
+		const retainedExit = once(retainedChild, "exit");
+		retainedChild.kill();
+		await retainedExit;
+	}
 	await rm(output, { recursive: true, force: true });
 	await rm(dataDir, { recursive: true, force: true });
 }

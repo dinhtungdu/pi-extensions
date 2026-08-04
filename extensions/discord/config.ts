@@ -89,6 +89,8 @@ interface ConfigAuthorityState {
 }
 
 const processConfigSources = new Map<string, ConfigSourceState>();
+// A successful explicit write makes the matching next load intentional rather than a stale reconnect.
+const pendingConfigSaves = new Map<string, string>();
 
 async function withExclusiveLock<T>(lockFile: string, operation: () => Promise<T>): Promise<T> {
 	let lock;
@@ -166,6 +168,7 @@ async function authoritativeEpoch(
 	const authority = await readConfigAuthority(authorityFile);
 	const fingerprint = effectiveFingerprint(config);
 	const previous = processConfigSources.get(authorityFile);
+	const savedIntentionally = pendingConfigSaves.get(authorityFile) === fingerprint;
 	let epoch: number;
 	if (!authority) {
 		epoch = Math.max(0, seedEpoch);
@@ -177,7 +180,7 @@ async function authoritativeEpoch(
 		});
 	} else if (authority.currentFingerprint === fingerprint) {
 		epoch = authority.currentEpoch;
-	} else if (previous?.fingerprint === fingerprint) {
+	} else if (!savedIntentionally && previous?.fingerprint === fingerprint) {
 		epoch = previous.epoch;
 	} else {
 		epoch = Math.max(authority.currentEpoch + 1, seedEpoch);
@@ -186,6 +189,7 @@ async function authoritativeEpoch(
 		await writeConfigAuthority(authorityFile, authority);
 	}
 	processConfigSources.set(authorityFile, { fingerprint, epoch });
+	pendingConfigSaves.delete(authorityFile);
 	return epoch;
 }
 
@@ -320,11 +324,12 @@ export async function loadDiscordConfig(
 
 export async function saveDiscordConfig(config: Omit<DiscordBridgeConfig, "epoch"> | DiscordBridgeConfig, file = DISCORD_CONFIG_FILE): Promise<void> {
 	const normalizedFile = resolve(file);
+	const authorityFile = `${normalizedFile}.authority.json`;
 	await mkdir(dirname(normalizedFile), { recursive: true, mode: 0o700 });
 	await chmod(dirname(normalizedFile), 0o700);
-	await withExclusiveLock(`${normalizedFile}.lock`, () =>
-		withExclusiveLock(`${normalizedFile}.authority.json.lock`, async () => {
-			await readConfigAuthority(`${normalizedFile}.authority.json`);
+	const savedFingerprint = await withExclusiveLock(`${normalizedFile}.lock`, () =>
+		withExclusiveLock(`${authorityFile}.lock`, async () => {
+			await readConfigAuthority(authorityFile);
 			let previousEpoch = -1;
 			try {
 				const existing = JSON.parse(await readFile(normalizedFile, "utf8")) as { epoch?: unknown };
@@ -343,6 +348,8 @@ export async function saveDiscordConfig(config: Omit<DiscordBridgeConfig, "epoch
 			} finally {
 				await unlink(temporary).catch(() => {});
 			}
+			return effectiveFingerprint(validated);
 		}),
 	);
+	pendingConfigSaves.set(authorityFile, savedFingerprint);
 }
