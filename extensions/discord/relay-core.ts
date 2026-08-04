@@ -140,6 +140,7 @@ export class DiscordRelayCore {
 
 	async start(): Promise<void> {
 		if (this.started) return;
+		await this.state.compact();
 		if (this.imageStore) await this.imageStore.initialize(await this.state.pendingImagePaths());
 		await this.transport.connect(this.config);
 		this.unsubscribeTerminal = this.transport.onTerminalError(this.onTerminalError);

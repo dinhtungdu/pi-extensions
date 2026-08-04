@@ -356,7 +356,13 @@ try {
 		saveDiscordConfig,
 	} = await importBuilt("extensions/discord/config.js");
 	const { PACKAGE_FOOTER_STATUS_KEYS } = await importBuilt("extensions/footer-status.js");
-	const { DiscordStateStore, MAX_DISCORD_NONCE_LENGTH } = await importBuilt("extensions/discord/state.js");
+	const {
+		DISCORD_SESSION_RETENTION_MS,
+		DiscordStateStore,
+		MAX_DISCORD_NONCE_LENGTH,
+		MAX_RECENT_MESSAGE_IDS,
+		MIN_RETAINED_DISCORD_SESSIONS,
+	} = await importBuilt("extensions/discord/state.js");
 	const { LocalRelayClient } = await importBuilt("extensions/discord/relay-client.js");
 	const { resolveProjectContext, resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
 	const { discoverTaskTitle, parseTaskTitle } = await importBuilt("extensions/discord/task-title.js");
@@ -533,10 +539,107 @@ try {
 		},
 		recentMessageIds: [],
 	}));
-	const legacyState = await new DiscordStateStore(legacyStateFile).load();
+	const compactionNow = 2_000_000_000_000;
+	const legacyStateStore = new DiscordStateStore(legacyStateFile, () => compactionNow);
+	const legacyState = await legacyStateStore.load();
 	assert.equal(legacyState.sessions["legacy-session"].threadCursors["legacy-thread"], "123");
 	assert.deepEqual(legacyState.sessions["legacy-session"].outboundMessages, []);
 	assert.deepEqual(legacyState.sessions["legacy-session"].lifecycleMessages, []);
+	assert.equal(legacyState.sessions["legacy-session"].lastActiveAt, compactionNow,
+		"legacy sessions without activity metadata must receive a safe fresh fallback");
+	await legacyStateStore.compact();
+	const persistedLegacyState = JSON.parse(await readFile(legacyStateFile, "utf8"));
+	assert.equal(persistedLegacyState.version, 1, "activity metadata must remain compatible with version-1 state");
+	assert.equal(persistedLegacyState.sessions["legacy-session"].lastActiveAt, compactionNow,
+		"legacy fallback activity must persist without a state-version migration");
+	assert.equal(persistedLegacyState.projects["/legacy/project"].channelId, "legacy-channel");
+
+	const retentionCutoff = compactionNow - DISCORD_SESSION_RETENTION_MS;
+	const compactionSession = (sessionId, lastActiveAt, overrides = {}) => ({
+		cwd: `/compaction/${sessionId}`,
+		channelId: `channel-${sessionId}`,
+		threadId: `thread-${sessionId}`,
+		lastActiveAt,
+		threadCursors: {},
+		pendingMessages: [],
+		retainedImages: [],
+		outboundMessages: [],
+		lifecycleMessages: [],
+		...overrides,
+	});
+	const freshSessions = Object.fromEntries(Array.from({ length: MIN_RETAINED_DISCORD_SESSIONS }, (_, index) => {
+		const sessionId = `fresh-${String(index).padStart(3, "0")}`;
+		return [sessionId, compactionSession(sessionId, compactionNow - index)];
+	}));
+	const compactionStateFile = join(dataDir, "compaction-state.json");
+	await writeFile(compactionStateFile, JSON.stringify({
+		version: 1,
+		projects: {
+			"/compaction/expired": { channelId: "permanent-expired-project" },
+			"/compaction/live": { channelId: "permanent-live-project" },
+		},
+		sessions: {
+			...freshSessions,
+			boundary: compactionSession("boundary", retentionCutoff, {
+				lifecycleMessages: [{ messageId: "expired-success", channelId: "thread-boundary", status: "succeeded", updatedAt: retentionCutoff - 1 },
+					{ messageId: "boundary-failure", channelId: "thread-boundary", status: "failed", updatedAt: retentionCutoff },
+					{ messageId: "unfinished", channelId: "thread-boundary", status: "tool", updatedAt: retentionCutoff - 1 }],
+			}),
+			expired: compactionSession("expired", retentionCutoff - 1),
+			"protected-pending": compactionSession("protected-pending", retentionCutoff - 10, {
+				pendingMessages: [{ id: "pending-id", content: "deliver me" }],
+			}),
+			"protected-outbound": compactionSession("protected-outbound", retentionCutoff - 20, {
+				outboundMessages: [{
+					id: "outbound-id",
+					kind: "assistant",
+					threadId: "thread-protected-outbound",
+					chunks: [{ index: 0, content: "send me", nonce: "bounded-nonce" }],
+				}],
+			}),
+			"protected-lifecycle": compactionSession("protected-lifecycle", retentionCutoff - 30, {
+				lifecycleMessages: [{
+					messageId: "active-lifecycle",
+					channelId: "thread-protected-lifecycle",
+					status: "thinking",
+					updatedAt: retentionCutoff - 30,
+				}],
+			}),
+		},
+		recentMessageIds: Array.from({ length: MAX_RECENT_MESSAGE_IDS + 5 }, (_, index) => `dedupe-${index}`),
+	}));
+	const compactionStore = new DiscordStateStore(compactionStateFile, () => compactionNow);
+	await compactionStore.compact();
+	const persistedCompacted = JSON.parse(await readFile(compactionStateFile, "utf8"));
+	assert.equal(persistedCompacted.recentMessageIds.length, MAX_RECENT_MESSAGE_IDS,
+		"the persisted deduplication list must remain strictly capped");
+	const compacted = await compactionStore.load();
+	assert.equal(compacted.sessions.expired, undefined, "sessions older than the boundary must expire");
+	assert.ok(compacted.sessions.boundary, "sessions exactly 30 days old must remain through the boundary");
+	assert.ok(compacted.sessions["protected-pending"], "pending inbound delivery must prevent session pruning");
+	assert.ok(compacted.sessions["protected-outbound"], "queued outbound delivery must prevent session pruning");
+	assert.ok(compacted.sessions["protected-lifecycle"], "unfinished lifecycle coordination must prevent session pruning");
+	assert.deepEqual(compacted.sessions.boundary.lifecycleMessages.map((message) => message.messageId), [
+		"boundary-failure", "unfinished",
+	], "only completed lifecycle records older than 30 days must expire");
+	assert.equal(compacted.projects["/compaction/expired"].channelId, "permanent-expired-project",
+		"session compaction must never remove project mappings");
+	assert.equal(compacted.recentMessageIds.length, MAX_RECENT_MESSAGE_IDS, "deduplication IDs must remain strictly capped");
+	assert.equal(compacted.recentMessageIds[0], "dedupe-5", "deduplication compaction must retain the newest IDs");
+
+	const minimumStateFile = join(dataDir, "minimum-session-state.json");
+	const minimumSessions = Object.fromEntries(Array.from({ length: MIN_RETAINED_DISCORD_SESSIONS + 5 }, (_, index) => {
+		const sessionId = `minimum-${String(index).padStart(3, "0")}`;
+		return [sessionId, compactionSession(sessionId, retentionCutoff - 1_000 + index)];
+	}));
+	await writeFile(minimumStateFile, JSON.stringify({ version: 1, projects: {}, sessions: minimumSessions, recentMessageIds: [] }));
+	const minimumStore = new DiscordStateStore(minimumStateFile, () => compactionNow);
+	await minimumStore.compact();
+	const minimumState = await minimumStore.load();
+	assert.equal(Object.keys(minimumState.sessions).length, MIN_RETAINED_DISCORD_SESSIONS,
+		"compaction must always retain the latest 100 sessions");
+	assert.equal(minimumState.sessions["minimum-004"], undefined);
+	assert.ok(minimumState.sessions["minimum-005"], "the minimum retention set must select sessions by activity time");
 
 	const managerFixture = join(dataDir, "the-manager");
 	await mkdir(join(managerFixture, "bin"), { recursive: true });

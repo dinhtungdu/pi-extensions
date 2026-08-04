@@ -7,9 +7,11 @@ import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reacti
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
 
 const STATE_VERSION = 1;
-const MAX_RECENT_MESSAGE_IDS = 2_000;
+export const MAX_RECENT_MESSAGE_IDS = 2_000;
 const MAX_LIFECYCLE_MESSAGES_PER_SESSION = 2_000;
 const MAX_RETAINED_IMAGE_MESSAGES_PER_SESSION = 2_000;
+export const DISCORD_SESSION_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+export const MIN_RETAINED_DISCORD_SESSIONS = 100;
 const LOCK_STALE_MS = 120_000;
 const LOCK_RETRIES = 600;
 const LOCK_RETRY_MS = 50;
@@ -52,6 +54,7 @@ export interface DiscordLifecycleMessage {
 	messageId: string;
 	channelId: string;
 	status: DiscordLifecycleStatus;
+	updatedAt: number;
 }
 
 export interface OutboundChunk {
@@ -79,6 +82,7 @@ export interface SessionThreadMapping {
 	cwd: string;
 	channelId: string;
 	threadId: string;
+	lastActiveAt: number;
 	threadCursors: Record<string, string>;
 	pendingMessages: QueuedDiscordMessage[];
 	retainedImages: RetainedInboundImages[];
@@ -131,19 +135,21 @@ function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: s
 	});
 }
 
-function parseLifecycleMessages(value: unknown, file: string): DiscordLifecycleMessage[] {
+function parseLifecycleMessages(value: unknown, file: string, fallbackUpdatedAt: number): DiscordLifecycleMessage[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) throw new Error(`Discord bridge state ${file} has an invalid lifecycle message list`);
 	return value.map((message) => {
 		if (!isRecord(message) || typeof message.messageId !== "string" || typeof message.channelId !== "string" ||
 			(message.status !== "accepted" && message.status !== "thinking" && message.status !== "tool" &&
-				message.status !== "succeeded" && message.status !== "failed")) {
+				message.status !== "succeeded" && message.status !== "failed") ||
+			(message.updatedAt !== undefined && (!Number.isSafeInteger(message.updatedAt) || Number(message.updatedAt) < 0))) {
 			throw new Error(`Discord bridge state ${file} has an invalid lifecycle message`);
 		}
 		return {
 			messageId: message.messageId,
 			channelId: message.channelId,
 			status: message.status as DiscordLifecycleStatus,
+			updatedAt: message.updatedAt === undefined ? fallbackUpdatedAt : Number(message.updatedAt),
 		};
 	}).slice(-MAX_LIFECYCLE_MESSAGES_PER_SESSION);
 }
@@ -209,7 +215,7 @@ function parseProjectSummary(value: unknown, file: string): ProjectSummaryState 
 	};
 }
 
-function parseState(value: unknown, file: string): DiscordBridgeState {
+function parseState(value: unknown, file: string, fallbackActivityAt: number): DiscordBridgeState {
 	if (!isRecord(value) || value.version !== STATE_VERSION) {
 		throw new Error(`Discord bridge state ${file} has an unsupported or invalid version`);
 	}
@@ -238,6 +244,7 @@ function parseState(value: unknown, file: string): DiscordBridgeState {
 			typeof mapping.cwd !== "string" ||
 			typeof mapping.channelId !== "string" ||
 			typeof mapping.threadId !== "string" ||
+			(mapping.lastActiveAt !== undefined && (!Number.isSafeInteger(mapping.lastActiveAt) || Number(mapping.lastActiveAt) < 0)) ||
 			(mapping.lastMessageId !== undefined && typeof mapping.lastMessageId !== "string") ||
 			(mapping.threadCursors !== undefined && !isRecord(mapping.threadCursors))
 		) {
@@ -257,11 +264,12 @@ function parseState(value: unknown, file: string): DiscordBridgeState {
 			cwd: mapping.cwd,
 			channelId: mapping.channelId,
 			threadId: mapping.threadId,
+			lastActiveAt: mapping.lastActiveAt === undefined ? fallbackActivityAt : Number(mapping.lastActiveAt),
 			threadCursors,
 			pendingMessages: parsePendingMessages(mapping.pendingMessages, file),
 			retainedImages: parseRetainedImages(mapping.retainedImages, file),
 			outboundMessages: parseOutboundMessages(mapping.outboundMessages, file, mapping.threadId),
-			lifecycleMessages: parseLifecycleMessages(mapping.lifecycleMessages, file),
+			lifecycleMessages: parseLifecycleMessages(mapping.lifecycleMessages, file, fallbackActivityAt),
 		};
 	}
 
@@ -274,6 +282,30 @@ function parseState(value: unknown, file: string): DiscordBridgeState {
 		sessions,
 		recentMessageIds: (value.recentMessageIds as string[]).slice(-MAX_RECENT_MESSAGE_IDS),
 	};
+}
+
+function isCompletedLifecycle(status: DiscordLifecycleStatus): boolean {
+	return status === "succeeded" || status === "failed";
+}
+
+function compactState(state: DiscordBridgeState, now: number): void {
+	const retentionCutoff = now - DISCORD_SESSION_RETENTION_MS;
+	for (const session of Object.values(state.sessions)) {
+		session.lifecycleMessages = session.lifecycleMessages.filter((message) =>
+			!isCompletedLifecycle(message.status) || message.updatedAt >= retentionCutoff);
+	}
+	const latestSessionIds = new Set(Object.entries(state.sessions)
+		.sort(([leftId, left], [rightId, right]) => right.lastActiveAt - left.lastActiveAt || leftId.localeCompare(rightId))
+		.slice(0, MIN_RETAINED_DISCORD_SESSIONS)
+		.map(([sessionId]) => sessionId));
+	for (const [sessionId, session] of Object.entries(state.sessions)) {
+		const hasQueuedWork = session.pendingMessages.length > 0 || session.outboundMessages.length > 0 ||
+			session.retainedImages.length > 0 || session.lifecycleMessages.some((message) => !isCompletedLifecycle(message.status));
+		if (session.lastActiveAt < retentionCutoff && !latestSessionIds.has(sessionId) && !hasQueuedWork) {
+			delete state.sessions[sessionId];
+		}
+	}
+	state.recentMessageIds = state.recentMessageIds.slice(-MAX_RECENT_MESSAGE_IDS);
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -292,18 +324,27 @@ function laterDiscordId(current: string | undefined, candidate: string): string 
 export class DiscordStateStore {
 	private readonly lockFile: string;
 
-	constructor(private readonly file = DISCORD_STATE_FILE) {
+	constructor(
+		private readonly file = DISCORD_STATE_FILE,
+		private readonly now: () => number = Date.now,
+	) {
 		this.lockFile = `${file}.lock`;
 	}
 
 	async load(): Promise<DiscordBridgeState> {
 		try {
-			return parseState(JSON.parse(await readFile(this.file, "utf8")), this.file);
+			return parseState(JSON.parse(await readFile(this.file, "utf8")), this.file, this.now());
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState();
 			if (error instanceof Error && error.message.startsWith("Discord bridge state ")) throw error;
 			throw new Error(`Cannot read Discord bridge state ${this.file}: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+
+	async compact(): Promise<void> {
+		await this.mutate(async (state) => {
+			compactState(state, this.now());
+		});
 	}
 
 	async resolveProjectChannel(
@@ -348,6 +389,7 @@ export class DiscordStateStore {
 				cwd,
 				channelId,
 				threadId,
+				lastActiveAt: this.now(),
 				threadCursors: existing?.threadCursors ?? {},
 				pendingMessages: existing?.pendingMessages ?? [],
 				retainedImages: existing?.retainedImages ?? [],
@@ -375,6 +417,7 @@ export class DiscordStateStore {
 		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
+			session.lastActiveAt = this.now();
 			const project = state.projects[session.cwd];
 			if (!project || project.channelId !== session.channelId) throw new Error(`Pi session ${sessionId} has no Discord project mapping`);
 			if (project.summary) project.summary.desiredText = desiredText;
@@ -440,6 +483,7 @@ export class DiscordStateStore {
 		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) return { queued: false };
+			session.lastActiveAt = this.now();
 			if (advanceCursor) {
 				session.threadCursors[message.channelId] = laterDiscordId(session.threadCursors[message.channelId], message.id);
 			}
@@ -459,7 +503,12 @@ export class DiscordStateStore {
 			if (!session.pendingMessages.some((candidate) => candidate.id === message.id)) {
 				session.pendingMessages.push(queued);
 			}
-			const lifecycle = { messageId: message.id, channelId: message.channelId, status: "accepted" as const };
+			const lifecycle = {
+				messageId: message.id,
+				channelId: message.channelId,
+				status: "accepted" as const,
+				updatedAt: this.now(),
+			};
 			session.lifecycleMessages.push(lifecycle);
 			session.lifecycleMessages = session.lifecycleMessages.slice(-MAX_LIFECYCLE_MESSAGES_PER_SESSION);
 			return { queued: true, message: queued, lifecycle };
@@ -480,9 +529,13 @@ export class DiscordStateStore {
 		status: DiscordLifecycleStatus,
 	): Promise<DiscordLifecycleMessage | undefined> {
 		return this.mutate(async (state) => {
-			const lifecycle = state.sessions[sessionId]?.lifecycleMessages.find((message) => message.messageId === messageId);
-			if (!lifecycle || !canAdvanceLifecycleStatus(lifecycle.status, status)) return undefined;
+			const session = state.sessions[sessionId];
+			const lifecycle = session?.lifecycleMessages.find((message) => message.messageId === messageId);
+			if (!session || !lifecycle || !canAdvanceLifecycleStatus(lifecycle.status, status)) return undefined;
+			const now = this.now();
+			session.lastActiveAt = now;
 			lifecycle.status = status;
+			lifecycle.updatedAt = now;
 			return structuredClone(lifecycle);
 		});
 	}
@@ -491,11 +544,12 @@ export class DiscordStateStore {
 		await this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) return;
+			session.lastActiveAt = this.now();
 			const acknowledged = session.pendingMessages.find((message) => message.id === messageId);
 			if (acknowledged?.images?.length && !session.retainedImages.some((entry) => entry.messageId === messageId)) {
 				session.retainedImages.push({
 					messageId,
-					acknowledgedAt: Date.now(),
+					acknowledgedAt: this.now(),
 					images: acknowledged.images.map((image) => ({ ...image })),
 				});
 				if (session.retainedImages.length > MAX_RETAINED_IMAGE_MESSAGES_PER_SESSION) {
@@ -510,6 +564,7 @@ export class DiscordStateStore {
 		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) return [];
+			session.lastActiveAt = this.now();
 			const retained = session.retainedImages.find((entry) => entry.messageId === messageId);
 			session.retainedImages = session.retainedImages.filter((entry) => entry.messageId !== messageId);
 			return retained?.images.map((image) => image.localPath) ?? [];
@@ -528,6 +583,7 @@ export class DiscordStateStore {
 		await this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
+			session.lastActiveAt = this.now();
 			const existing = session.outboundMessages.find((candidate) => candidate.id === message.id);
 			if (existing) {
 				const sameChunks = existing.chunks.length === message.chunks.length && existing.chunks.every((chunk, index) => {
@@ -556,9 +612,11 @@ export class DiscordStateStore {
 
 	async markOutboundChunkSent(sessionId: string, messageId: string, index: number, discordMessageId: string): Promise<void> {
 		await this.mutate(async (state) => {
-			const message = state.sessions[sessionId]?.outboundMessages.find((candidate) => candidate.id === messageId);
+			const session = state.sessions[sessionId];
+			const message = session?.outboundMessages.find((candidate) => candidate.id === messageId);
 			const chunk = message?.chunks[index];
-			if (!chunk) throw new Error(`Outbound chunk ${messageId}/${index} is missing`);
+			if (!session || !chunk) throw new Error(`Outbound chunk ${messageId}/${index} is missing`);
+			session.lastActiveAt = this.now();
 			chunk.discordMessageId = discordMessageId;
 		});
 	}
@@ -568,6 +626,7 @@ export class DiscordStateStore {
 			const session = state.sessions[sessionId];
 			if (!session || session.outboundMessages[0]?.id !== messageId) return;
 			if (!session.outboundMessages[0].chunks.every((chunk) => chunk.discordMessageId)) return;
+			session.lastActiveAt = this.now();
 			session.outboundMessages.shift();
 		});
 	}
