@@ -605,11 +605,19 @@ try {
 					updatedAt: retentionCutoff - 30,
 				}],
 			}),
+			"protected-retained": compactionSession("protected-retained", retentionCutoff - 40, {
+				retainedImages: [{
+					messageId: "retained-message",
+					acknowledgedAt: retentionCutoff - 40,
+					images: [{ attachmentId: "12345", localPath: "/tmp/retained.png", mimeType: "image/png", size: 100 }],
+				}],
+			}),
+			"protected-explicit": compactionSession("protected-explicit", retentionCutoff - 50),
 		},
 		recentMessageIds: Array.from({ length: MAX_RECENT_MESSAGE_IDS + 5 }, (_, index) => `dedupe-${index}`),
 	}));
 	const compactionStore = new DiscordStateStore(compactionStateFile, () => compactionNow);
-	await compactionStore.compact();
+	await compactionStore.compact(new Set(["protected-explicit"]));
 	const persistedCompacted = JSON.parse(await readFile(compactionStateFile, "utf8"));
 	assert.equal(persistedCompacted.recentMessageIds.length, MAX_RECENT_MESSAGE_IDS,
 		"the persisted deduplication list must remain strictly capped");
@@ -619,6 +627,9 @@ try {
 	assert.ok(compacted.sessions["protected-pending"], "pending inbound delivery must prevent session pruning");
 	assert.ok(compacted.sessions["protected-outbound"], "queued outbound delivery must prevent session pruning");
 	assert.ok(compacted.sessions["protected-lifecycle"], "unfinished lifecycle coordination must prevent session pruning");
+	assert.ok(compacted.sessions["protected-retained"], "retained image cleanup must prevent session pruning");
+	assert.equal(compacted.sessions["protected-explicit"].lastActiveAt, compactionNow,
+		"explicitly connected or registering sessions must be protected and refreshed atomically");
 	assert.deepEqual(compacted.sessions.boundary.lifecycleMessages.map((message) => message.messageId), [
 		"boundary-failure", "unfinished",
 	], "only completed lifecycle records older than 30 days must expire");
@@ -640,6 +651,151 @@ try {
 		"compaction must always retain the latest 100 sessions");
 	assert.equal(minimumState.sessions["minimum-004"], undefined);
 	assert.ok(minimumState.sessions["minimum-005"], "the minimum retention set must select sessions by activity time");
+
+	function manualCompactionScheduler() {
+		let scheduled;
+		return {
+			dependencies: {
+				scheduleStateCompaction(run) {
+					scheduled = run;
+					return () => { scheduled = undefined; };
+				},
+			},
+			async run() {
+				assert.ok(scheduled, "relay state compaction must be scheduled while running");
+				await scheduled();
+			},
+		};
+	}
+
+	const replacementStateFile = join(dataDir, "relay-replacement-compaction.json");
+	let replacementNow = compactionNow;
+	const replacementAfter31Days = compactionNow + DISCORD_SESSION_RETENTION_MS + 24 * 60 * 60 * 1_000;
+	const replacementNewerSessions = Object.fromEntries(Array.from({ length: MIN_RETAINED_DISCORD_SESSIONS }, (_, index) => {
+		const sessionId = `replacement-newer-${String(index).padStart(3, "0")}`;
+		return [sessionId, compactionSession(sessionId, replacementAfter31Days - index)];
+	}));
+	await writeFile(replacementStateFile, JSON.stringify({
+		version: 1,
+		projects: { "/replacement/connected": { channelId: "replacement-channel", name: "connected" } },
+		sessions: {
+			...replacementNewerSessions,
+			"replacement-connected": {
+				...compactionSession("replacement-connected", replacementNow),
+				cwd: "/replacement/connected",
+				channelId: "replacement-channel",
+				threadId: "replacement-thread",
+				threadCursors: { "replacement-thread": "987654321" },
+			},
+		},
+		recentMessageIds: [],
+	}));
+	const replacementStore = new DiscordStateStore(replacementStateFile, () => replacementNow);
+	const oldReplacementScheduler = manualCompactionScheduler();
+	const oldReplacementGateway = new FakeGateway();
+	const oldReplacementCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		replacementStore,
+		oldReplacementGateway,
+		() => {},
+		undefined,
+		oldReplacementScheduler.dependencies,
+	);
+	await oldReplacementCore.start();
+	await oldReplacementCore.prepareRegistration("replacement-client", "old-generation", {
+		cwd: "/replacement/connected",
+		projectIdentityResolved: true,
+		sessionId: "replacement-connected",
+		sessionName: "Replacement connected",
+	});
+	await oldReplacementCore.activateRegistration("replacement-client", "old-generation", "replacement-connected", () => true);
+	replacementNow = replacementAfter31Days;
+	await oldReplacementCore.stop();
+	const protectedReplacement = await replacementStore.getSession("replacement-connected");
+	assert.equal(protectedReplacement.lastActiveAt, replacementAfter31Days,
+		"relay shutdown must refresh every connected session before replacement compaction");
+	assert.equal(protectedReplacement.threadId, "replacement-thread");
+	assert.equal(protectedReplacement.threadCursors["replacement-thread"], "987654321");
+
+	const newReplacementScheduler = manualCompactionScheduler();
+	const newReplacementGateway = new FakeGateway();
+	const newReplacementCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		replacementStore,
+		newReplacementGateway,
+		() => {},
+		undefined,
+		newReplacementScheduler.dependencies,
+	);
+	await newReplacementCore.start();
+	await newReplacementCore.prepareRegistration("replacement-client", "new-generation", {
+		cwd: "/replacement/connected",
+		projectIdentityResolved: true,
+		sessionId: "replacement-connected",
+		sessionName: "Replacement connected",
+	});
+	assert.equal(newReplacementGateway.threadRequests.at(-1).mappedThreadId, "replacement-thread",
+		"replacement relay registration must reuse the connected session's thread");
+	assert.equal((await replacementStore.getSession("replacement-connected")).threadCursors["replacement-thread"], "987654321",
+		"replacement relay registration must preserve connected-session cursors");
+	await newReplacementCore.stop();
+
+	const longLivedStateFile = join(dataDir, "long-lived-relay-compaction.json");
+	let longLivedNow = compactionNow;
+	const longLivedAfter31Days = compactionNow + DISCORD_SESSION_RETENTION_MS + 24 * 60 * 60 * 1_000;
+	const longLivedNewerSessions = Object.fromEntries(Array.from({ length: MIN_RETAINED_DISCORD_SESSIONS }, (_, index) => {
+		const sessionId = `long-lived-newer-${String(index).padStart(3, "0")}`;
+		return [sessionId, compactionSession(sessionId, longLivedAfter31Days - index)];
+	}));
+	await writeFile(longLivedStateFile, JSON.stringify({
+		version: 1,
+		projects: {
+			"/long-lived/active": { channelId: "long-lived-active-channel", name: "active" },
+			"/long-lived/reserved": { channelId: "long-lived-reserved-channel", name: "reserved" },
+			"/long-lived/stale": { channelId: "long-lived-stale-channel", name: "stale" },
+		},
+		sessions: {
+			...longLivedNewerSessions,
+			"long-lived-active": { ...compactionSession("long-lived-active", longLivedNow), cwd: "/long-lived/active",
+				channelId: "long-lived-active-channel", threadId: "long-lived-active-thread" },
+			"long-lived-reserved": { ...compactionSession("long-lived-reserved", longLivedNow), cwd: "/long-lived/reserved",
+				channelId: "long-lived-reserved-channel", threadId: "long-lived-reserved-thread" },
+			"long-lived-stale": { ...compactionSession("long-lived-stale", longLivedNow), cwd: "/long-lived/stale",
+				channelId: "long-lived-stale-channel", threadId: "long-lived-stale-thread" },
+		},
+		recentMessageIds: [],
+	}));
+	const longLivedStore = new DiscordStateStore(longLivedStateFile, () => longLivedNow);
+	const longLivedScheduler = manualCompactionScheduler();
+	const longLivedGateway = new FakeGateway();
+	const longLivedCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		longLivedStore,
+		longLivedGateway,
+		() => {},
+		undefined,
+		longLivedScheduler.dependencies,
+	);
+	await longLivedCore.start();
+	await longLivedCore.prepareRegistration("long-lived-client", "active-generation", {
+		cwd: "/long-lived/active", projectIdentityResolved: true, sessionId: "long-lived-active",
+	});
+	await longLivedCore.activateRegistration("long-lived-client", "active-generation", "long-lived-active", () => true);
+	await longLivedCore.prepareRegistration("reserved-client", "reserved-generation", {
+		cwd: "/long-lived/reserved", projectIdentityResolved: true, sessionId: "long-lived-reserved",
+	});
+	longLivedNow = longLivedAfter31Days;
+	await longLivedScheduler.run();
+	const longLivedCompacted = await longLivedStore.load();
+	assert.equal(longLivedCompacted.sessions["long-lived-stale"], undefined,
+		"scheduled compaction must prune expired clean sessions without waiting for relay restart");
+	assert.equal(longLivedCompacted.sessions["long-lived-active"].lastActiveAt, longLivedAfter31Days,
+		"scheduled compaction must protect and refresh active sessions");
+	assert.equal(longLivedCompacted.sessions["long-lived-reserved"].lastActiveAt, longLivedAfter31Days,
+		"scheduled compaction must protect and refresh reserved/registering sessions");
+	assert.equal(longLivedCompacted.projects["/long-lived/stale"].channelId, "long-lived-stale-channel",
+		"long-lived relay compaction must preserve project mappings");
+	await longLivedCore.stop();
 
 	const managerFixture = join(dataDir, "the-manager");
 	await mkdir(join(managerFixture, "bin"), { recursive: true });

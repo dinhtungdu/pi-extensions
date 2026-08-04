@@ -288,8 +288,12 @@ function isCompletedLifecycle(status: DiscordLifecycleStatus): boolean {
 	return status === "succeeded" || status === "failed";
 }
 
-function compactState(state: DiscordBridgeState, now: number): void {
+function compactState(state: DiscordBridgeState, now: number, protectedSessionIds: ReadonlySet<string>): void {
 	const retentionCutoff = now - DISCORD_SESSION_RETENTION_MS;
+	for (const sessionId of protectedSessionIds) {
+		const session = state.sessions[sessionId];
+		if (session) session.lastActiveAt = now;
+	}
 	for (const session of Object.values(state.sessions)) {
 		session.lifecycleMessages = session.lifecycleMessages.filter((message) =>
 			!isCompletedLifecycle(message.status) || message.updatedAt >= retentionCutoff);
@@ -301,7 +305,8 @@ function compactState(state: DiscordBridgeState, now: number): void {
 	for (const [sessionId, session] of Object.entries(state.sessions)) {
 		const hasQueuedWork = session.pendingMessages.length > 0 || session.outboundMessages.length > 0 ||
 			session.retainedImages.length > 0 || session.lifecycleMessages.some((message) => !isCompletedLifecycle(message.status));
-		if (session.lastActiveAt < retentionCutoff && !latestSessionIds.has(sessionId) && !hasQueuedWork) {
+		if (session.lastActiveAt < retentionCutoff && !latestSessionIds.has(sessionId) &&
+			!protectedSessionIds.has(sessionId) && !hasQueuedWork) {
 			delete state.sessions[sessionId];
 		}
 	}
@@ -341,9 +346,13 @@ export class DiscordStateStore {
 		}
 	}
 
-	async compact(): Promise<void> {
-		await this.mutate(async (state) => {
-			compactState(state, this.now());
+	async compact(
+		protectedSessionIds: ReadonlySet<string> | (() => ReadonlySet<string>) = new Set(),
+	): Promise<ReadonlySet<string>> {
+		return this.mutate(async (state) => {
+			const protectedIds = new Set(typeof protectedSessionIds === "function" ? protectedSessionIds() : protectedSessionIds);
+			compactState(state, this.now(), protectedIds);
+			return protectedIds;
 		});
 	}
 

@@ -75,6 +75,17 @@ const SUMMARY_RETRY_MIN_MS = 250;
 const SUMMARY_RETRY_MAX_MS = 30_000;
 const INBOUND_RETRY_MIN_MS = 1_000;
 const INBOUND_RETRY_MAX_MS = 30_000;
+export const DISCORD_STATE_COMPACTION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+
+export interface DiscordRelayCoreDependencies {
+	scheduleStateCompaction(run: () => Promise<void>): () => void;
+}
+
+function scheduleStateCompaction(run: () => Promise<void>): () => void {
+	const timer = setInterval(() => void run(), DISCORD_STATE_COMPACTION_INTERVAL_MS);
+	timer.unref();
+	return () => clearInterval(timer);
+}
 
 async function boundedReaction(operation: Promise<void>): Promise<boolean> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -128,6 +139,9 @@ export class DiscordRelayCore {
 	private readonly summaryReconcileRequested = new Set<string>();
 	private readonly summaryRetryAttempts = new Map<string, number>();
 	private readonly summaryRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly recentlyDisconnectedSessions = new Set<string>();
+	private cancelStateCompaction: (() => void) | undefined;
+	private stateCompaction: Promise<void> | undefined;
 	private started = false;
 
 	constructor(
@@ -136,11 +150,11 @@ export class DiscordRelayCore {
 		private readonly transport: DiscordTransport,
 		private readonly onTerminalError: (error: Error) => void = () => {},
 		private readonly imageStore?: InboundImageStore,
+		private readonly dependencies: DiscordRelayCoreDependencies = { scheduleStateCompaction },
 	) {}
 
 	async start(): Promise<void> {
 		if (this.started) return;
-		await this.state.compact();
 		if (this.imageStore) await this.imageStore.initialize(await this.state.pendingImagePaths());
 		await this.transport.connect(this.config);
 		this.unsubscribeTerminal = this.transport.onTerminalError(this.onTerminalError);
@@ -159,12 +173,51 @@ export class DiscordRelayCore {
 			return this.managerAutocomplete(channelId, prefix, kind);
 		});
 		this.started = true;
+		this.cancelStateCompaction = this.dependencies.scheduleStateCompaction(() => this.compactInactiveState().catch((error) => {
+			this.onTerminalError(error instanceof Error ? error : new Error(String(error)));
+		}));
 		for (const { cwd } of await this.state.projectSummaries()) this.scheduleProjectSummaryReconciliation(cwd);
+	}
+
+	private protectedSessionIds(): ReadonlySet<string> {
+		return new Set([
+			...this.activeSessions.keys(),
+			...this.reservedSessions.keys(),
+			...this.catchingUpSessions,
+			...this.recentlyDisconnectedSessions,
+		]);
+	}
+
+	private compactInactiveState(): Promise<void> {
+		if (!this.started) return Promise.resolve();
+		if (this.stateCompaction) return this.stateCompaction;
+		const operation = this.state.compact(() => this.protectedSessionIds()).then((protectedIds) => {
+			for (const sessionId of protectedIds) this.recentlyDisconnectedSessions.delete(sessionId);
+		});
+		let tracked: Promise<void>;
+		tracked = operation.finally(() => {
+			if (this.stateCompaction === tracked) this.stateCompaction = undefined;
+		});
+		this.stateCompaction = tracked;
+		return tracked;
 	}
 
 	async stop(): Promise<void> {
 		if (!this.started) return;
 		this.started = false;
+		this.cancelStateCompaction?.();
+		this.cancelStateCompaction = undefined;
+		let compactionError: unknown;
+		try {
+			await this.stateCompaction;
+		} catch (error) {
+			compactionError = error;
+		}
+		try {
+			await this.state.compact(() => this.protectedSessionIds());
+		} catch (error) {
+			compactionError ??= error;
+		}
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.unsubscribeControls?.();
@@ -182,6 +235,8 @@ export class DiscordRelayCore {
 		this.activeThreadSessions.clear();
 		this.inboundCursorBlockedSessions.clear();
 		this.reservedSessions.clear();
+		this.catchingUpSessions.clear();
+		this.recentlyDisconnectedSessions.clear();
 		this.clientSessions.clear();
 		this.controlQueues.clear();
 		this.controlQueueDepths.clear();
@@ -208,6 +263,7 @@ export class DiscordRelayCore {
 		await Promise.allSettled(this.summaryReconciliations.values());
 		this.summaryReconciliations.clear();
 		await this.transport.disconnect();
+		if (compactionError) throw compactionError;
 	}
 
 	async prepareRegistration(clientId: string, generation: string, registration: RelaySessionRegistration): Promise<PreparedRegistration> {
@@ -312,11 +368,15 @@ export class DiscordRelayCore {
 
 	unregisterClient(clientId: string, generation: string): void {
 		for (const [sessionId, owner] of this.reservedSessions) {
-			if (owner.clientId === clientId && owner.generation === generation) this.reservedSessions.delete(sessionId);
+			if (owner.clientId === clientId && owner.generation === generation) {
+				this.recentlyDisconnectedSessions.add(sessionId);
+				this.reservedSessions.delete(sessionId);
+			}
 		}
 		for (const sessionId of this.clientSessions.get(clientId) ?? []) {
 			const active = this.activeSessions.get(sessionId);
 			if (active?.clientId === clientId && active.generation === generation) {
+				this.recentlyDisconnectedSessions.add(sessionId);
 				this.activeSessions.delete(sessionId);
 				if (this.activeThreadSessions.get(active.threadId) === sessionId) this.activeThreadSessions.delete(active.threadId);
 				this.clearOutboundRetry(sessionId);
