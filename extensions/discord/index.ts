@@ -1,4 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DiscordBridge, inboundMessageId, stripInboundMarker, type BridgeSession } from "./bridge.js";
 import {
@@ -55,6 +57,15 @@ function compactEntry(text: string) {
 
 type ConfigLoader = () => Promise<DiscordBridgeConfig | null>;
 
+function isWithinPath(root: string, candidate: string): boolean {
+	const pathFromRoot = relative(resolve(root), resolve(candidate));
+	return pathFromRoot === "" || (pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot));
+}
+
+export function shouldAutoStartDiscordBridge(cwd: string, home = homedir()): boolean {
+	return [join(home, "workspace"), join(home, "worktrees")].some((root) => isWithinPath(root, cwd));
+}
+
 export interface DiscordExtensionDependencies {
 	loadConfig?: ConfigLoader;
 	saveConfig?: (config: Omit<DiscordBridgeConfig, "epoch"> | DiscordBridgeConfig) => Promise<void>;
@@ -63,6 +74,7 @@ export interface DiscordExtensionDependencies {
 	createTransport?: () => DiscordTransport;
 	launchRelay?: () => Promise<void>;
 	restartRelay?: (expectedPid: number, expectedNonce?: string) => Promise<void>;
+	autoStartForCwd?: (cwd: string) => boolean;
 }
 
 function errorMessage(error: unknown): string {
@@ -75,6 +87,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 	const paths = dependencies.paths ?? relayPaths();
 	const createStateStore = dependencies.createStateStore ?? (() => new DiscordStateStore());
 	const createTransport = dependencies.createTransport ?? (() => new DiscordJsTransport());
+	const autoStartForCwd = dependencies.autoStartForCwd ?? shouldAutoStartDiscordBridge;
 	let inProcessRelay: Promise<boolean> | undefined;
 	const launchRelay = dependencies.launchRelay ?? (dependencies.createStateStore || dependencies.createTransport
 		? async () => {
@@ -418,7 +431,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		}
 
 		pi.on("session_start", async (_event, ctx) => {
-			await serialize(() => startBridge(ctx, false));
+			await serialize(() => autoStartForCwd(ctx.cwd) ? startBridge(ctx, false) : stopBridge(ctx));
 		});
 
 		pi.on("session_shutdown", async (_event, ctx) => {
@@ -532,10 +545,13 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				}
 				if (command === "status") {
 					const status = bridge?.status();
+					const activationHint = autoStartForCwd(ctx.cwd)
+						? ""
+						: "\nAutomatic activation is off outside ~/workspace and ~/worktrees. Run /discord reconnect to enable this session.";
 					ctx.ui.notify(
 						status?.connected
 							? `Discord bridge connected through local relay PID ${status.leaderPid}\nProject channel: ${status.channelId}\nSession thread: ${status.threadId}`
-							: `Discord bridge disconnected\nConfig: ${DISCORD_CONFIG_FILE}`,
+							: `Discord bridge disconnected\nConfig: ${DISCORD_CONFIG_FILE}${activationHint}`,
 						"info",
 					);
 					return;

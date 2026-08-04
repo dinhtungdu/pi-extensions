@@ -360,7 +360,11 @@ try {
 	const { LocalRelayClient } = await importBuilt("extensions/discord/relay-client.js");
 	const { resolveProjectContext, resolveProjectIdentity } = await importBuilt("extensions/discord/project-identity.js");
 	const { discoverTaskTitle, parseTaskTitle } = await importBuilt("extensions/discord/task-title.js");
-	const { createDiscordExtension, MANAGER_CONTROL_RESULT_ENTRY } = await importBuilt("extensions/discord/index.js");
+	const {
+		createDiscordExtension,
+		MANAGER_CONTROL_RESULT_ENTRY,
+		shouldAutoStartDiscordBridge,
+	} = await importBuilt("extensions/discord/index.js");
 	const { formatManagerTaskSummary, managerProjectCatalogue, managerTaskCatalogue, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
 	const {
 		MANAGER_CONTROL_PROCESS_TIMEOUT_MS,
@@ -412,6 +416,48 @@ try {
 		replaceOwnLifecycleReaction,
 		reuseSessionThread,
 	} = await importBuilt("extensions/discord/transport.js");
+
+	const activationHome = join(dataDir, "activation-home");
+	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "workspace"), activationHome), true,
+		"the workspace root must activate by default");
+	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "worktrees"), activationHome), true,
+		"the worktrees root must activate by default");
+	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "workspace", "project", "src"), activationHome), true,
+		"workspace descendants must activate by default");
+	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "worktrees", "project"), activationHome), true,
+		"worktree descendants must activate by default");
+	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "workspace-misleading", "project"), activationHome), false,
+		"workspace string prefixes must not activate");
+	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "worktrees-old", "project"), activationHome), false,
+		"worktrees string prefixes must not activate");
+	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "elsewhere", "project"), activationHome), false,
+		"paths outside both roots must remain off by default");
+
+	let explicitEnableLoads = 0;
+	const explicitRelayDirectory = join(dataDir, "explicit-enable-relay");
+	const explicitEnable = createExtensionHarness(createDiscordExtension({
+		autoStartForCwd: () => false,
+		paths: relayPaths(explicitRelayDirectory),
+		loadConfig: async () => {
+			explicitEnableLoads++;
+			return { token: "explicit-token", guildId: "12345", epoch: 1 };
+		},
+		createStateStore: () => new DiscordStateStore(join(explicitRelayDirectory, "state.json")),
+		createTransport: () => new FakeGateway(),
+	}), {
+		cwd: join(activationHome, "elsewhere"),
+		sessionId: "explicit-discord-enable",
+		sessionName: "Explicit Discord enable",
+	});
+	await explicitEnable.emit("session_start", { reason: "startup" });
+	assert.equal(explicitEnableLoads, 0, "outside sessions must not load Discord configuration at startup");
+	assert.equal(FakeGateway.activeConnections, 0, "outside startup must leave the relay off");
+	await explicitEnable.runCommand("discord", "reconnect");
+	assert.ok(explicitEnableLoads > 0, "/discord reconnect must load configuration for an outside session");
+	assert.deepEqual(explicitEnable.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.discord, "💬"],
+		"/discord reconnect must explicitly connect an outside session");
+	await explicitEnable.emit("session_shutdown", { reason: "quit" });
+	await waitFor(() => FakeGateway.activeConnections === 0, "explicit-enable relay shutdown");
 
 	assert.deepEqual(parseDiscordConfig({ token: " token ", guildId: "12345", categoryId: "" }), {
 		token: "token",
@@ -2791,6 +2837,7 @@ try {
 		saveConfig: async () => {},
 		createStateStore: () => new DiscordStateStore(stateFile),
 		createTransport: () => new FakeGateway(),
+		autoStartForCwd: () => true,
 		async restartRelay(expectedPid, expectedNonce) {
 			requestedRestartPid = expectedPid;
 			requestedRestartNonce = expectedNonce;
@@ -3703,6 +3750,7 @@ try {
 		saveConfig: async () => {},
 		createStateStore: () => new DiscordStateStore(rolloverStateFile),
 		createTransport: () => new FakeGateway(),
+		autoStartForCwd: () => true,
 	});
 	const rolloverA = createExtensionHarness(createDiscordExtension(rolloverDependencies(environmentFirst)), {
 		cwd: "/rollover",
