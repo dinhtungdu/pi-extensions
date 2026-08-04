@@ -370,6 +370,7 @@ try {
 		createDiscordExtension,
 		MANAGER_CONTROL_RESULT_ENTRY,
 		shouldAutoStartDiscordBridge,
+		shouldPublishManagerTaskSummary,
 	} = await importBuilt("extensions/discord/index.js");
 	const { formatManagerTaskSummary, managerProjectCatalogue, managerTaskCatalogue, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
 	const {
@@ -424,10 +425,10 @@ try {
 	} = await importBuilt("extensions/discord/transport.js");
 
 	const activationHome = join(dataDir, "activation-home");
-	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "workspace"), activationHome), true,
-		"the workspace root must activate by default");
-	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "worktrees"), activationHome), true,
-		"the worktrees root must activate by default");
+	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "workspace"), activationHome), false,
+		"the workspace root must remain off by default");
+	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "worktrees"), activationHome), false,
+		"the worktrees root must remain off by default");
 	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "workspace", "project", "src"), activationHome), true,
 		"workspace descendants must activate by default");
 	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "worktrees", "project"), activationHome), true,
@@ -438,6 +439,10 @@ try {
 		"worktrees string prefixes must not activate");
 	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "elsewhere", "project"), activationHome), false,
 		"paths outside both roots must remain off by default");
+	assert.equal(shouldPublishManagerTaskSummary(join(activationHome, "workspace", "the-manager")), true,
+		"the-manager checkout must publish task summaries");
+	assert.equal(shouldPublishManagerTaskSummary(join(activationHome, "workspace", "the-manager-copy")), false,
+		"other checkouts must not publish task summaries");
 
 	let explicitEnableLoads = 0;
 	const explicitRelayDirectory = join(dataDir, "explicit-enable-relay");

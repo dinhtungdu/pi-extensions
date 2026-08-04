@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DiscordBridge, inboundMessageId, stripInboundMarker, type BridgeSession } from "./bridge.js";
 import {
@@ -57,13 +57,17 @@ function compactEntry(text: string) {
 
 type ConfigLoader = () => Promise<DiscordBridgeConfig | null>;
 
-function isWithinPath(root: string, candidate: string): boolean {
+function isDescendantPath(root: string, candidate: string): boolean {
 	const pathFromRoot = relative(resolve(root), resolve(candidate));
-	return pathFromRoot === "" || (pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot));
+	return pathFromRoot !== "" && pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot);
 }
 
 export function shouldAutoStartDiscordBridge(cwd: string, home = homedir()): boolean {
-	return [join(home, "workspace"), join(home, "worktrees")].some((root) => isWithinPath(root, cwd));
+	return [join(home, "workspace"), join(home, "worktrees")].some((root) => isDescendantPath(root, cwd));
+}
+
+export function shouldPublishManagerTaskSummary(checkoutRoot: string): boolean {
+	return basename(resolve(checkoutRoot)) === "the-manager";
 }
 
 export interface DiscordExtensionDependencies {
@@ -276,8 +280,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			} catch (error) {
 				ctx.ui.notify(`Discord manager controls disabled: ${errorMessage(error)}`, "warning");
 			}
+			const publishManagerTaskSummary = shouldPublishManagerTaskSummary(checkoutRoot);
 			const managerProducer = await ManagerTaskSummaryProducer.create(checkoutRoot, {
 				onSummary(summary) {
+					if (!publishManagerTaskSummary) return;
 					desiredTaskSummary = summary;
 					publishTaskSummary(ctx);
 				},
@@ -547,7 +553,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					const status = bridge?.status();
 					const activationHint = autoStartForCwd(ctx.cwd)
 						? ""
-						: "\nAutomatic activation is off outside ~/workspace and ~/worktrees. Run /discord reconnect to enable this session.";
+						: "\nAutomatic activation is limited to subdirectories of ~/workspace and ~/worktrees. Run /discord reconnect to enable this session.";
 					ctx.ui.notify(
 						status?.connected
 							? `Discord bridge connected through local relay PID ${status.leaderPid}\nProject channel: ${status.channelId}\nSession thread: ${status.threadId}`
