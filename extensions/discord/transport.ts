@@ -89,16 +89,20 @@ export async function replaceOwnLifecycleReaction(
 	add: (reaction: DiscordLifecycleReaction) => Promise<unknown>,
 ): Promise<void> {
 	let hasNext = false;
+	const previous: LifecycleReactionState[] = [];
 	for (const reaction of reactions) {
 		if (reaction.emoji.name === next) {
 			hasNext ||= reaction.me;
 			continue;
 		}
 		if (reaction.me && DISCORD_LIFECYCLE_REACTIONS.includes(reaction.emoji.name as DiscordLifecycleReaction)) {
-			await reaction.users.remove(botUserId);
+			previous.push(reaction);
 		}
 	}
+	// Display progress before cleanup. Discord may rate-limit removal, and removing first
+	// leaves the message blank while the replacement waits or when its API call fails.
 	if (!hasNext) await add(next);
+	for (const reaction of previous) await reaction.users.remove(botUserId);
 }
 
 export function assertConfiguredCategory(

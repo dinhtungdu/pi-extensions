@@ -433,18 +433,33 @@ try {
 	);
 	const removedReactions = [];
 	const addedReactions = [];
+	const reactionOperations = [];
 	await replaceOwnLifecycleReaction([
-		{ emoji: { name: "👀" }, me: true, users: { async remove(id) { removedReactions.push(["👀", id]); } } },
+		{ emoji: { name: "👀" }, me: true, users: { async remove(id) { reactionOperations.push("remove"); removedReactions.push(["👀", id]); } } },
 		{ emoji: { name: "🤔" }, me: false, users: { async remove(id) { removedReactions.push(["🤔", id]); } } },
 		{ emoji: { name: "🎉" }, me: true, users: { async remove(id) { removedReactions.push(["🎉", id]); } } },
-	], "bot-user", "⚙️", async (reaction) => { addedReactions.push(reaction); });
+	], "bot-user", "⚙️", async (reaction) => { reactionOperations.push("add"); addedReactions.push(reaction); });
 	assert.deepEqual(removedReactions, [["👀", "bot-user"]], "only the bot's prior lifecycle reaction may be removed");
 	assert.deepEqual(addedReactions, ["⚙️"]);
-	let addedAfterRemoveFailure = false;
+	assert.deepEqual(reactionOperations, ["add", "remove"], "the current status must display before stale-reaction cleanup");
+	let releaseRateLimitedRemoval;
+	let replacementDisplayed = false;
+	const rateLimitedReplacement = replaceOwnLifecycleReaction([
+		{ emoji: { name: "🤔" }, me: true, users: { remove() { return new Promise((resolve) => { releaseRateLimitedRemoval = resolve; }); } } },
+	], "bot-user", "⚙️", async () => { replacementDisplayed = true; });
+	await waitFor(() => replacementDisplayed, "replacement display during rate-limited cleanup");
+	releaseRateLimitedRemoval();
+	await rateLimitedReplacement;
+	let addedBeforeRemoveFailure = false;
 	await assert.rejects(() => replaceOwnLifecycleReaction([
 		{ emoji: { name: "🤔" }, me: true, users: { async remove() { throw new Error("Missing Permissions"); } } },
-	], "bot-user", "✅", async () => { addedAfterRemoveFailure = true; }), /Missing Permissions/);
-	assert.equal(addedAfterRemoveFailure, false, "a replacement must not add until removal succeeds");
+	], "bot-user", "✅", async () => { addedBeforeRemoveFailure = true; }), /Missing Permissions/);
+	assert.equal(addedBeforeRemoveFailure, true, "cleanup failure must not hide the current lifecycle status");
+	let removedBeforeAddFailure = false;
+	await assert.rejects(() => replaceOwnLifecycleReaction([
+		{ emoji: { name: "👀" }, me: true, users: { async remove() { removedBeforeAddFailure = true; } } },
+	], "bot-user", "🤔", async () => { throw new Error("reaction API failure"); }), /reaction API failure/);
+	assert.equal(removedBeforeAddFailure, false, "a failed replacement must leave the previous lifecycle status visible");
 	let reopened = false;
 	assert.equal(await reuseSessionThread({
 		id: "thread-1",
