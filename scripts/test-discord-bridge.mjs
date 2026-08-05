@@ -2676,29 +2676,29 @@ try {
 	);
 	const firstPresentation = managerPresentationPayload("1".repeat(64), "opaque presentation one");
 	await presentationCore.queueManagerPresentation(
-		"presentation-client", "presentation-generation", "presentation-session", firstPresentation,
-	);
+		"presentation-client", "presentation-generation", "presentation-session", firstPresentation);
 	const presentationMapping = await presentationState.getSession("presentation-session");
 	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.revision === firstPresentation.revision,
 		"manager presentation delivery with components");
 	const deliveredPresentation = FakeGateway.channelMessages.get(presentationMapping.channelId).at(-1);
-	assert.equal(FakeGateway.channelMessages.get(presentationMapping.channelId).length, 1,
-		"manager presentation must use one parent-channel message");
+	assert.equal(FakeGateway.channelMessages.get(presentationMapping.channelId).length, 1, "one manager presentation message");
 	assert.deepEqual(deliveredPresentation.presentation.controls, firstPresentation.controls,
 		"manager labels and generic controls must remain unchanged");
-	const controlRequest = {
-		requestId: "presentation-interaction",
-		guildId: "12345",
-		channelId: presentationMapping.channelId,
-		messageId: deliveredPresentation.id,
-		customId: `m:${firstPresentation.revision}:github-status-refresh`,
+	const controlRequest = { requestId: "presentation-interaction", guildId: "12345", channelId: presentationMapping.channelId,
+		messageId: deliveredPresentation.id, customId: `m:${firstPresentation.revision}:github-status-refresh` };
+	const lookupPresentation = presentationState.projectSummaryByChannel.bind(presentationState);
+	let releaseFirstLookup, markFirstLookupStarted, presentationLookups = 0; const firstLookupStarted = new Promise((resolveStarted) => { markFirstLookupStarted = resolveStarted; });
+	presentationState.projectSummaryByChannel = async (...args) => {
+		if (++presentationLookups === 1) { markFirstLookupStarted(); await new Promise((resolveLookup) => { releaseFirstLookup = resolveLookup; }); }
+		return lookupPresentation(...args);
 	};
-	const firstControl = presentationCore.executeDiscordPresentationControl(controlRequest);
-	const duplicatePresentationControl = presentationCore.executeDiscordPresentationControl(controlRequest);
-	await waitFor(() => presentationExecutions === 1, "one atomic duplicate presentation control");
-	assert.deepEqual(await presentationCore.executeDiscordPresentationControl({ ...controlRequest, requestId: "busy-interaction" }),
-		{ ok: false, message: "A manager presentation control is already running; retry later." }, "busy click must not queue");
-	assert.equal(presentationExecutions, 1);
+	const firstControl = presentationCore.executeDiscordPresentationControl(controlRequest); const duplicatePresentationControl = presentationCore.executeDiscordPresentationControl(controlRequest);
+	assert.equal(firstControl, duplicatePresentationControl, "identical interaction attaches to exact reserved promise");
+	await firstLookupStarted;
+	const laterControl = presentationCore.executeDiscordPresentationControl({ ...controlRequest, requestId: "busy-interaction" }); assert.deepEqual(await laterControl, { ok: false, message: "A manager presentation control is already running; retry later." });
+	assert.equal(presentationLookups, 1, "later interaction must not overtake delayed first authorization");
+	releaseFirstLookup();
+	await waitFor(() => presentationExecutions === 1, "reserved first presentation control");
 	releasePresentationControl({ ok: true, message: "opaque execution complete" });
 	assert.deepEqual(await firstControl, { ok: true, message: "opaque execution complete" });
 	assert.deepEqual(await duplicatePresentationControl, { ok: true, message: "opaque execution complete" },

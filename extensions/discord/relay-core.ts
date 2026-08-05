@@ -149,7 +149,7 @@ export class DiscordRelayCore {
 	private readonly managerControlQueueDepths = new Map<string, number>();
 	private readonly inFlightManagerControls = new Map<string, Promise<PiSessionControlResult>>();
 	private readonly completedManagerControls = new Map<string, PiSessionControlResult>();
-	private readonly inFlightPresentationInteractions = new Map<string, Promise<PiSessionControlResult>>(); private readonly inFlightPresentationControls = new Map<string, { owner: ActiveSession; result: Promise<PiSessionControlResult> }>();
+	private readonly inFlightPresentationControls = new Map<string, { requestId: string; result: Promise<PiSessionControlResult> }>();
 	private readonly completedPresentationControls = new Map<string, PiSessionControlResult>();
 	private inboundQueue: Promise<void> = Promise.resolve();
 	private drainingOutbound = false;
@@ -286,7 +286,6 @@ export class DiscordRelayCore {
 		this.managerControlQueueDepths.clear();
 		this.inFlightManagerControls.clear();
 		this.completedManagerControls.clear();
-		this.inFlightPresentationInteractions.clear();
 		this.inFlightPresentationControls.clear();
 		this.completedPresentationControls.clear();
 		for (const timer of this.outboundRetryTimers.values()) clearTimeout(timer);
@@ -564,20 +563,29 @@ export class DiscordRelayCore {
 	executeDiscordPresentationControl(request: DiscordPresentationControlRequest): Promise<PiSessionControlResult> {
 		const completed = this.completedPresentationControls.get(request.requestId);
 		if (completed) return Promise.resolve({ ...completed });
-		const duplicate = this.inFlightPresentationInteractions.get(request.requestId); if (duplicate) return duplicate;
-		let tracked: Promise<PiSessionControlResult>;
-		const execution = this.executeCurrentPresentationControl(request).then((result) => {
-			this.completedPresentationControls.set(request.requestId, result);
+		const interactionKey = `interaction:${request.requestId}`;
+		const duplicate = this.inFlightPresentationControls.get(interactionKey);
+		if (duplicate) return duplicate.result;
+		const channelKey = `channel:${request.channelId}`;
+		if (this.inFlightPresentationControls.has(channelKey)) {
+			return Promise.resolve({ ok: false, message: "A manager presentation control is already running; retry later." });
+		}
+		let resolveResult!: (result: PiSessionControlResult) => void;
+		let rejectResult!: (error: unknown) => void;
+		const result = new Promise<PiSessionControlResult>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
+		const reservation = { requestId: request.requestId, result };
+		this.inFlightPresentationControls.set(interactionKey, reservation);
+		this.inFlightPresentationControls.set(channelKey, reservation);
+		void this.executeCurrentPresentationControl(request).then((settled) => {
+			this.completedPresentationControls.set(request.requestId, settled);
 			while (this.completedPresentationControls.size > MAX_RECENT_SESSION_CONTROLS)
 				this.completedPresentationControls.delete(this.completedPresentationControls.keys().next().value!);
-			return result;
+			return settled;
+		}).then(resolveResult, rejectResult).finally(() => {
+			if (this.inFlightPresentationControls.get(interactionKey) === reservation) this.inFlightPresentationControls.delete(interactionKey);
+			if (this.inFlightPresentationControls.get(channelKey) === reservation) this.inFlightPresentationControls.delete(channelKey);
 		});
-		tracked = execution.finally(() => {
-			if (this.inFlightPresentationInteractions.get(request.requestId) === tracked)
-				this.inFlightPresentationInteractions.delete(request.requestId);
-		});
-		this.inFlightPresentationInteractions.set(request.requestId, tracked);
-		return tracked;
+		return result;
 	}
 
 	private async executeCurrentPresentationControl(request: DiscordPresentationControlRequest): Promise<PiSessionControlResult> {
@@ -599,9 +607,6 @@ export class DiscordRelayCore {
 			delivered?.revision !== custom[1] || !control || control.command !== SUPPORTED_MANAGER_PRESENTATION_CONTROL) {
 			return { ok: false, message: "This manager control is stale or no longer authorized." };
 		}
-		if (this.inFlightPresentationControls.has(project.cwd)) {
-			return { ok: false, message: "A manager presentation control is already running; retry later." };
-		}
 		const execution = (async () => {
 			let result: PiSessionControlResult;
 			try {
@@ -619,12 +624,7 @@ export class DiscordRelayCore {
 			}
 			return result;
 		})();
-		this.inFlightPresentationControls.set(project.cwd, { owner, result: execution });
-		return execution.finally(() => {
-			if (this.inFlightPresentationControls.get(project.cwd)?.result === execution) {
-				this.inFlightPresentationControls.delete(project.cwd);
-			}
-		});
+		return execution;
 	}
 
 	async executeDiscordControl(request: DiscordSessionControlRequest): Promise<PiSessionControlResult> {
