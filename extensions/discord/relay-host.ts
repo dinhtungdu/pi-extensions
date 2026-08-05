@@ -29,8 +29,6 @@ interface SocketState {
 	closed: boolean;
 	registered: boolean;
 	managerControls: boolean;
-	legacyManagerTaskSummaryProducer: boolean;
-	legacyProjectSummaryCandidate?: { requestId: string; text: string; timer: ReturnType<typeof setTimeout> };
 	buffer: string;
 	queue: Promise<void>;
 	queuedInputFrames: number;
@@ -47,15 +45,13 @@ interface SocketState {
 const ZERO_CLIENT_GRACE_MS = 1_000;
 const SESSION_CONTROL_TIMEOUT_MS = 10_000;
 export const MANAGER_CONTROL_IPC_TIMEOUT_MS = 170_000;
-export const LEGACY_MANAGER_SUMMARY_FRESHNESS_TIMEOUT_MS = 1_000;
 
 export function isEligibleManagerTaskSummaryProducer(
 	cwd: string,
 	registration: { managerControls?: unknown; managerTaskSummaryProducer?: true },
 ): boolean {
-	if (basename(cwd) !== "the-manager" || registration.managerControls === undefined) return false;
-	// Missing capability is an old verified manager client. Explicit true is the new protocol.
-	return registration.managerTaskSummaryProducer === undefined || registration.managerTaskSummaryProducer === true;
+	return basename(cwd) === "the-manager" && registration.managerControls !== undefined &&
+		registration.managerTaskSummaryProducer === true;
 }
 
 export class LocalRelayHost {
@@ -166,7 +162,6 @@ export class LocalRelayHost {
 			closed: false,
 			registered: false,
 			managerControls: false,
-			legacyManagerTaskSummaryProducer: false,
 			buffer: "",
 			queue: Promise.resolve(),
 			queuedInputFrames: 0,
@@ -220,8 +215,6 @@ export class LocalRelayHost {
 				pending.reject(new Error("Pi session disconnected while executing a Discord control"));
 			}
 			state.pendingControls.clear();
-			if (state.legacyProjectSummaryCandidate) clearTimeout(state.legacyProjectSummaryCandidate.timer);
-			state.legacyProjectSummaryCandidate = undefined;
 			this.sockets.delete(socket);
 			this.socketStates.delete(socket);
 			if (state.registered) {
@@ -277,7 +270,6 @@ export class LocalRelayHost {
 			state.sessionId = parsed.sessionId;
 			state.managerControls = parsed.managerControls !== undefined;
 			const managerTaskSummaryProducer = isEligibleManagerTaskSummaryProducer(prepared.cwd, parsed);
-			state.legacyManagerTaskSummaryProducer = managerTaskSummaryProducer && parsed.managerTaskSummaryProducer === undefined;
 			if (!this.write(state, {
 				type: "registered",
 				channelId: prepared.channelId,
@@ -346,15 +338,6 @@ export class LocalRelayHost {
 				return;
 			}
 			this.write(state, { type: "manager_catalogue_updated", requestId: parsed.requestId });
-			const candidate = state.legacyProjectSummaryCandidate;
-			if (!candidate) return;
-			clearTimeout(candidate.timer);
-			state.legacyProjectSummaryCandidate = undefined;
-			try {
-				await this.options.core.queueProjectSummary(clientId, generation, sessionId, candidate.text);
-			} catch (error) {
-				this.fail(socket, state, error instanceof Error ? error.message : String(error), false);
-			}
 			return;
 		}
 		if (parsed.type === "ack_inbound") {
@@ -382,21 +365,6 @@ export class LocalRelayHost {
 			return;
 		}
 		if (parsed.type === "project_summary") {
-			if (state.legacyManagerTaskSummaryProducer) {
-				const previous = state.legacyProjectSummaryCandidate;
-				if (previous) clearTimeout(previous.timer);
-				let candidate: NonNullable<SocketState["legacyProjectSummaryCandidate"]>;
-				const timer = setTimeout(() => {
-					if (state.legacyProjectSummaryCandidate === candidate) state.legacyProjectSummaryCandidate = undefined;
-				}, LEGACY_MANAGER_SUMMARY_FRESHNESS_TIMEOUT_MS);
-				timer.unref();
-				candidate = { requestId: parsed.requestId, text: parsed.text, timer };
-				state.legacyProjectSummaryCandidate = candidate;
-				// Acknowledge staging so an old serial publisher can submit its newer snapshot.
-				// Only the next catalogue frame consumes the latest unexpired candidate.
-				this.write(state, { type: "project_summary_queued", requestId: parsed.requestId });
-				return;
-			}
 			try {
 				await this.options.core.queueProjectSummary(clientId, generation, sessionId, parsed.text);
 			} catch (error) {

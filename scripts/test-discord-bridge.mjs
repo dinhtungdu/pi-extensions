@@ -379,7 +379,6 @@ try {
 	} = await importBuilt("extensions/discord/manager-controls.js");
 	const {
 		isEligibleManagerTaskSummaryProducer,
-		LEGACY_MANAGER_SUMMARY_FRESHNESS_TIMEOUT_MS,
 		LocalRelayHost,
 		MANAGER_CONTROL_IPC_TIMEOUT_MS,
 	} = await importBuilt("extensions/discord/relay-host.js");
@@ -2086,12 +2085,29 @@ try {
 			if (!oldMutation) return original(...args);
 			oldAttempts++;
 			if (retryFirst && oldAttempts === 1) throw new Error(`injected ${kind} retry failure`);
+			const blockedAttempt = retryFirst ? 2 : 1;
+			if (oldAttempts !== blockedAttempt) {
+				const result = await original(...args);
+				order.push("old-recovery-settled");
+				return result;
+			}
 			oldOperationStarted();
 			await new Promise((resolveOperation) => { releaseOldOperation = resolveOperation; });
 			const result = await original(...args);
 			order.push("old-operation-settled");
 			return result;
 		};
+		if (kind === "send") {
+			const recordSent = fenceState.recordProjectSummarySent.bind(fenceState);
+			let failAcceptedSendRecord = true;
+			fenceState.recordProjectSummarySent = async (...args) => {
+				if (failAcceptedSendRecord) {
+					failAcceptedSendRecord = false;
+					throw new Error("injected accepted-send persistence failure");
+				}
+				return recordSent(...args);
+			};
+		}
 
 		const retryKeepAlive = retryFirst ? setTimeout(() => {}, 1_000) : undefined;
 		await fenceCore.queueProjectSummary(
@@ -2123,6 +2139,14 @@ try {
 			`${kind} old-generation mutation must settle before new-owner publication`);
 		await waitFor(() => FakeGateway.channelMessages.get(channelId)?.at(-1)?.text === `new ${kind}`,
 			`${kind} new-owner reconciliation`);
+		if (kind === "send") {
+			assert.ok(order.indexOf("old-recovery-settled") < order.indexOf("new-publication-settled"),
+				"accepted-send nonce recovery must settle before owner promotion");
+			assert.equal(FakeGateway.sendAttempts.get("old send"), 2,
+				"retiring owner must retry an accepted-but-unrecorded send with its durable nonce");
+			assert.equal(FakeGateway.channelMessages.get(channelId).filter((message) => message.botOwned).length, 1,
+				"nonce recovery and promoted-owner reconciliation must retain exactly one bot summary");
+		}
 		await fenceCore.stop();
 	}
 
@@ -2238,13 +2262,15 @@ try {
 	await new Promise((resolveWait) => setTimeout(resolveWait, 25));
 	assert.equal((await summaryState.projectSummaries())[0].summary.desiredText, "in-flight stale owner",
 		"new ownership must not publish while an old-owner reconciliation operation remains in flight");
+	summaryGateway.latestMessageId = originalSummaryLatestMessageId;
 	releaseStaleOwnerRead();
 	await promotedOwnerPublication;
-	summaryGateway.latestMessageId = originalSummaryLatestMessageId;
 	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "promoted owner snapshot",
 		"promoted owner revision after an in-flight stale reconciliation");
-	assert.equal(FakeGateway.summaryEvents.some((event) => event.text === "in-flight stale owner"), false,
-		"an old-owner reconciliation must be fenced after ownership promotion");
+	const staleOwnerEvent = FakeGateway.summaryEvents.findIndex((event) => event.text === "in-flight stale owner");
+	const promotedOwnerEvent = FakeGateway.summaryEvents.findIndex((event) => event.text === "promoted owner snapshot");
+	assert.ok(staleOwnerEvent >= 0 && staleOwnerEvent < promotedOwnerEvent,
+		"the retiring owner's in-flight operation must settle before promoted-owner reconciliation");
 
 	const promotedSummaryId = FakeGateway.channelMessages.get("summary-channel").at(-1).id;
 	FakeGateway.failEditOnce.add(promotedSummaryId);
@@ -2279,8 +2305,10 @@ try {
 	);
 	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "new owner after failed retry",
 		"new owner summary after stale retry fencing");
-	assert.equal(FakeGateway.summaryEvents.some((event) => event.text === "failed stale retry"), false,
-		"a failed old-owner retry must not edit after a new owner publishes a newer revision");
+	const retiredRetryEvent = FakeGateway.summaryEvents.findIndex((event) => event.text === "failed stale retry");
+	const postRetryPromotionEvent = FakeGateway.summaryEvents.findIndex((event) => event.text === "new owner after failed retry");
+	assert.ok(retiredRetryEvent >= 0 && retiredRetryEvent < postRetryPromotionEvent,
+		"failed old-owner work must finish retry recovery before new-owner publication");
 
 	FakeGateway.channelMessages.get("summary-channel").push({ id: "external-displacement", text: "human message", botOwned: false });
 	await summaryCore.queueProjectSummary("final-summary-client", "final-summary-generation", "final-summary-session", "summary three");
@@ -2948,8 +2976,11 @@ try {
 		configEpoch: 1, cwd: "/the-manager", sessionId: "old-manager-session", managerControls: { taskCatalogue: [] },
 	};
 	assert.equal(isClientFrame(oldManagerRegistration), true, "new relays must parse old manager registrations without the additive capability");
-	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/the-manager", oldManagerRegistration), true,
-		"new relays must infer old manager eligibility from verified controls and canonical project identity");
+	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/the-manager", oldManagerRegistration), false,
+		"new relays must fail closed when an old manager registration lacks explicit freshness capability");
+	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/the-manager", {
+		...oldManagerRegistration, managerTaskSummaryProducer: true,
+	}), true, "new relays must grant ownership only to explicitly capable verified manager clients");
 	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/unrelated", oldManagerRegistration), false,
 		"manager-shaped clients from unrelated project identities must not claim summary ownership");
 	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/the-manager", { managerTaskSummaryProducer: true }), false,
@@ -3007,46 +3038,12 @@ try {
 		configFingerprint: "old-client-fingerprint",
 	})}\n`);
 	await waitFor(() => oldClientServerFrames.some((frame) => frame.type === "registered"), "old client registration on new relay");
-	assert.equal(oldClientServerFrames.find((frame) => frame.type === "registered").projectSummaries, true,
-		"new relays must negotiate summary support with structurally verified old manager clients");
-	assert.equal(oldClientActivatedAsProducer, true);
-	oldClientSocket.write(`${JSON.stringify({ type: "project_summary", requestId: "old-cached-summary", text: "cached stale" })}\n`);
-	await waitFor(() => oldClientServerFrames.some((frame) =>
-		frame.type === "project_summary_queued" && frame.requestId === "old-cached-summary"), "cached legacy summary staging");
-	oldClientSocket.write(`${JSON.stringify({ type: "project_summary", requestId: "old-fresh-summary", text: "fresh canonical" })}\n`);
-	await waitFor(() => oldClientServerFrames.some((frame) =>
-		frame.type === "project_summary_queued" && frame.requestId === "old-fresh-summary"), "fresh legacy summary staging");
-	assert.equal(oldClientServerFrames.some((frame) => frame.type === "error" &&
-		(frame.requestId === "old-cached-summary" || frame.requestId === "old-fresh-summary")), false,
-		"a cached legacy request must not block or reject the actual fresh summary");
-	assert.deepEqual(oldClientSummaryFrames, [], "legacy summary candidates must not publish before their catalogue proof");
-	oldClientSocket.write(`${JSON.stringify({
-		type: "manager_catalogue", requestId: "old-fresh-catalogue", taskCatalogue: [], projectCatalogue: [],
-	})}\n`);
-	await waitFor(() => oldClientSummaryFrames.length === 1, "old client fresh summary correlation");
-	assert.deepEqual(oldClientSummaryFrames, ["fresh canonical"],
-		"a catalogue refresh must authorize only the latest corresponding fresh legacy summary");
-
-	oldClientSocket.write(`${JSON.stringify({ type: "project_summary", requestId: "old-expired-summary", text: "expired candidate" })}\n`);
-	await waitFor(() => oldClientServerFrames.some((frame) =>
-		frame.type === "project_summary_queued" && frame.requestId === "old-expired-summary"), "expiring legacy summary staging");
-	await new Promise((resolveWait) => setTimeout(resolveWait, LEGACY_MANAGER_SUMMARY_FRESHNESS_TIMEOUT_MS + 50));
-	oldClientSocket.write(`${JSON.stringify({
-		type: "manager_catalogue", requestId: "old-late-catalogue", taskCatalogue: [], projectCatalogue: [],
-	})}\n`);
-	await waitFor(() => oldClientServerFrames.some((frame) =>
-		frame.type === "manager_catalogue_updated" && frame.requestId === "old-late-catalogue"), "late legacy catalogue");
-	assert.deepEqual(oldClientSummaryFrames, ["fresh canonical"],
-		"a later catalogue must not release an expired legacy summary candidate");
-	oldClientSocket.write(`${JSON.stringify({ type: "project_summary", requestId: "old-retry-summary", text: "retry fresh" })}\n`);
-	await waitFor(() => oldClientServerFrames.some((frame) =>
-		frame.type === "project_summary_queued" && frame.requestId === "old-retry-summary"), "legacy summary retry staging");
-	oldClientSocket.write(`${JSON.stringify({
-		type: "manager_catalogue", requestId: "old-retry-catalogue", taskCatalogue: [], projectCatalogue: [],
-	})}\n`);
-	await waitFor(() => oldClientSummaryFrames.length === 2, "legacy summary retry correlation");
-	assert.deepEqual(oldClientSummaryFrames, ["fresh canonical", "retry fresh"],
-		"an expired candidate must not consume the next summary/catalogue retry pair");
+	assert.equal(oldClientServerFrames.find((frame) => frame.type === "registered").projectSummaries, undefined,
+		"new relays must not advertise summary ownership to old manager clients without explicit freshness capability");
+	assert.equal(oldClientActivatedAsProducer, false);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+	assert.deepEqual(oldClientSummaryFrames, [],
+		"old-client to new-relay rolling compatibility must perform zero summary Discord operations");
 	oldClientSocket.end();
 	await oldClientHost.stop();
 

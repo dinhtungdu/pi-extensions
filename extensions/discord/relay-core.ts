@@ -703,12 +703,15 @@ export class DiscordRelayCore {
 	private retireManagerTaskSummaryOwner(cwd: string, owner: ActiveSession): void {
 		if (this.summaryOwners.get(cwd) !== owner || this.summaryOwnerRetirements.has(cwd)) return;
 		const authorization = this.summaryAuthorizations.get(cwd);
-		if (authorization?.owner === owner) this.summaryAuthorizations.delete(cwd);
+		// Replace any detached retry timer with an awaited retirement recovery loop;
+		// durable pending-send state and its nonce remain untouched.
 		this.clearProjectSummaryRetry(cwd);
 		const settlement = this.summaryReconciliations.get(cwd) ?? Promise.resolve();
 		let retirement: Promise<void>;
-		retirement = settlement.catch(() => {}).then(() => {
+		retirement = settlement.catch(() => {}).then(async () => {
+			if (authorization?.owner === owner) await this.settleRetiringProjectSummary(cwd, authorization);
 			if (this.summaryOwners.get(cwd) !== owner) return;
+			if (this.summaryAuthorizations.get(cwd)?.owner === owner) this.summaryAuthorizations.delete(cwd);
 			const next = this.electManagerTaskSummaryOwner(cwd);
 			if (next) this.summaryOwners.set(cwd, next);
 			else this.summaryOwners.delete(cwd);
@@ -718,10 +721,25 @@ export class DiscordRelayCore {
 		this.summaryOwnerRetirements.set(cwd, retirement);
 	}
 
+	private async settleRetiringProjectSummary(cwd: string, authorization: SummaryAuthorization): Promise<void> {
+		while (this.isCurrentSummaryAuthorization(cwd, authorization)) {
+			try {
+				await this.reconcileProjectSummary(cwd, authorization);
+				const project = (await this.state.projectSummaries()).find((candidate) => candidate.cwd === cwd);
+				if (project?.summary.revision === authorization.revision && !project.summary.pendingSend &&
+					project.summary.delivery?.content === project.summary.desiredText &&
+					await this.transport.latestMessageId(project.mapping.channelId) === project.summary.delivery.messageId) return;
+			} catch {
+				// Keep the old owner authoritative until uncertain transport state is durably recovered.
+			}
+			await new Promise<void>((resolve) => setTimeout(resolve, SUMMARY_RETRY_MIN_MS));
+		}
+	}
+
 	private isCurrentSummaryAuthorization(cwd: string, authorization: SummaryAuthorization): boolean {
 		return this.started && this.summaryAuthorizations.get(cwd) === authorization &&
 			this.summaryRevisions.get(cwd) === authorization.revision &&
-			this.summaryOwners.get(cwd) === authorization.owner && !this.summaryOwnerRetirements.has(cwd);
+			this.summaryOwners.get(cwd) === authorization.owner;
 	}
 
 	private scheduleProjectSummaryReconciliation(cwd: string): void {
@@ -787,7 +805,8 @@ export class DiscordRelayCore {
 
 	private scheduleProjectSummaryRetry(cwd: string): void {
 		const authorization = this.summaryAuthorizations.get(cwd);
-		if (!authorization || !this.isCurrentSummaryAuthorization(cwd, authorization) || this.summaryRetryTimers.has(cwd)) return;
+		if (!authorization || !this.isCurrentSummaryAuthorization(cwd, authorization) ||
+			this.summaryOwnerRetirements.has(cwd) || this.summaryRetryTimers.has(cwd)) return;
 		const attempt = (this.summaryRetryAttempts.get(cwd) ?? 0) + 1;
 		this.summaryRetryAttempts.set(cwd, attempt);
 		const delay = Math.min(SUMMARY_RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 7), SUMMARY_RETRY_MAX_MS);
