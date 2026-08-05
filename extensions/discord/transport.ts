@@ -1,5 +1,8 @@
 import {
+	ActionRowBuilder,
 	ApplicationCommandOptionType,
+	ButtonBuilder,
+	ButtonStyle,
 	ChannelType,
 	Client,
 	Events,
@@ -28,6 +31,7 @@ import {
 	type DiscordSessionControlRequest,
 	type PiSessionControlResult,
 } from "./controls.js";
+import type { ManagerPresentation, ManagerPresentationStyle } from "./manager-presentation.js";
 
 const READY_TIMEOUT_MS = 30_000;
 const CONTROL_EXECUTION_TIMEOUT_MS = 12_000;
@@ -35,6 +39,14 @@ export const MANAGER_CONTROL_INTERACTION_TIMEOUT_MS = 180_000;
 const PI_COMMAND_NAME = "pi";
 const MANAGER_COMMAND_NAME = "m";
 const LEGACY_MANAGER_COMMAND_NAME = "manager";
+
+export interface DiscordPresentationControlRequest {
+	requestId: string;
+	guildId?: string;
+	channelId: string;
+	messageId: string;
+	customId: string;
+}
 
 export interface DiscordInboundMessage {
 	id: string;
@@ -65,12 +77,15 @@ export interface DiscordTransport {
 	onModelAutocomplete(listener: (channelId: string, prefix: string) => DiscordModelChoice[]): () => void;
 	onManagerControl(listener: (request: DiscordManagerControlRequest) => Promise<PiSessionControlResult>): () => void;
 	onManagerAutocomplete(listener: (channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]): () => void;
+	onPresentationControl(listener: (request: DiscordPresentationControlRequest) => Promise<PiSessionControlResult>): () => void;
 	ensureProjectChannel(request: ProjectChannelRequest): Promise<string>;
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
 	sendText(channelId: string, text: string, nonce: string): Promise<string>;
+	sendPresentation(channelId: string, presentation: ManagerPresentation, nonce: string): Promise<string>;
 	latestMessageId(channelId: string): Promise<string | undefined>;
 	editOwnText(channelId: string, messageId: string, text: string): Promise<void>;
+	editOwnPresentation(channelId: string, messageId: string, presentation: ManagerPresentation): Promise<void>;
 	deleteOwnText(channelId: string, messageId: string): Promise<void>;
 	setLifecycleReaction(channelId: string, messageId: string, reaction: DiscordLifecycleReaction): Promise<void>;
 	onTerminalError(listener: (error: Error) => void): () => void;
@@ -159,6 +174,25 @@ export async function collectChronologicalMessages(
 	return [...collected.values()].sort((left, right) => compareIds(left.id, right.id));
 }
 
+const PRESENTATION_BUTTON_STYLES: Record<ManagerPresentationStyle, ButtonStyle> = {
+	primary: ButtonStyle.Primary,
+	secondary: ButtonStyle.Secondary,
+	success: ButtonStyle.Success,
+	danger: ButtonStyle.Danger,
+};
+
+export function presentationComponents(presentation: ManagerPresentation): ActionRowBuilder<ButtonBuilder>[] {
+	const buttons = presentation.controls.map((control) => new ButtonBuilder()
+		.setCustomId(`m:${presentation.revision}:${control.id}`)
+		.setLabel(control.label)
+		.setStyle(PRESENTATION_BUTTON_STYLES[control.style]));
+	const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+	for (let index = 0; index < buttons.length; index += 5) {
+		rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons.slice(index, index + 5)));
+	}
+	return rows;
+}
+
 export function managerCommandDefinition(): ChatInputApplicationCommandData {
 	const descriptions = {
 		handoff: "Work directly in a retained task worker",
@@ -237,6 +271,7 @@ export class DiscordJsTransport implements DiscordTransport {
 	private readonly autocompleteListeners = new Set<(channelId: string, prefix: string) => DiscordModelChoice[]>();
 	private readonly managerControlListeners = new Set<(request: DiscordManagerControlRequest) => Promise<PiSessionControlResult>>();
 	private readonly managerAutocompleteListeners = new Set<(channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]>();
+	private readonly presentationControlListeners = new Set<(request: DiscordPresentationControlRequest) => Promise<PiSessionControlResult>>();
 	private readonly terminalListeners = new Set<(error: Error) => void>();
 
 	async connect(config: DiscordBridgeConfig): Promise<void> {
@@ -276,6 +311,10 @@ export class DiscordJsTransport implements DiscordTransport {
 		});
 		client.on(Events.InteractionCreate, (interaction) => {
 			const channelId = interactionChannels.resolve(interaction);
+			if (interaction.isButton()) {
+				void this.executePresentationControlInteraction(interaction, channelId);
+				return;
+			}
 			if (interaction.isAutocomplete()) {
 				const focused = interaction.options.getFocused(true);
 				const managerKind = interaction.commandName === MANAGER_COMMAND_NAME &&
@@ -354,6 +393,11 @@ export class DiscordJsTransport implements DiscordTransport {
 		return () => this.managerAutocompleteListeners.delete(listener);
 	}
 
+	onPresentationControl(listener: (request: DiscordPresentationControlRequest) => Promise<PiSessionControlResult>): () => void {
+		this.presentationControlListeners.add(listener);
+		return () => this.presentationControlListeners.delete(listener);
+	}
+
 	async ensureProjectChannel(request: ProjectChannelRequest): Promise<string> {
 		const guild = await this.guild(request.guildId);
 		await this.validateCategory(guild, request.categoryId);
@@ -430,6 +474,18 @@ export class DiscordJsTransport implements DiscordTransport {
 		return message.id;
 	}
 
+	async sendPresentation(channelId: string, presentation: ManagerPresentation, nonce: string): Promise<string> {
+		const channel = await this.textChannel(channelId, "receive presentations");
+		const message = await channel.send({
+			content: presentation.content,
+			components: presentationComponents(presentation),
+			nonce,
+			enforceNonce: true,
+			allowedMentions: { parse: [] },
+		});
+		return message.id;
+	}
+
 	async latestMessageId(channelId: string): Promise<string | undefined> {
 		const channel = await this.textChannel(channelId, "inspect messages");
 		return (await channel.messages.fetch({ limit: 1 })).first()?.id;
@@ -441,6 +497,18 @@ export class DiscordJsTransport implements DiscordTransport {
 		const message = await channel.messages.fetch(messageId);
 		if (message.author.id !== client.user.id) throw new Error(`Discord message ${messageId} is not owned by this bot`);
 		await message.edit({ content: text, allowedMentions: { parse: [] } });
+	}
+
+	async editOwnPresentation(channelId: string, messageId: string, presentation: ManagerPresentation): Promise<void> {
+		const client = this.readyClient();
+		const channel = await this.textChannel(channelId, "edit presentations");
+		const message = await channel.messages.fetch(messageId);
+		if (message.author.id !== client.user.id) throw new Error(`Discord message ${messageId} is not owned by this bot`);
+		await message.edit({
+			content: presentation.content,
+			components: presentationComponents(presentation),
+			allowedMentions: { parse: [] },
+		});
 	}
 
 	async deleteOwnText(channelId: string, messageId: string): Promise<void> {
@@ -582,6 +650,37 @@ export class DiscordJsTransport implements DiscordTransport {
 		}
 		const bounded = boundedControlResult(result);
 		await command.editReply({
+			content: `${bounded.ok ? "✅" : "❌"} ${bounded.message}`,
+			allowedMentions: { parse: [] },
+		}).catch(() => {});
+	}
+
+	private async executePresentationControlInteraction(
+		interaction: import("discord.js").ButtonInteraction,
+		channelId?: string,
+	): Promise<void> {
+		try {
+			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+		} catch {
+			return;
+		}
+		await interaction.editReply({ content: "Running manager control…", allowedMentions: { parse: [] } }).catch(() => {});
+		let result: PiSessionControlResult;
+		try {
+			if (!channelId) throw new Error("Discord interaction did not identify its channel.");
+			const listener = this.presentationControlListeners.values().next().value;
+			result = listener ? await listener({
+				requestId: interaction.id,
+				...(interaction.guildId ? { guildId: interaction.guildId } : {}),
+				channelId,
+				messageId: interaction.message.id,
+				customId: interaction.customId,
+			}) : { ok: false, message: "Discord relay is not ready for manager presentation controls." };
+		} catch (error) {
+			result = { ok: false, message: error instanceof Error ? error.message : String(error) };
+		}
+		const bounded = boundedControlResult(result);
+		await interaction.editReply({
 			content: `${bounded.ok ? "✅" : "❌"} ${bounded.message}`,
 			allowedMentions: { parse: [] },
 		}).catch(() => {});

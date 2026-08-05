@@ -46,6 +46,10 @@ class ChildFakeTransport {
 		return () => {};
 	}
 
+	onPresentationControl() {
+		return () => {};
+	}
+
 	onTerminalError(listener) {
 		this.terminalListeners.add(listener);
 		return () => this.terminalListeners.delete(listener);
@@ -66,6 +70,10 @@ class ChildFakeTransport {
 	async sendText(channelId, text, nonce) {
 		await record({ event: "send", channelId, text, nonce });
 		return `message-${nonce}`;
+	}
+
+	async sendPresentation(channelId, presentation, nonce) {
+		return this.sendText(channelId, presentation.content, nonce);
 	}
 }
 

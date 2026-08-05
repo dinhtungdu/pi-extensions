@@ -21,6 +21,11 @@ import {
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
 } from "./controls.js";
+import {
+	MANAGER_PRESENTATION_SCHEMA_VERSION,
+	SUPPORTED_MANAGER_PRESENTATION_CONTROL,
+	type ManagerPresentation,
+} from "./manager-presentation.js";
 
 const CONNECT_RETRY_MIN_MS = 25;
 const CONNECT_RETRY_MAX_MS = 500;
@@ -40,6 +45,7 @@ export interface RelayClientStatus {
 	projectSummaries?: true;
 	sessionControls?: true;
 	managerControls?: true;
+	managerPresentation?: { schemaVersion: 1; controlIds: string[] };
 	inboundImages?: true;
 }
 
@@ -52,6 +58,10 @@ export interface RelayClientCallbacks {
 	managerTaskCatalogue?(): ManagerTaskCatalogueEntry[];
 	managerProjectCatalogue?(): ManagerProjectCatalogueEntry[];
 	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
+	onManagerPresentationControl?(
+		request: { requestId: string; revision: string; controlId: string; command: string },
+		signal: AbortSignal,
+	): Promise<PiSessionControlResult>;
 }
 
 export interface RelayClientDependencies {
@@ -109,6 +119,7 @@ export class LocalRelayClient {
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private lastRelayLaunchAt = 0;
 	private readonly pendingRequests = new Map<string, PendingRequest>();
+	private readonly presentationControlAborts = new Map<string, AbortController>();
 	private readonly desiredLifecycleStatuses = new Map<string, { status: DiscordLifecycleStatus; sentGeneration?: string }>();
 	private readonly pendingLifecycleFrames: Array<{ messageId: string; status: DiscordLifecycleStatus }> = [];
 	private lifecycleGeneration: string | undefined;
@@ -156,6 +167,7 @@ export class LocalRelayClient {
 			await bounded(closed, SHUTDOWN_TIMEOUT_MS, "Timed out closing local Discord relay socket").catch(() => socket.destroy());
 		}
 		this.rejectPending(new Error("Local Discord relay client stopped"));
+		this.abortPresentationControls();
 		if (this.connecting) {
 			await bounded(this.connecting.catch(() => {}), SHUTDOWN_TIMEOUT_MS, "Timed out stopping local Discord relay connection").catch(() => {});
 		}
@@ -201,6 +213,18 @@ export class LocalRelayClient {
 	async sendProjectSummary(text: string): Promise<boolean> {
 		if (!text || !this.currentStatus.projectSummaries) return false;
 		await this.sendRequest({ type: "project_summary", requestId: randomUUID(), text }, REQUEST_TIMEOUT_MS);
+		return true;
+	}
+
+	async publishManagerPresentation(presentation: ManagerPresentation): Promise<boolean> {
+		const capability = this.currentStatus.managerPresentation;
+		if (!capability) return false;
+		if (presentation.controls.some((control) => !capability.controlIds.includes(control.id))) return false;
+		await this.sendRequest({
+			type: "manager_presentation",
+			requestId: randomUUID(),
+			presentation: structuredClone(presentation),
+		}, REQUEST_TIMEOUT_MS);
 		return true;
 	}
 
@@ -345,6 +369,12 @@ export class LocalRelayClient {
 					...(managerTaskCatalogue && managerProjectCatalogue ? {
 						managerControls: { taskCatalogue: managerTaskCatalogue, projectCatalogue: managerProjectCatalogue },
 					} : {}),
+					...(this.callbacks.onManagerPresentationControl ? {
+						managerPresentation: {
+							schemaVersion: MANAGER_PRESENTATION_SCHEMA_VERSION,
+							controlIds: [SUPPORTED_MANAGER_PRESENTATION_CONTROL],
+						},
+					} : {}),
 				};
 				if (!writer.write(encodeFrame(frame))) {
 					waiter.reject(new Error("Local Discord relay request queue is full during registration"));
@@ -382,6 +412,7 @@ export class LocalRelayClient {
 				this.lifecycleSupported = false;
 				this.updateStatus({ connected: false });
 				this.rejectPending(new Error("Local Discord relay connection closed"));
+				this.abortPresentationControls();
 				if (!this.stopped) {
 					this.scheduleReconnect();
 				}
@@ -405,6 +436,10 @@ export class LocalRelayClient {
 				...(frame.projectSummaries ? { projectSummaries: true as const } : {}),
 				...(frame.sessionControls ? { sessionControls: true as const } : {}),
 				...(frame.managerControls ? { managerControls: true as const } : {}),
+				...(frame.managerPresentation ? { managerPresentation: {
+					schemaVersion: 1 as const,
+					controlIds: frame.managerPresentation.controlIds.slice(),
+				} } : {}),
 				...(frame.inboundImages ? { inboundImages: true as const } : {}),
 			});
 			this.flushLifecycleStatuses();
@@ -452,6 +487,31 @@ export class LocalRelayClient {
 			}
 			return;
 		}
+		if (frame.type === "manager_presentation_control") {
+			const abort = new AbortController();
+			this.presentationControlAborts.set(frame.requestId, abort);
+			let result: PiSessionControlResult;
+			try {
+				result = this.callbacks.onManagerPresentationControl
+					? boundedControlResult(await this.callbacks.onManagerPresentationControl({
+						requestId: frame.requestId,
+						revision: frame.revision,
+						controlId: frame.controlId,
+						command: frame.command,
+					}, abort.signal))
+					: { ok: false, message: "This Pi client does not support manager presentation controls." };
+			} catch (error) {
+				result = boundedControlResult({ ok: false, message: asError(error).message });
+			} finally {
+				this.presentationControlAborts.delete(frame.requestId);
+			}
+			if (this.socket === socket && this.writer) {
+				if (!this.writer.write(encodeFrame({ type: "manager_presentation_control_result", requestId: frame.requestId, ...result }))) {
+					this.callbacks.onError(new Error("Local Discord relay request queue is full while returning a presentation control result"));
+				}
+			}
+			return;
+		}
 		if (frame.type === "manager_control") {
 			let result: PiSessionControlResult;
 			try {
@@ -480,7 +540,7 @@ export class LocalRelayClient {
 		}
 		if (frame.type === "inbound_acked" || frame.type === "inbound_images_released" ||
 			frame.type === "outbound_queued" || frame.type === "project_summary_queued" ||
-			frame.type === "manager_catalogue_updated") {
+			frame.type === "manager_presentation_queued" || frame.type === "manager_catalogue_updated") {
 			const pending = this.pendingRequests.get(frame.requestId);
 			if (pending) {
 				clearTimeout(pending.timer);
@@ -554,6 +614,11 @@ export class LocalRelayClient {
 				if (!(failure instanceof FatalRelayConnectionError)) this.scheduleReconnect();
 			});
 		}, CONNECT_RETRY_MIN_MS);
+	}
+
+	private abortPresentationControls(): void {
+		for (const abort of this.presentationControlAborts.values()) abort.abort();
+		this.presentationControlAborts.clear();
 	}
 
 	private rejectPending(error: Error): void {

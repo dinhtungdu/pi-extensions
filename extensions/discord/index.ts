@@ -19,6 +19,7 @@ import { resolveProjectContext } from "./project-identity.js";
 import { discoverTaskTitle } from "./task-title.js";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
+import { ManagerPresentationProducer, type ManagerPresentation } from "./manager-presentation.js";
 import { ManagerControlExecutor } from "./manager-controls.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
@@ -131,11 +132,12 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 		let bridge: DiscordBridge | undefined;
 		let taskSummaryProducer: ManagerTaskSummaryProducer | undefined;
+		let presentationProducer: ManagerPresentationProducer | undefined;
 		let managerTaskCatalogue: ManagerTaskCatalogueEntry[] = [];
 		let managerProjectCatalogue: ManagerProjectCatalogueEntry[] = [];
-		let desiredTaskSummary: string | undefined;
-		let publishingTaskSummary: Promise<void> | undefined;
-		let taskSummaryPublishRequested = false;
+		let desiredPresentation: ManagerPresentation | undefined;
+		let publishingPresentation: Promise<void> | undefined;
+		let presentationPublishRequested = false;
 		let operation: Promise<void> = Promise.resolve();
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -212,28 +214,28 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			};
 		}
 
-		function publishTaskSummary(ctx: ExtensionContext): void {
-			if (!desiredTaskSummary || !bridge?.status().projectSummaries) return;
-			if (publishingTaskSummary) {
-				taskSummaryPublishRequested = true;
+		function publishPresentation(ctx: ExtensionContext): void {
+			if (!desiredPresentation || !bridge?.status().managerPresentation) return;
+			if (publishingPresentation) {
+				presentationPublishRequested = true;
 				return;
 			}
-			publishingTaskSummary = (async () => {
+			publishingPresentation = (async () => {
 				do {
-					taskSummaryPublishRequested = false;
+					presentationPublishRequested = false;
 					const active = bridge;
-					const summary = desiredTaskSummary;
-					if (!active || !summary || !active.status().projectSummaries) return;
+					const presentation = desiredPresentation;
+					if (!active || !presentation || !active.status().managerPresentation) return;
 					try {
-						await active.publishProjectSummary(summary);
+						await active.publishManagerPresentation(presentation);
 					} catch (error) {
-						ctx.ui.notify(`Discord task-summary update deferred: ${errorMessage(error)}`, "warning");
+						ctx.ui.notify(`Discord manager-presentation update deferred: ${errorMessage(error)}`, "warning");
 						return;
 					}
-				} while (taskSummaryPublishRequested);
+				} while (presentationPublishRequested);
 			})().finally(() => {
-				publishingTaskSummary = undefined;
-				if (taskSummaryPublishRequested) publishTaskSummary(ctx);
+				publishingPresentation = undefined;
+				if (presentationPublishRequested) publishPresentation(ctx);
 			});
 		}
 
@@ -248,10 +250,12 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		async function stopBridge(ctx: ExtensionContext): Promise<void> {
 			taskSummaryProducer?.stop();
 			taskSummaryProducer = undefined;
+			presentationProducer?.stop();
+			presentationProducer = undefined;
 			managerTaskCatalogue = [];
 			managerProjectCatalogue = [];
-			desiredTaskSummary = undefined;
-			taskSummaryPublishRequested = false;
+			desiredPresentation = undefined;
+			presentationPublishRequested = false;
 			const active = bridge;
 			bridge = undefined;
 			await active?.stop();
@@ -282,11 +286,6 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			}
 			const publishManagerTaskSummary = shouldPublishManagerTaskSummary(checkoutRoot);
 			const managerProducer = await ManagerTaskSummaryProducer.create(checkoutRoot, {
-				onSummary(summary) {
-					if (!publishManagerTaskSummary) return;
-					desiredTaskSummary = summary;
-					publishTaskSummary(ctx);
-				},
 				onCatalogues(tasks, projects) {
 					managerTaskCatalogue = tasks;
 					managerProjectCatalogue = projects;
@@ -298,6 +297,19 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					ctx.ui.notify(`Discord task-summary producer: ${error.message}`, "warning");
 				},
 			});
+			const managerPresentationProducer = publishManagerTaskSummary ? await ManagerPresentationProducer.create(checkoutRoot, {
+				onPresentation(presentation) {
+					desiredPresentation = presentation;
+					publishPresentation(ctx);
+				},
+				onUnavailable(error) {
+					if (desiredPresentation?.controls.length) {
+						desiredPresentation = { ...desiredPresentation, controls: [] };
+						publishPresentation(ctx);
+					}
+					ctx.ui.notify(`Discord manager-presentation producer: ${error.message}`, "warning");
+				},
+			}) : undefined;
 			const candidate = new DiscordBridge(
 				config,
 				{
@@ -318,7 +330,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 							STATUS_KEY,
 							status.connected ? STATUS_CONNECTED : STATUS_RECONNECTING,
 						);
-						if (status.connected) taskSummaryProducer?.requestRefresh(0);
+						if (status.connected) {
+							taskSummaryProducer?.requestRefresh(0);
+							presentationProducer?.requestRefresh(0);
+						}
 					},
 					supportsImageInput: () => ctx.model?.input?.includes("image") === true,
 					modelCatalogue: () => modelCatalogue(ctx),
@@ -356,6 +371,15 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 							return result;
 						},
 					} : {}),
+					...(managerExecutor && managerPresentationProducer ? {
+						onManagerPresentationControl: async (request, signal) => {
+							try {
+								return boundedControlResult(await managerExecutor!.executePresentationControl(request.command, signal));
+							} finally {
+								managerPresentationProducer.requestRefresh(0);
+							}
+						},
+					} : {}),
 				},
 				{
 					paths,
@@ -375,9 +399,12 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				await candidate.start();
 				setConnectedStatus(ctx);
 				taskSummaryProducer = managerProducer;
+				presentationProducer = managerPresentationProducer;
 				taskSummaryProducer?.start();
+				presentationProducer?.start();
 			} catch (error) {
 				managerProducer?.stop();
+				managerPresentationProducer?.stop();
 				await candidate.stop().catch(() => {});
 				bridge = undefined;
 				ctx.ui.setStatus(STATUS_KEY, STATUS_ERROR);

@@ -5,6 +5,7 @@ import { DISCORD_STATE_FILE } from "./config.js";
 import { collidingProjectChannelName, normalizeCwd, projectChannelName } from "./text.js";
 import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reactions.js";
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
+import { isManagerPresentation, type ManagerPresentation } from "./manager-presentation.js";
 
 const STATE_VERSION = 1;
 export const MAX_RECENT_MESSAGE_IDS = 2_000;
@@ -28,14 +29,17 @@ function isValidDiscordNonce(nonce: string): boolean {
 
 export interface ProjectSummaryState {
 	desiredText: string;
+	desiredPresentation?: ManagerPresentation;
 	revision: number;
 	delivery?: {
 		messageId: string;
 		content: string;
+		presentation?: ManagerPresentation;
 	};
 	pendingSend?: {
 		nonce: string;
 		content: string;
+		presentation?: ManagerPresentation;
 	};
 }
 
@@ -200,20 +204,38 @@ function parseProjectSummary(value: unknown, file: string): ProjectSummaryState 
 		if (!isRecord(value.delivery) || typeof value.delivery.messageId !== "string" || typeof value.delivery.content !== "string") {
 			throw new Error(`Discord bridge state ${file} has an invalid project summary delivery`);
 		}
-		delivery = { messageId: value.delivery.messageId, content: value.delivery.content };
+		if (value.delivery.presentation !== undefined && !isManagerPresentation(value.delivery.presentation)) {
+			throw new Error(`Discord bridge state ${file} has an invalid delivered manager presentation`);
+		}
+		delivery = {
+			messageId: value.delivery.messageId,
+			content: value.delivery.content,
+			...(value.delivery.presentation ? { presentation: structuredClone(value.delivery.presentation as ManagerPresentation) } : {}),
+		};
 	}
 	let pendingSend: ProjectSummaryState["pendingSend"];
 	if (value.pendingSend !== undefined) {
 		if (!isRecord(value.pendingSend) || typeof value.pendingSend.nonce !== "string" || typeof value.pendingSend.content !== "string") {
 			throw new Error(`Discord bridge state ${file} has an invalid pending project summary`);
 		}
-		pendingSend = { nonce: value.pendingSend.nonce, content: value.pendingSend.content };
+		if (value.pendingSend.presentation !== undefined && !isManagerPresentation(value.pendingSend.presentation)) {
+			throw new Error(`Discord bridge state ${file} has an invalid pending manager presentation`);
+		}
+		pendingSend = {
+			nonce: value.pendingSend.nonce,
+			content: value.pendingSend.content,
+			...(value.pendingSend.presentation ? { presentation: structuredClone(value.pendingSend.presentation as ManagerPresentation) } : {}),
+		};
 	}
 	if (value.revision !== undefined && (!Number.isSafeInteger(value.revision) || Number(value.revision) < 0)) {
 		throw new Error(`Discord bridge state ${file} has an invalid project summary revision`);
 	}
+	if (value.desiredPresentation !== undefined && !isManagerPresentation(value.desiredPresentation)) {
+		throw new Error(`Discord bridge state ${file} has an invalid desired manager presentation`);
+	}
 	return {
 		desiredText: value.desiredText,
+		...(value.desiredPresentation ? { desiredPresentation: structuredClone(value.desiredPresentation as ManagerPresentation) } : {}),
 		revision: value.revision === undefined ? 0 : Number(value.revision),
 		...(delivery ? { delivery } : {}),
 		...(pendingSend ? { pendingSend } : {}),
@@ -427,10 +449,17 @@ export class DiscordStateStore {
 		return Object.entries(state.projects).find(([, mapping]) => mapping.channelId === channelId && mapping.summary)?.[0];
 	}
 
+	async projectSummaryByChannel(channelId: string): Promise<{ cwd: string; mapping: ProjectChannelMapping; summary: ProjectSummaryState } | undefined> {
+		const state = await this.load();
+		const found = Object.entries(state.projects).find(([, mapping]) => mapping.channelId === channelId && mapping.summary);
+		return found ? { cwd: found[0], mapping: structuredClone(found[1]), summary: structuredClone(found[1].summary!) } : undefined;
+	}
+
 	async setProjectSummaryDesired(
 		sessionId: string,
 		desiredText: string,
 		candidateRevision?: number,
+		presentation?: ManagerPresentation,
 	): Promise<{ cwd: string; revision: number; accepted: boolean }> {
 		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
@@ -443,12 +472,21 @@ export class DiscordStateStore {
 			if (project.summary && revision <= project.summary.revision) {
 				return { cwd: session.cwd, revision: project.summary.revision, accepted: false };
 			}
+			if (presentation && (!isManagerPresentation(presentation) || presentation.content !== desiredText)) {
+				throw new Error("Discord manager presentation is invalid");
+			}
 			if (project.summary) {
 				// A pending nonce may already identify an accepted Discord send. Keep it so
-				// reconciliation can recover that message before applying newer text.
+				// reconciliation can recover that message before applying newer content.
 				project.summary.desiredText = desiredText;
+				if (presentation) project.summary.desiredPresentation = structuredClone(presentation);
+				else delete project.summary.desiredPresentation;
 				project.summary.revision = revision;
-			} else project.summary = { desiredText, revision };
+			} else project.summary = {
+				desiredText,
+				revision,
+				...(presentation ? { desiredPresentation: structuredClone(presentation) } : {}),
+			};
 			return { cwd: session.cwd, revision, accepted: true };
 		});
 	}
@@ -460,7 +498,11 @@ export class DiscordStateStore {
 		return this.mutate(async (state) => {
 			const summary = state.projects[cwd]?.summary;
 			if (!summary || summary.delivery || (expectedRevision !== undefined && summary.revision !== expectedRevision)) return undefined;
-			if (!summary.pendingSend) summary.pendingSend = { nonce: projectSummaryNonce(), content: summary.desiredText };
+			if (!summary.pendingSend) summary.pendingSend = {
+				nonce: projectSummaryNonce(),
+				content: summary.desiredText,
+				...(summary.desiredPresentation ? { presentation: structuredClone(summary.desiredPresentation) } : {}),
+			};
 			else if (!isValidDiscordNonce(summary.pendingSend.nonce)) {
 				// Previous versions persisted UUID nonces that Discord rejected as too long.
 				summary.pendingSend.nonce = projectSummaryNonce();
@@ -474,17 +516,29 @@ export class DiscordStateStore {
 			const summary = state.projects[cwd]?.summary;
 			if (!summary?.pendingSend || summary.pendingSend.nonce !== nonce ||
 				(expectedRevision !== undefined && summary.revision !== expectedRevision)) return;
-			summary.delivery = { messageId, content: summary.pendingSend.content };
+			summary.delivery = {
+				messageId,
+				content: summary.pendingSend.content,
+				...(summary.pendingSend.presentation ? { presentation: structuredClone(summary.pendingSend.presentation) } : {}),
+			};
 			delete summary.pendingSend;
 		});
 	}
 
-	async recordProjectSummaryEdited(cwd: string, messageId: string, content: string, expectedRevision?: number): Promise<void> {
+	async recordProjectSummaryEdited(
+		cwd: string,
+		messageId: string,
+		content: string,
+		expectedRevision?: number,
+		presentation?: ManagerPresentation,
+	): Promise<void> {
 		await this.mutate(async (state) => {
 			const summary = state.projects[cwd]?.summary;
 			const delivery = summary?.delivery;
 			if (delivery?.messageId === messageId && (expectedRevision === undefined || summary?.revision === expectedRevision)) {
 				delivery.content = content;
+				if (presentation) delivery.presentation = structuredClone(presentation);
+				else delete delivery.presentation;
 			}
 		});
 	}

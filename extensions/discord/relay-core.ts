@@ -10,7 +10,11 @@ import {
 import { lifecycleReaction, type DiscordLifecycleStatus } from "./reactions.js";
 import { resolveProjectIdentity } from "./project-identity.js";
 import { normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
-import type { DiscordInboundMessage, DiscordTransport } from "./transport.js";
+import type {
+	DiscordInboundMessage,
+	DiscordPresentationControlRequest,
+	DiscordTransport,
+} from "./transport.js";
 import {
 	appendInboundImageContext,
 	InboundImageStore,
@@ -38,6 +42,10 @@ import {
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
 } from "./controls.js";
+import {
+	SUPPORTED_MANAGER_PRESENTATION_CONTROL,
+	type ManagerPresentation,
+} from "./manager-presentation.js";
 
 export interface RelaySessionRegistration {
 	cwd: string;
@@ -55,10 +63,12 @@ export interface PreparedRegistration {
 
 interface ActiveSession {
 	clientId: string;
+	sessionId: string;
 	generation: string;
 	cwd: string;
 	threadId: string;
 	managerTaskSummaryProducer: boolean;
+	managerPresentationControlIds: string[];
 	summaryProducerOrder: number;
 	deliver(message: QueuedDiscordMessage): boolean;
 	deliveredIds: Set<string>;
@@ -68,6 +78,7 @@ interface ActiveSession {
 	managerProjectCatalogue: ManagerProjectCatalogueEntry[];
 	managerAsk: boolean;
 	executeManagerControl?: (request: PiManagerControlRequest) => Promise<PiSessionControlResult>;
+	executePresentationControl?: (request: { requestId: string; revision: string; controlId: string; command: string }) => Promise<PiSessionControlResult>;
 	inboundImages: boolean;
 }
 
@@ -97,6 +108,10 @@ function scheduleStateCompaction(run: () => Promise<void>): () => void {
 	return () => clearInterval(timer);
 }
 
+function samePresentation(left: ManagerPresentation | undefined, right: ManagerPresentation | undefined): boolean {
+	return left === undefined ? right === undefined : right !== undefined && JSON.stringify(left) === JSON.stringify(right);
+}
+
 async function boundedReaction(operation: Promise<void>): Promise<boolean> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -124,6 +139,7 @@ export class DiscordRelayCore {
 	private unsubscribeAutocomplete: (() => void) | undefined;
 	private unsubscribeManagerControls: (() => void) | undefined;
 	private unsubscribeManagerAutocomplete: (() => void) | undefined;
+	private unsubscribePresentationControls: (() => void) | undefined;
 	private unsubscribeTerminal: (() => void) | undefined;
 	private readonly controlQueues = new Map<string, Promise<void>>();
 	private readonly controlQueueDepths = new Map<string, number>();
@@ -133,6 +149,8 @@ export class DiscordRelayCore {
 	private readonly managerControlQueueDepths = new Map<string, number>();
 	private readonly inFlightManagerControls = new Map<string, Promise<PiSessionControlResult>>();
 	private readonly completedManagerControls = new Map<string, PiSessionControlResult>();
+	private readonly inFlightPresentationControls = new Map<string, { requestId: string; owner: ActiveSession; result: Promise<PiSessionControlResult> }>();
+	private readonly completedPresentationControls = new Map<string, PiSessionControlResult>();
 	private inboundQueue: Promise<void> = Promise.resolve();
 	private drainingOutbound = false;
 	private outboundDrainRequested = false;
@@ -186,6 +204,9 @@ export class DiscordRelayCore {
 		this.unsubscribeManagerControls = this.transport.onManagerControl((request) => this.executeDiscordManagerControl(request));
 		this.unsubscribeManagerAutocomplete = this.transport.onManagerAutocomplete((channelId, prefix, kind) => {
 			return this.managerAutocomplete(channelId, prefix, kind);
+		});
+		this.unsubscribePresentationControls = this.transport.onPresentationControl((request) => {
+			return this.executeDiscordPresentationControl(request);
 		});
 		for (const { cwd, summary } of await this.state.projectSummaries()) {
 			this.summaryRevisions.set(cwd, summary.revision);
@@ -245,6 +266,8 @@ export class DiscordRelayCore {
 		this.unsubscribeManagerControls = undefined;
 		this.unsubscribeManagerAutocomplete?.();
 		this.unsubscribeManagerAutocomplete = undefined;
+		this.unsubscribePresentationControls?.();
+		this.unsubscribePresentationControls = undefined;
 		this.unsubscribeTerminal?.();
 		this.unsubscribeTerminal = undefined;
 		await this.inboundQueue;
@@ -263,6 +286,8 @@ export class DiscordRelayCore {
 		this.managerControlQueueDepths.clear();
 		this.inFlightManagerControls.clear();
 		this.completedManagerControls.clear();
+		this.inFlightPresentationControls.clear();
+		this.completedPresentationControls.clear();
 		for (const timer of this.outboundRetryTimers.values()) clearTimeout(timer);
 		this.outboundRetryTimers.clear();
 		this.outboundRetryAttempts.clear();
@@ -349,6 +374,10 @@ export class DiscordRelayCore {
 			execute(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 		},
 		managerTaskSummaryProducer = false,
+		managerPresentation?: {
+			controlIds: string[];
+			execute(request: { requestId: string; revision: string; controlId: string; command: string }): Promise<PiSessionControlResult>;
+		},
 	): Promise<void> {
 		const reserved = this.reservedSessions.get(sessionId);
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
@@ -363,10 +392,12 @@ export class DiscordRelayCore {
 		this.reservedSessions.delete(sessionId);
 		const active: ActiveSession = {
 			clientId,
+			sessionId,
 			generation,
 			cwd: mapping!.cwd,
 			threadId: mapping!.threadId,
 			managerTaskSummaryProducer,
+			managerPresentationControlIds: managerPresentation?.controlIds.slice() ?? [],
 			summaryProducerOrder: this.nextSummaryProducerOrder++,
 			deliver,
 			deliveredIds: new Set(),
@@ -376,6 +407,7 @@ export class DiscordRelayCore {
 			managerProjectCatalogue: managerControls?.projectCatalogue?.map((project) => ({ ...project })) ?? [],
 			managerAsk: managerControls?.projectCatalogue !== undefined,
 			...(managerControls ? { executeManagerControl: managerControls.execute } : {}),
+			...(managerPresentation ? { executePresentationControl: managerPresentation.execute } : {}),
 			inboundImages,
 		};
 		const replaced = this.activeSessions.get(sessionId);
@@ -390,10 +422,11 @@ export class DiscordRelayCore {
 		}
 		if (this.inboundCursorBlockedSessions.has(sessionId)) this.scheduleInboundRetry(sessionId);
 		if (managerTaskSummaryProducer) {
-			if (replaced && this.summaryOwners.get(active.cwd) === replaced) this.retireManagerTaskSummaryOwner(active.cwd, replaced);
-			else if (!this.summaryOwners.has(active.cwd) && !this.summaryOwnerRetirements.has(active.cwd)) {
-				this.summaryOwners.set(active.cwd, active);
-			}
+			const owner = this.summaryOwners.get(active.cwd);
+			if (replaced && owner === replaced) this.retireManagerTaskSummaryOwner(active.cwd, replaced);
+			else if (owner && !owner.executePresentationControl && active.executePresentationControl) {
+				this.retireManagerTaskSummaryOwner(active.cwd, owner);
+			} else if (!owner && !this.summaryOwnerRetirements.has(active.cwd)) this.summaryOwners.set(active.cwd, active);
 		}
 		void this.drainOutbound().catch(this.onTerminalError);
 	}
@@ -527,6 +560,64 @@ export class DiscordRelayCore {
 		});
 	}
 
+	async executeDiscordPresentationControl(request: DiscordPresentationControlRequest): Promise<PiSessionControlResult> {
+		const completed = this.completedPresentationControls.get(request.requestId);
+		if (completed) return { ...completed };
+		for (const active of this.inFlightPresentationControls.values()) {
+			if (active.requestId === request.requestId) return active.result;
+		}
+		if (request.guildId !== this.config.guildId) return { ok: false, message: "This manager control is not authorized." };
+		const custom = /^m:([a-f0-9]{64}):([a-z0-9-]+)$/.exec(request.customId);
+		if (!custom || custom[2] !== SUPPORTED_MANAGER_PRESENTATION_CONTROL) {
+			return { ok: false, message: "This manager control is malformed or unsupported." };
+		}
+		const project = await this.state.projectSummaryByChannel(request.channelId);
+		if (!project) return { ok: false, message: "This manager control is not mapped to a current project summary." };
+		const owner = this.summaryOwners.get(project.cwd);
+		const authorization = this.summaryAuthorizations.get(project.cwd);
+		const desired = project.summary.desiredPresentation;
+		const delivered = project.summary.delivery?.presentation;
+		const control = desired?.controls.find((candidate) => candidate.id === custom[2]);
+		if (!owner?.executePresentationControl || this.activeSessions.get(owner.sessionId) !== owner ||
+			!authorization || authorization.owner !== owner || authorization.revision !== project.summary.revision ||
+			project.summary.delivery?.messageId !== request.messageId || desired?.revision !== custom[1] ||
+			delivered?.revision !== custom[1] || !control || control.command !== SUPPORTED_MANAGER_PRESENTATION_CONTROL) {
+			return { ok: false, message: "This manager control is stale or no longer authorized." };
+		}
+		if (this.inFlightPresentationControls.has(project.cwd)) {
+			return { ok: false, message: "A manager presentation control is already running; retry later." };
+		}
+		const execution = (async () => {
+			let result: PiSessionControlResult;
+			try {
+				result = boundedControlResult(await owner.executePresentationControl!({
+					requestId: request.requestId,
+					revision: custom[1]!,
+					controlId: control.id,
+					command: control.command,
+				}));
+			} catch (error) {
+				result = boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
+			}
+			if (this.summaryOwners.get(project.cwd) !== owner || this.activeSessions.get(owner.sessionId) !== owner) {
+				return { ok: false, message: "The manager presentation owner disconnected while the control was running." };
+			}
+			return result;
+		})();
+		this.inFlightPresentationControls.set(project.cwd, { requestId: request.requestId, owner, result: execution });
+		return execution.then((result) => {
+			this.completedPresentationControls.set(request.requestId, result);
+			while (this.completedPresentationControls.size > MAX_RECENT_SESSION_CONTROLS) {
+				this.completedPresentationControls.delete(this.completedPresentationControls.keys().next().value!);
+			}
+			return result;
+		}).finally(() => {
+			if (this.inFlightPresentationControls.get(project.cwd)?.result === execution) {
+				this.inFlightPresentationControls.delete(project.cwd);
+			}
+		});
+	}
+
 	async executeDiscordControl(request: DiscordSessionControlRequest): Promise<PiSessionControlResult> {
 		const sessionId = this.activeThreadSessions.get(request.channelId);
 		if (!sessionId) {
@@ -645,23 +736,40 @@ export class DiscordRelayCore {
 		if (!text || text.length > 2_000) throw new Error("Discord project summary must contain 1-2000 characters");
 		const active = this.activeSessions.get(sessionId)!;
 		if (!active.managerTaskSummaryProducer) throw new Error("Local client is not registered as a manager task-summary producer");
+		await this.queueSummary(active, text);
+	}
+
+	async queueManagerPresentation(
+		clientId: string,
+		generation: string,
+		sessionId: string,
+		presentation: ManagerPresentation,
+	): Promise<void> {
+		this.assertClientSession(clientId, generation, sessionId);
+		const active = this.activeSessions.get(sessionId)!;
+		if (!active.executePresentationControl) throw new Error("Local client did not negotiate manager presentation support");
+		if (presentation.controls.some((control) => !active.managerPresentationControlIds.includes(control.id))) {
+			throw new Error("Manager presentation contains an unsupported control");
+		}
+		await this.queueSummary(active, presentation.content, presentation);
+	}
+
+	private async queueSummary(active: ActiveSession, text: string, presentation?: ManagerPresentation): Promise<void> {
 		await this.summaryOwnerRetirements.get(active.cwd)?.catch(() => {});
 		if (this.summaryOwners.get(active.cwd) !== active) return;
-		// Publish the next revision only after the current owner's Discord operation settles,
-		// so a completed transport mutation is always ordered before the newer state.
+		// Order every durable intent after the current owner's Discord mutation settles.
 		await this.summaryReconciliations.get(active.cwd)?.catch(() => {});
 		if (this.summaryOwners.get(active.cwd) !== active) return;
 		let revision = (this.summaryRevisions.get(active.cwd) ?? 0) + 1;
 		this.summaryRevisions.set(active.cwd, revision);
-		let update = await this.state.setProjectSummaryDesired(sessionId, text, revision);
+		let update = await this.state.setProjectSummaryDesired(active.sessionId, text, revision, presentation);
 		if (!update.accepted && update.revision >= revision &&
 			this.summaryOwners.get(active.cwd) === active && this.summaryRevisions.get(active.cwd) === revision) {
 			revision = update.revision + 1;
 			this.summaryRevisions.set(active.cwd, revision);
-			update = await this.state.setProjectSummaryDesired(sessionId, text, revision);
+			update = await this.state.setProjectSummaryDesired(active.sessionId, text, revision, presentation);
 		}
-		if (!update.accepted || this.summaryOwners.get(active.cwd) !== active ||
-			this.summaryRevisions.get(active.cwd) !== revision) return;
+		if (!update.accepted || this.summaryOwners.get(active.cwd) !== active || this.summaryRevisions.get(active.cwd) !== revision) return;
 		this.summaryAuthorizations.set(active.cwd, { owner: active, revision });
 		this.clearProjectSummaryRetry(active.cwd);
 		this.scheduleProjectSummaryReconciliation(active.cwd);
@@ -697,6 +805,7 @@ export class DiscordRelayCore {
 		return [...this.activeSessions.entries()]
 			.filter(([, active]) => active.managerTaskSummaryProducer && active.cwd === cwd)
 			.sort(([leftId, left], [rightId, right]) =>
+				Number(Boolean(right.executePresentationControl)) - Number(Boolean(left.executePresentationControl)) ||
 				left.summaryProducerOrder - right.summaryProducerOrder || leftId.localeCompare(rightId))[0]?.[1];
 	}
 
@@ -711,6 +820,19 @@ export class DiscordRelayCore {
 		retirement = settlement.catch(() => {}).then(async () => {
 			if (authorization?.owner === owner) await this.settleRetiringProjectSummary(cwd, authorization);
 			if (this.summaryOwners.get(cwd) !== owner) return;
+			const project = (await this.state.projectSummaries()).find((candidate) => candidate.cwd === cwd);
+			const desired = project?.summary.desiredPresentation;
+			if (project && desired?.controls.length) {
+				const revision = Math.max(this.summaryRevisions.get(cwd) ?? 0, project.summary.revision) + 1;
+				this.summaryRevisions.set(cwd, revision);
+				const stripped: ManagerPresentation = { ...desired, controls: [] };
+				const update = await this.state.setProjectSummaryDesired(owner.sessionId, stripped.content, revision, stripped);
+				if (update.accepted) {
+					const strippedAuthorization = { owner, revision };
+					this.summaryAuthorizations.set(cwd, strippedAuthorization);
+					await this.settleRetiringProjectSummary(cwd, strippedAuthorization);
+				}
+			}
 			if (this.summaryAuthorizations.get(cwd)?.owner === owner) this.summaryAuthorizations.delete(cwd);
 			const next = this.electManagerTaskSummaryOwner(cwd);
 			if (next) this.summaryOwners.set(cwd, next);
@@ -728,6 +850,7 @@ export class DiscordRelayCore {
 				const project = (await this.state.projectSummaries()).find((candidate) => candidate.cwd === cwd);
 				if (project?.summary.revision === authorization.revision && !project.summary.pendingSend &&
 					project.summary.delivery?.content === project.summary.desiredText &&
+					samePresentation(project.summary.delivery?.presentation, project.summary.desiredPresentation) &&
 					await this.transport.latestMessageId(project.mapping.channelId) === project.summary.delivery.messageId) return;
 			} catch {
 				// Keep the old owner authoritative until uncertain transport state is durably recovered.
@@ -769,7 +892,9 @@ export class DiscordRelayCore {
 			if (summary.pendingSend) {
 				const pending = await this.state.prepareProjectSummarySend(cwd, authorization.revision);
 				if (!pending || !this.isCurrentSummaryAuthorization(cwd, authorization)) return;
-				const messageId = await this.transport.sendText(mapping.channelId, pending.content, pending.nonce);
+				const messageId = pending.presentation
+					? await this.transport.sendPresentation(mapping.channelId, pending.presentation, pending.nonce)
+					: await this.transport.sendText(mapping.channelId, pending.content, pending.nonce);
 				await this.state.recordProjectSummarySent(cwd, pending.nonce, messageId, authorization.revision);
 				continue;
 			}
@@ -781,16 +906,20 @@ export class DiscordRelayCore {
 			const latestMessageId = await this.transport.latestMessageId(mapping.channelId);
 			if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
 			if (latestMessageId === summary.delivery.messageId) {
-				if (summary.delivery.content === summary.desiredText) {
+				if (summary.delivery.content === summary.desiredText &&
+					samePresentation(summary.delivery.presentation, summary.desiredPresentation)) {
 					this.clearProjectSummaryRetry(cwd);
 					return;
 				}
-				await this.transport.editOwnText(mapping.channelId, summary.delivery.messageId, summary.desiredText);
+				if (summary.desiredPresentation) {
+					await this.transport.editOwnPresentation(mapping.channelId, summary.delivery.messageId, summary.desiredPresentation);
+				} else await this.transport.editOwnText(mapping.channelId, summary.delivery.messageId, summary.desiredText);
 				await this.state.recordProjectSummaryEdited(
 					cwd,
 					summary.delivery.messageId,
 					summary.desiredText,
 					authorization.revision,
+					summary.desiredPresentation,
 				);
 				continue;
 			}

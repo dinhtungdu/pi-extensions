@@ -15,6 +15,7 @@ import {
 	type NativeInboundImage,
 	type QueuedInboundImage,
 } from "./inbound-images.js";
+import type { ManagerPresentation } from "./manager-presentation.js";
 
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
@@ -38,6 +39,10 @@ export interface BridgeCallbacks {
 	managerTaskCatalogue?(): ManagerTaskCatalogueEntry[];
 	managerProjectCatalogue?(): ManagerProjectCatalogueEntry[];
 	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
+	onManagerPresentationControl?(
+		request: { requestId: string; revision: string; controlId: string; command: string },
+		signal: AbortSignal,
+	): Promise<PiSessionControlResult>;
 }
 
 export interface BridgeStatus extends RelayClientStatus {}
@@ -97,6 +102,7 @@ export class DiscordBridge {
 				...(callbacks.managerTaskCatalogue ? { managerTaskCatalogue: callbacks.managerTaskCatalogue } : {}),
 				...(callbacks.managerProjectCatalogue ? { managerProjectCatalogue: callbacks.managerProjectCatalogue } : {}),
 				...(callbacks.onManagerControl ? { onManagerControl: callbacks.onManagerControl } : {}),
+				...(callbacks.onManagerPresentationControl ? { onManagerPresentationControl: callbacks.onManagerPresentationControl } : {}),
 			},
 			dependencies,
 		);
@@ -129,6 +135,10 @@ export class DiscordBridge {
 
 	async publishProjectSummary(text: string): Promise<boolean> {
 		return this.relay.sendProjectSummary(text);
+	}
+
+	async publishManagerPresentation(presentation: ManagerPresentation): Promise<boolean> {
+		return this.relay.publishManagerPresentation(presentation);
 	}
 
 	async updateManagerCatalogues(

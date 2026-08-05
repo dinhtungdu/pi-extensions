@@ -27,7 +27,7 @@ export interface ManagerProcessResult {
 }
 
 export interface ManagerControlDependencies {
-	run?: (executable: string, args: string[], options: { cwd: string; timeout: number }) => Promise<ManagerProcessResult>;
+	run?: (executable: string, args: string[], options: { cwd: string; timeout: number; signal?: AbortSignal }) => Promise<ManagerProcessResult>;
 	environment?: NodeJS.ProcessEnv;
 }
 
@@ -38,7 +38,7 @@ async function isFile(path: string): Promise<boolean> {
 function defaultRun(
 	executable: string,
 	args: string[],
-	options: { cwd: string; timeout: number },
+	options: { cwd: string; timeout: number; signal?: AbortSignal },
 ): Promise<ManagerProcessResult> {
 	return new Promise((resolveResult) => {
 		execFile(executable, args, {
@@ -47,6 +47,7 @@ function defaultRun(
 			maxBuffer: MAX_OUTPUT_BYTES,
 			timeout: options.timeout,
 			windowsHide: true,
+			signal: options.signal,
 		}, (error, stdout, stderr) => {
 			resolveResult({
 				code: typeof error?.code === "number" ? error.code : error ? 1 : 0,
@@ -194,6 +195,27 @@ export class ManagerControlExecutor {
 		return executor;
 	}
 
+	async executePresentationControl(command: string, signal?: AbortSignal): Promise<PiSessionControlResult> {
+		if (command !== "github-status-refresh") return { ok: false, message: "Unsupported manager presentation control." };
+		try {
+			await this.validateRuntime(signal);
+			if (signal?.aborted) return { ok: false, message: "Manager presentation control was aborted." };
+			const manager = join(this.root, "bin", "manager.mjs");
+			const result = await this.run(process.execPath, [manager, command, "--root", this.root], {
+				cwd: this.root,
+				timeout: MANAGER_CONTROL_PROCESS_TIMEOUT_MS,
+				signal,
+			});
+			if (signal?.aborted) return { ok: false, message: "Manager presentation control was aborted." };
+			if (result.code !== 0) {
+				return boundedControlResult({ ok: false, message: failureMessage(result, `Manager control failed with exit ${result.code}.`) });
+			}
+			return { ok: true, message: "Manager control completed." };
+		} catch (error) {
+			return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
+		}
+	}
+
 	async execute(
 		request: PiManagerControlRequest,
 		tasks: readonly ManagerTaskCatalogueEntry[],
@@ -336,11 +358,12 @@ export class ManagerControlExecutor {
 		};
 	}
 
-	private async validateRuntime(): Promise<void> {
+	private async validateRuntime(signal?: AbortSignal): Promise<void> {
 		const runtime = join(this.root, "bin", "manager-runtime.mjs");
 		const result = await this.run(process.execPath, [runtime, "--root", this.root, "validate"], {
 			cwd: this.root,
 			timeout: VALIDATE_TIMEOUT_MS,
+			signal,
 		});
 		if (result.code !== 0) throw new Error(failureMessage(result, `manager runtime validation failed with exit ${result.code}.`));
 		const output = parseJson(result.stdout, "manager runtime validation");

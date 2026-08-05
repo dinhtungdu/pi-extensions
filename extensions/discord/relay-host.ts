@@ -12,6 +12,7 @@ import {
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
 } from "./controls.js";
+import { MANAGER_PRESENTATION_SCHEMA_VERSION, SUPPORTED_MANAGER_PRESENTATION_CONTROL } from "./manager-presentation.js";
 
 export interface RelayHostOptions {
 	paths: RelayPaths;
@@ -29,6 +30,7 @@ interface SocketState {
 	closed: boolean;
 	registered: boolean;
 	managerControls: boolean;
+	managerPresentation: boolean;
 	buffer: string;
 	queue: Promise<void>;
 	queuedInputFrames: number;
@@ -38,7 +40,7 @@ interface SocketState {
 		resolve(result: PiSessionControlResult): void;
 		reject(error: Error): void;
 		timer: ReturnType<typeof setTimeout>;
-		resultType: "control_result" | "manager_control_result";
+		resultType: "control_result" | "manager_control_result" | "manager_presentation_control_result";
 	}>;
 }
 
@@ -52,6 +54,18 @@ export function isEligibleManagerTaskSummaryProducer(
 ): boolean {
 	return basename(cwd) === "the-manager" && registration.managerControls !== undefined &&
 		registration.managerTaskSummaryProducer === true;
+}
+
+export function negotiatedManagerPresentation(
+	cwd: string,
+	registration: { managerControls?: unknown; managerTaskSummaryProducer?: true; managerPresentation?: { schemaVersion: 1; controlIds: string[] } },
+): { schemaVersion: 1; controlIds: string[] } | undefined {
+	if (!isEligibleManagerTaskSummaryProducer(cwd, registration) ||
+		registration.managerPresentation?.schemaVersion !== MANAGER_PRESENTATION_SCHEMA_VERSION) return undefined;
+	return {
+		schemaVersion: 1,
+		controlIds: registration.managerPresentation.controlIds.filter((id) => id === SUPPORTED_MANAGER_PRESENTATION_CONTROL),
+	};
 }
 
 export class LocalRelayHost {
@@ -162,6 +176,7 @@ export class LocalRelayHost {
 			closed: false,
 			registered: false,
 			managerControls: false,
+			managerPresentation: false,
 			buffer: "",
 			queue: Promise.resolve(),
 			queuedInputFrames: 0,
@@ -270,6 +285,8 @@ export class LocalRelayHost {
 			state.sessionId = parsed.sessionId;
 			state.managerControls = parsed.managerControls !== undefined;
 			const managerTaskSummaryProducer = isEligibleManagerTaskSummaryProducer(prepared.cwd, parsed);
+			const managerPresentation = negotiatedManagerPresentation(prepared.cwd, parsed);
+			state.managerPresentation = managerPresentation !== undefined;
 			if (!this.write(state, {
 				type: "registered",
 				channelId: prepared.channelId,
@@ -280,6 +297,7 @@ export class LocalRelayHost {
 				...(managerTaskSummaryProducer ? { projectSummaries: true as const } : {}),
 				sessionControls: true,
 				managerControls: true,
+				...(managerPresentation ? { managerPresentation } : {}),
 				inboundImages: true,
 			})) throw new Error("Local Discord relay response queue is full");
 			await this.options.core.activateRegistration(
@@ -303,6 +321,10 @@ export class LocalRelayHost {
 					execute: (request) => this.requestManagerControl(state, request),
 				} : undefined,
 				managerTaskSummaryProducer,
+				managerPresentation ? {
+					controlIds: managerPresentation.controlIds,
+					execute: (request) => this.requestPresentationControl(state, request),
+				} : undefined,
 			);
 			if (state.closed) {
 				this.options.core.unregisterClient(parsed.clientId, parsed.generation);
@@ -315,12 +337,24 @@ export class LocalRelayHost {
 		const generation = state.generation!;
 		const sessionId = state.sessionId!;
 		if (parsed.type === "register") throw new Error("Local Discord relay client is already registered");
-		if (parsed.type === "control_result" || parsed.type === "manager_control_result") {
+		if (parsed.type === "control_result" || parsed.type === "manager_control_result" ||
+			parsed.type === "manager_presentation_control_result") {
 			const pending = state.pendingControls.get(parsed.requestId);
 			if (!pending || pending.resultType !== parsed.type) return;
 			clearTimeout(pending.timer);
 			state.pendingControls.delete(parsed.requestId);
 			pending.resolve({ ok: parsed.ok, message: parsed.message });
+			return;
+		}
+		if (parsed.type === "manager_presentation") {
+			if (!state.managerPresentation) throw new Error("Local client did not negotiate manager presentation support");
+			try {
+				await this.options.core.queueManagerPresentation(clientId, generation, sessionId, parsed.presentation);
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
+				return;
+			}
+			this.write(state, { type: "manager_presentation_queued", requestId: parsed.requestId });
 			return;
 		}
 		if (parsed.type === "manager_catalogue") {
@@ -391,6 +425,13 @@ export class LocalRelayHost {
 		if (parsed.type === "unregister") socket.end();
 	}
 
+	private requestPresentationControl(
+		state: SocketState,
+		request: { requestId: string; revision: string; controlId: string; command: string },
+	): Promise<PiSessionControlResult> {
+		return this.requestClientControl(state, { type: "manager_presentation_control", ...request }, MANAGER_CONTROL_IPC_TIMEOUT_MS);
+	}
+
 	private requestManagerControl(state: SocketState, request: PiManagerControlRequest): Promise<PiSessionControlResult> {
 		const frame: Extract<ServerFrame, { type: "manager_control" }> = request.action === "ask"
 			? { type: "manager_control", requestId: request.requestId, action: "ask", target: request.target, request: request.request }
@@ -419,7 +460,8 @@ export class LocalRelayHost {
 		}
 		const existing = state.pendingControls.get(frame.requestId);
 		if (existing) return Promise.reject(new Error("Pi session control request is already pending"));
-		const resultType = frame.type === "manager_control" ? "manager_control_result" : "control_result";
+		const resultType = frame.type === "manager_control" ? "manager_control_result"
+			: frame.type === "manager_presentation_control" ? "manager_presentation_control_result" : "control_result";
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				state.pendingControls.delete(frame.requestId);
