@@ -88,6 +88,12 @@ function isPullRequestNumber(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
+function hasValidOptionalCleanupFields(output: Record<string, unknown>): boolean {
+	return (output.checkout_mode === undefined || typeof output.checkout_mode === "string" && output.checkout_mode.length > 0) &&
+		(output.slot_state === undefined || output.slot_state === null || typeof output.slot_state === "string") &&
+		(output.replay === undefined || typeof output.replay === "boolean");
+}
+
 function isReconcilePullRequestSuccess(output: Record<string, unknown>, taskId: string): boolean {
 	if (output.ok !== true || output.command !== "task-reconcile-pr" || output.task_id !== taskId) return false;
 	const baseKeys = ["ok", "command", "task_id", "state", "archived"] as const;
@@ -100,10 +106,37 @@ function isReconcilePullRequestSuccess(output: Record<string, unknown>, taskId: 
 	return typeof output.url === "string" && output.url.length > 0 && isPullRequestNumber(output.number) &&
 		typeof output.merged_at === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(output.merged_at) &&
 		typeof output.merge_commit === "string" && /^[a-f0-9]{40,64}$/i.test(output.merge_commit) &&
-		(output.checkout_mode === undefined || typeof output.checkout_mode === "string" && output.checkout_mode.length > 0) &&
-		(output.slot_state === undefined || output.slot_state === null || typeof output.slot_state === "string") &&
-		(output.replay === undefined || typeof output.replay === "boolean") &&
+		hasValidOptionalCleanupFields(output) &&
 		hasOnlyKeys(output, [...baseKeys, "url", "number", "merged_at", "merge_commit", "checkout_mode", "slot_state", "replay"]);
+}
+
+const GITHUB_REFERENCE_URL = /^https:\/\/(github\.com|github\.a8c\.com)\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(issues|pull)\/([1-9][0-9]*)$/;
+
+function isReconcileReference(value: unknown): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const reference = value as Record<string, unknown>;
+	if ((reference.kind !== "issue" && reference.kind !== "pull-request") ||
+		(reference.state !== "open" && reference.state !== "closed" && reference.state !== "merged") ||
+		typeof reference.url !== "string" || !isPullRequestNumber(reference.number)) return false;
+	if (reference.kind === "issue" && reference.state === "merged") return false;
+	const url = GITHUB_REFERENCE_URL.exec(reference.url);
+	if (!url || url[4] !== (reference.kind === "issue" ? "issues" : "pull") || url[5] !== String(reference.number)) return false;
+	const merged = reference.kind === "pull-request" && reference.state === "merged";
+	if (!merged) return hasExactKeys(reference, ["kind", "state", "url", "number"]);
+	return typeof reference.merged_at === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(reference.merged_at) &&
+		typeof reference.merge_commit === "string" && /^[a-f0-9]{40,64}$/i.test(reference.merge_commit) &&
+		hasExactKeys(reference, ["kind", "state", "url", "number", "merged_at", "merge_commit"]);
+}
+
+function isReconcileReferencedTaskSuccess(output: Record<string, unknown>, taskId: string): boolean {
+	const baseKeys = ["ok", "command", "task_id", "state", "archived", "references"] as const;
+	if (output.ok !== true || output.command !== "task-reconcile-pr" || output.task_id !== taskId ||
+		typeof output.state !== "string" || !["open", "closed", "merged", "terminal", "mixed"].includes(output.state) ||
+		typeof output.archived !== "boolean" || !Array.isArray(output.references) || output.references.length < 1 ||
+		output.references.length > 5 || !output.references.every(isReconcileReference)) return false;
+	if (!output.archived) return hasExactKeys(output, baseKeys);
+	return hasValidOptionalCleanupFields(output) &&
+		hasOnlyKeys(output, [...baseKeys, "checkout_mode", "slot_state", "replay"]);
 }
 
 interface ReconcilePullRequestBatchSuccess extends Record<string, unknown> {
@@ -112,7 +145,16 @@ interface ReconcilePullRequestBatchSuccess extends Record<string, unknown> {
 	scope: "all";
 	scanned: number;
 	results: Array<Record<string, unknown>>;
-	summary: { merged: number; open: number; closed: number; not_found: number; failed: number };
+	summary: {
+		archived: number;
+		merged: number;
+		closed: number;
+		terminal: number;
+		open: number;
+		mixed: number;
+		not_found: number;
+		failed: number;
+	};
 }
 
 function isReconcilePullRequestBatchSuccess(output: Record<string, unknown>): output is ReconcilePullRequestBatchSuccess {
@@ -124,13 +166,13 @@ function isReconcilePullRequestBatchSuccess(output: Record<string, unknown>): ou
 	}
 	if (!output.summary || typeof output.summary !== "object" || Array.isArray(output.summary)) return false;
 	const summary = output.summary as Record<string, unknown>;
-	const summaryKeys = ["merged", "open", "closed", "not_found", "failed"] as const;
+	const summaryKeys = ["archived", "merged", "closed", "terminal", "open", "mixed", "not_found", "failed"] as const;
 	if (!hasExactKeys(summary, summaryKeys) || summaryKeys.some((key) =>
 		!Number.isSafeInteger(summary[key]) || (summary[key] as number) < 0 || (summary[key] as number) > MAX_RECONCILE_BATCH_TASKS)) {
 		return false;
 	}
 	const taskIds = new Set<string>();
-	const counts = { merged: 0, open: 0, closed: 0, not_found: 0, failed: 0 };
+	const counts = { archived: 0, merged: 0, closed: 0, terminal: 0, open: 0, mixed: 0, not_found: 0, failed: 0 };
 	for (const value of output.results) {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 		const result = value as Record<string, unknown>;
@@ -143,18 +185,23 @@ function isReconcilePullRequestBatchSuccess(output: Record<string, unknown>): ou
 			counts.failed++;
 			continue;
 		}
-		if (!isReconcilePullRequestSuccess({ ok: true, command: "task-reconcile-pr", ...result }, result.task_id)) return false;
-		if (result.state === "merged" || result.state === "open" || result.state === "closed") counts[result.state]++;
+		const normalized = { ok: true, command: "task-reconcile-pr", ...result };
+		if (!("references" in result
+			? isReconcileReferencedTaskSuccess(normalized, result.task_id)
+			: isReconcilePullRequestSuccess(normalized, result.task_id))) return false;
+		if (result.archived) counts.archived++;
+		if (result.state === "merged" || result.state === "closed" || result.state === "terminal" ||
+			result.state === "open" || result.state === "mixed") counts[result.state]++;
 		else if (result.state === "not-found") counts.not_found++;
 		else return false;
 	}
-	return summary.merged === counts.merged && summary.open === counts.open && summary.closed === counts.closed &&
-		summary.not_found === counts.not_found && summary.failed === counts.failed;
+	return summaryKeys.every((key) => summary[key] === counts[key]);
 }
 
 function formatReconcilePullRequestBatch(output: ReconcilePullRequestBatchSuccess): string {
 	const summary = output.summary;
-	let message = `Reconciled ${output.scanned} tasks: ${summary.merged} merged, ${summary.open} open, ${summary.closed} closed, ` +
+	const terminal = summary.merged + summary.closed + summary.terminal;
+	let message = `Reconciled ${output.scanned} tasks: ${summary.archived} archived, ${summary.open} open, ${terminal} terminal, ` +
 		`${summary.not_found} not found, ${summary.failed} failed.`;
 	const failedTaskIds = output.results.filter((result) => result.state === "error").map((result) => result.task_id as string);
 	if (failedTaskIds.length > 0) {
@@ -257,8 +304,15 @@ export class ManagerControlExecutor {
 					}
 					return { ok: true, message: formatReconcilePullRequestBatch(output) };
 				}
-				if (!task || !isReconcilePullRequestSuccess(output, task.taskId)) {
+				if (!task || !("references" in output
+					? isReconcileReferencedTaskSuccess(output, task.taskId)
+					: isReconcilePullRequestSuccess(output, task.taskId))) {
 					return { ok: false, message: "reconcile-pr returned conflicting manager output." };
+				}
+				if ("references" in output) {
+					const count = (output.references as unknown[]).length;
+					return { ok: true, message: `@${task.taskId}: ${count} GitHub reference${count === 1 ? "" : "s"} reconciled; ` +
+						`task ${output.archived ? "archived" : `retained (${output.state})`}.` };
 				}
 				const message = output.state === "merged" ? `PR #${output.number} merged; @${task.taskId} archived without local merge.`
 					: output.state === "not-found" ? `No pull request found for @${task.taskId}.`

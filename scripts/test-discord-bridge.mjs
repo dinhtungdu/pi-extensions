@@ -850,7 +850,7 @@ try {
 		'if (command === "status") console.log(readFileSync(join(process.cwd(), "status.json"), "utf8"));',
 		'else if (command === "summary-render") { writeFileSync(join(process.cwd(), "summary-render-args.json"), JSON.stringify(process.argv.slice(2))); console.log(readFileSync(join(process.cwd(), "presentation.json"), "utf8")); }',
 		'else if (command === "github-status-refresh") console.log(JSON.stringify({ ok: true, command }));',
-		'else if (command === "task-reconcile-pr" && !process.argv.includes("--task")) console.log(JSON.stringify({ ok: true, command, scope: "all", scanned: 0, results: [], summary: { merged: 0, open: 0, closed: 0, not_found: 0, failed: 0 } }));',
+		'else if (command === "task-reconcile-pr" && !process.argv.includes("--task")) console.log(JSON.stringify({ ok: true, command, scope: "all", scanned: 0, results: [], summary: { archived: 0, merged: 0, closed: 0, terminal: 0, open: 0, mixed: 0, not_found: 0, failed: 0 } }));',
 		'else {',
 		'  const taskPath = process.argv[process.argv.indexOf("--task") + 1];',
 		'  const taskId = taskPath.split("/").at(-1).replace(/\\.md$/, "");',
@@ -1198,7 +1198,7 @@ try {
 	let managerProcessFailure;
 	let reconcileOutput = { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "not-found", archived: false };
 	let reconcileBatchOutput = {
-		ok: true, command: "task-reconcile-pr", scope: "all", scanned: 5,
+		ok: true, command: "task-reconcile-pr", scope: "all", scanned: 7,
 		results: [{
 			task_id: "batch-closed", state: "closed", archived: false, url: "https://github.com/acme/repo/pull/11", number: 11,
 		}, {
@@ -1209,9 +1209,20 @@ try {
 		}, {
 			task_id: "batch-missing", state: "not-found", archived: false,
 		}, {
+			task_id: "batch-mixed", state: "mixed", archived: false, references: [
+				{ kind: "issue", state: "closed", url: "https://github.com/acme/repo/issues/14", number: 14 },
+				{ kind: "pull-request", state: "open", url: "https://github.com/acme/repo/pull/15", number: 15 },
+			],
+		}, {
 			task_id: "batch-open", state: "open", archived: false, url: "https://github.com/acme/repo/pull/13", number: 13,
+		}, {
+			task_id: "batch-terminal", state: "terminal", archived: true, references: [
+				{ kind: "issue", state: "closed", url: "https://github.a8c.com/acme/repo/issues/16", number: 16 },
+				{ kind: "pull-request", state: "merged", url: "https://github.a8c.com/acme/repo/pull/17", number: 17,
+					merged_at: "2026-08-03T15:00:00.123Z", merge_commit: "b".repeat(64) },
+			], checkout_mode: "repository", slot_state: null, replay: false,
 		}],
-		summary: { merged: 1, open: 1, closed: 1, not_found: 1, failed: 1 },
+		summary: { archived: 2, merged: 1, closed: 1, terminal: 1, open: 1, mixed: 1, not_found: 1, failed: 1 },
 	};
 	const managerRun = async (executable, args, options) => {
 		managerProcessCalls.push({ executable, args, options });
@@ -1309,7 +1320,7 @@ try {
 			task_id: "window-exhausted", state: "error", archived: false,
 			error: "pull request reconciliation scan time budget exhausted",
 		}],
-		summary: { merged: 0, open: 1, closed: 0, not_found: 0, failed: 1 },
+		summary: { archived: 0, merged: 0, closed: 0, terminal: 0, open: 1, mixed: 0, not_found: 0, failed: 1 },
 	};
 	const delayedExecutor = await ManagerControlExecutor.create(managerExecutorRoot, {
 		environment: validManagerEnvironment,
@@ -1366,7 +1377,7 @@ try {
 	assert.equal(clearedDelayedTimer, delayedInteractionTimer,
 		"settled delayed canonical execution must clear the Discord interaction timer");
 	assert.deepEqual(delayedReplies.map((reply) => reply.content), [
-		"✅ Reconciled 2 tasks: 0 merged, 1 open, 0 closed, 0 not found, 1 failed. Failed: @window-exhausted.",
+		"✅ Reconciled 2 tasks: 0 archived, 1 open, 0 terminal, 0 not found, 1 failed. Failed: @window-exhausted.",
 	], "canonical partial results must win the timeout race and remain visible");
 	for (const action of ["handoff", "takeback", "archive", "merge-and-archive"]) {
 		assert.equal((await managerExecutor.execute({ requestId: `executor-${action}`, action, taskId: "safe-task" }, executorCatalogue)).ok, true);
@@ -1405,7 +1416,7 @@ try {
 		requestId: "executor-reconcile-batch", action: "reconcile-pr",
 	}, executorCatalogue), {
 		ok: true,
-		message: "Reconciled 5 tasks: 1 merged, 1 open, 1 closed, 1 not found, 1 failed. Failed: @batch-failed.",
+		message: "Reconciled 7 tasks: 2 archived, 1 open, 3 terminal, 1 not found, 1 failed. Failed: @batch-failed.",
 	}, "taskless reconcile-pr must summarize every canonical batch state");
 	const validReconcileBatchOutput = structuredClone(reconcileBatchOutput);
 	const manyFailedResults = Array.from({ length: 12 }, (_, index) => ({
@@ -1414,7 +1425,7 @@ try {
 	reconcileBatchOutput = {
 		ok: true, command: "task-reconcile-pr", scope: "all", scanned: manyFailedResults.length,
 		results: manyFailedResults,
-		summary: { merged: 0, open: 0, closed: 0, not_found: 0, failed: manyFailedResults.length },
+		summary: { archived: 0, merged: 0, closed: 0, terminal: 0, open: 0, mixed: 0, not_found: 0, failed: manyFailedResults.length },
 	};
 	const boundedBatch = await managerExecutor.execute({
 		requestId: "executor-reconcile-batch-bounded", action: "reconcile-pr",
@@ -1422,12 +1433,41 @@ try {
 	assert.match(boundedBatch.message, /Failed: @failed-task-1,.*@failed-task-10, … 2 more\.$/,
 		"batch summaries must bound failed task IDs");
 	assert.doesNotMatch(boundedBatch.message, /@failed-task-11/, "bounded batch summaries must omit excess failed task IDs");
+	const referencedReconcileCases = [{
+		output: { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "closed", archived: true,
+			references: [{ kind: "issue", state: "closed", url: "https://github.com/acme/repo/issues/21", number: 21 }],
+			checkout_mode: "repository", slot_state: null, replay: false },
+		message: "@safe-task: 1 GitHub reference reconciled; task archived.",
+	}, {
+		output: { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "open", archived: false,
+			references: [{ kind: "issue", state: "open", url: "https://github.com/acme/repo/issues/22", number: 22 }] },
+		message: "@safe-task: 1 GitHub reference reconciled; task retained (open).",
+	}, {
+		output: { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "mixed", archived: false,
+			references: [
+				{ kind: "issue", state: "closed", url: "https://github.com/acme/repo/issues/23", number: 23 },
+				{ kind: "pull-request", state: "open", url: "https://github.com/acme/repo/pull/24", number: 24 },
+			] },
+		message: "@safe-task: 2 GitHub references reconciled; task retained (mixed).",
+	}, {
+		output: { ok: true, command: "task-reconcile-pr", task_id: "safe-task", state: "merged", archived: true,
+			references: [{ kind: "pull-request", state: "merged", url: "https://github.a8c.com/acme/repo/pull/25", number: 25,
+				merged_at: "2026-08-04T16:00:00Z", merge_commit: "c".repeat(40) }] },
+		message: "@safe-task: 1 GitHub reference reconciled; task archived.",
+	}];
+	for (const [index, reconcileCase] of referencedReconcileCases.entries()) {
+		reconcileOutput = reconcileCase.output;
+		assert.deepEqual(await managerExecutor.execute({
+			requestId: `executor-reconcile-referenced-${index}`, action: "reconcile-pr", taskId: "safe-task",
+		}, executorCatalogue), { ok: true, message: reconcileCase.message });
+	}
 	const managerActionCalls = managerProcessCalls.filter((call) =>
 		call.args.at(-1) !== "validate" && call.args[1] !== "github-status-refresh");
 	assert.deepEqual(managerActionCalls.map((call) => call.args[1]), [
 		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive",
 		"task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr",
-		"task-reconcile-pr", "task-reconcile-pr",
+		"task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr",
+		"task-reconcile-pr",
 	], "Discord controls must route only through canonical manager CLI composites");
 	assert.ok(managerActionCalls[2].args.includes("--completion-authorized"), "archive must carry explicit non-merge completion authorization");
 	assert.equal(managerActionCalls[3].args.includes("--completion-authorized"), false,
@@ -1586,7 +1626,7 @@ try {
 		"canonical stale/removed target refusals must never call deliverAsk");
 	assert.equal(managerProcessCalls.filter((call) => [
 		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive", "task-reconcile-pr",
-	].includes(call.args[1])).length, 11, "ask must not invoke or mutate manager lifecycle state");
+	].includes(call.args[1])).length, 15, "ask must not invoke or mutate manager lifecycle state");
 	const callsBeforeStale = managerProcessCalls.length;
 	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-stale", action: "archive", taskId: "missing-task" }, executorCatalogue), {
 		ok: false,
@@ -1633,7 +1673,38 @@ try {
 		}, executorCatalogue), { ok: false, message: "reconcile-pr returned conflicting manager output." },
 		`reconcile-pr success schema adversary ${index} must fail closed`);
 	}
-	const emptyBatchSummary = { merged: 0, open: 0, closed: 0, not_found: 0, failed: 0 };
+	const validOpenReferencedOutput = referencedReconcileCases[1].output;
+	const validOpenIssue = validOpenReferencedOutput.references[0];
+	const validMergedReferencedOutput = referencedReconcileCases[3].output;
+	const validMergedReference = validMergedReferencedOutput.references[0];
+	const conflictingReferencedOutputs = [
+		{ ...validOpenReferencedOutput, state: "not-found" },
+		{ ...validOpenReferencedOutput, references: [] },
+		{ ...validOpenReferencedOutput, references: Array.from({ length: 6 }, () => validOpenIssue) },
+		{ ...validOpenReferencedOutput, references: [{ ...validOpenIssue, kind: "repository" }] },
+		{ ...validOpenReferencedOutput, references: [{ ...validOpenIssue, state: "merged" }] },
+		{ ...validOpenReferencedOutput, references: [{ ...validOpenIssue, url: "https://example.test/acme/repo/issues/22" }] },
+		{ ...validOpenReferencedOutput, references: [{ ...validOpenIssue, url: "https://github.com/acme/repo/pull/22" }] },
+		{ ...validOpenReferencedOutput, references: [{ ...validOpenIssue, url: "https://github.com/acme/repo/issues/23" }] },
+		{ ...validOpenReferencedOutput, references: [{ ...validOpenIssue, url: `${validOpenIssue.url}/` }] },
+		{ ...validOpenReferencedOutput, references: [{ ...validOpenIssue, number: 0 }] },
+		{ ...validMergedReferencedOutput, references: [{ ...validMergedReference, merged_at: undefined }] },
+		{ ...validMergedReferencedOutput, references: [{ ...validMergedReference, merge_commit: "bad" }] },
+		{ ...validOpenReferencedOutput, references: [{ ...validOpenIssue,
+			merged_at: "2026-08-04T16:00:00Z", merge_commit: "d".repeat(40) }] },
+		{ ...validOpenReferencedOutput, references: [{ ...validOpenIssue, unexpected: true }] },
+		{ ...validOpenReferencedOutput, replay: false },
+		{ ...validMergedReferencedOutput, unexpected: true },
+		{ ...validMergedReferencedOutput, replay: "false" },
+	];
+	for (const [index, output] of conflictingReferencedOutputs.entries()) {
+		reconcileOutput = output;
+		assert.deepEqual(await managerExecutor.execute({
+			requestId: `executor-reconcile-referenced-conflict-${index}`, action: "reconcile-pr", taskId: "safe-task",
+		}, executorCatalogue), { ok: false, message: "reconcile-pr returned conflicting manager output." },
+		`referenced reconcile-pr schema adversary ${index} must fail closed`);
+	}
+	const emptyBatchSummary = { archived: 0, merged: 0, closed: 0, terminal: 0, open: 0, mixed: 0, not_found: 0, failed: 0 };
 	const conflictingBatchOutputs = [
 		{ ...validReconcileBatchOutput, ok: false },
 		{ ...validReconcileBatchOutput, command: "wrong-command" },
@@ -1642,8 +1713,10 @@ try {
 		{ ...validReconcileBatchOutput, scanned: 4 },
 		{ ...validReconcileBatchOutput, results: "invalid" },
 		{ ...validReconcileBatchOutput, summary: { ...validReconcileBatchOutput.summary, failed: 2 } },
+		{ ...validReconcileBatchOutput, summary: { ...validReconcileBatchOutput.summary, archived: 1 } },
+		{ ...validReconcileBatchOutput, summary: { ...validReconcileBatchOutput.summary, mixed: 0 } },
 		{ ...validReconcileBatchOutput, summary: { ...validReconcileBatchOutput.summary, unexpected: 0 } },
-		{ ...validReconcileBatchOutput, results: [...validReconcileBatchOutput.results, validReconcileBatchOutput.results[0]], scanned: 6,
+		{ ...validReconcileBatchOutput, results: [...validReconcileBatchOutput.results, validReconcileBatchOutput.results[0]], scanned: 8,
 			summary: { ...validReconcileBatchOutput.summary, closed: 2 } },
 		{ ok: true, command: "task-reconcile-pr", scope: "all", scanned: 1,
 			results: [{ task_id: "bad-open", state: "open", archived: false, url: "https://example.test/pr/1" }],
@@ -3955,11 +4028,11 @@ try {
 		requestId: "manager-end-to-end-reconcile-all",
 		channelId: managerSummaryMapping.threadId,
 		action: "reconcile-pr",
-	}), { ok: true, message: "Reconciled 0 tasks: 0 merged, 0 open, 0 closed, 0 not found, 0 failed." });
+	}), { ok: true, message: "Reconciled 0 tasks: 0 archived, 0 open, 0 terminal, 0 not found, 0 failed." });
 	assert.deepEqual(managerHistory().at(-1).data, {
 		action: "reconcile-pr",
 		ok: true,
-		message: "Reconciled 0 tasks: 0 merged, 0 open, 0 closed, 0 not found, 0 failed.",
+		message: "Reconciled 0 tasks: 0 archived, 0 open, 0 terminal, 0 not found, 0 failed.",
 	}, "taskless manager results must omit taskId while preserving the final result");
 	await writeFile(join(managerFixture, "bin", "manager.mjs"), [
 		'import { readFileSync } from "node:fs";',
