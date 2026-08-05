@@ -475,6 +475,7 @@ export class DiscordJsTransport implements DiscordTransport {
 			nonce,
 			enforceNonce: true,
 			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
 		});
 		return message.id;
 	}
@@ -501,6 +502,7 @@ export class DiscordJsTransport implements DiscordTransport {
 			content: presentation.content,
 			components: presentationComponents(presentation),
 			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
 		});
 	}
 

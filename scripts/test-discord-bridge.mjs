@@ -8,7 +8,7 @@ import { chmod, mkdir, mkdtemp, open, readFile, realpath, rm, stat, symlink, uti
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { ChannelType } from "discord.js";
+import { ChannelType, MessageFlags } from "discord.js";
 
 const root = resolve(import.meta.dirname, "..");
 const output = await mkdtemp(join(root, ".discord-bridge-test-"));
@@ -931,6 +931,69 @@ try {
 			{ type: 2, emoji: undefined, custom_id: `m:${"7".repeat(64)}:github-status-refresh`, label: "Exact manager label", style: 2 },
 			{ type: 2, emoji: undefined, custom_id: `m:${"7".repeat(64)}:github-task-reconcile`, label: "Reconcile Tasks", style: 2 },
 		] }], "Discord components must preserve both manager labels and revision-fenced IDs");
+	const transportPresentation = { schemaVersion: 1, revision: "8".repeat(64), content: "GitHub: https://example.com/task @everyone",
+		controls: [{ id: "github-status-refresh", label: "Refresh", style: "secondary", command: "github-status-refresh" }],
+		degraded: false, warnings: [] };
+	const presentationSendPayloads = [];
+	const presentationEditPayloads = [];
+	const presentationTransport = new DiscordJsTransport();
+	const presentationMessage = {
+		author: { id: "bot-user" },
+		async edit(payload) { presentationEditPayloads.push(payload); },
+	};
+	presentationTransport.readyClient = () => ({ user: { id: "bot-user" } });
+	presentationTransport.textChannel = async () => ({
+		async send(payload) { presentationSendPayloads.push(payload); return { id: "presentation-message" }; },
+		messages: { async fetch(messageId) {
+			assert.equal(messageId, "presentation-message");
+			return presentationMessage;
+		} },
+	});
+	assert.equal(await presentationTransport.sendPresentation(
+		"project-channel", transportPresentation, "presentation-nonce",
+	), "presentation-message");
+	await presentationTransport.editOwnPresentation("project-channel", "presentation-message", transportPresentation);
+	const normalizePresentationPayload = (payload) => ({
+		...payload,
+		components: payload.components.map((row) => row.toJSON()),
+	});
+	const expectedPresentationPayload = {
+		content: transportPresentation.content,
+		components: presentationComponents(transportPresentation).map((row) => row.toJSON()),
+		allowedMentions: { parse: [] },
+		flags: MessageFlags.SuppressEmbeds,
+	};
+	assert.deepEqual(normalizePresentationPayload(presentationSendPayloads[0]), {
+		...expectedPresentationPayload,
+		nonce: "presentation-nonce",
+		enforceNonce: true,
+	}, "manager presentation creates must suppress embeds without changing content, controls, nonce, or mention safety");
+	assert.deepEqual(normalizePresentationPayload(presentationEditPayloads[0]), expectedPresentationPayload,
+		"manager presentation edits must retain embed suppression, content, controls, and mention safety");
+	const ordinarySendPayloads = [];
+	const ordinaryEditPayloads = [];
+	const ordinaryMessage = { author: { id: "bot-user" }, async edit(payload) { ordinaryEditPayloads.push(payload); } };
+	const ordinaryChannel = {
+		isTextBased: () => true,
+		isDMBased: () => false,
+		async send(payload) { ordinarySendPayloads.push(payload); return { id: "ordinary-message" }; },
+		messages: { async fetch() { return ordinaryMessage; } },
+	};
+	const ordinaryTransport = new DiscordJsTransport();
+	ordinaryTransport.readyClient = () => ({ user: { id: "bot-user" }, channels: { async fetch() { return ordinaryChannel; } } });
+	ordinaryTransport.textChannel = async () => ordinaryChannel;
+	assert.equal(await ordinaryTransport.sendText("session-thread", "ordinary https://example.com", "ordinary-nonce"), "ordinary-message");
+	await ordinaryTransport.editOwnText("session-thread", "ordinary-message", "edited ordinary https://example.com");
+	assert.deepEqual(ordinarySendPayloads, [{
+		content: "ordinary https://example.com",
+		nonce: "ordinary-nonce",
+		enforceNonce: true,
+		allowedMentions: { parse: [] },
+	}], "ordinary project and session sends must retain automatic embeds");
+	assert.deepEqual(ordinaryEditPayloads, [{
+		content: "edited ordinary https://example.com",
+		allowedMentions: { parse: [] },
+	}], "ordinary edits must retain automatic embeds");
 	const managerDefinition = managerCommandDefinition();
 	assert.equal(managerDefinition.name, "m");
 	const commandRegistrationEvents = [];
