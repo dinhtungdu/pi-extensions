@@ -377,7 +377,12 @@ try {
 		MANAGER_CONTROL_PROCESS_TIMEOUT_MS,
 		ManagerControlExecutor,
 	} = await importBuilt("extensions/discord/manager-controls.js");
-	const { isEligibleManagerTaskSummaryProducer, LocalRelayHost, MANAGER_CONTROL_IPC_TIMEOUT_MS } = await importBuilt("extensions/discord/relay-host.js");
+	const {
+		isEligibleManagerTaskSummaryProducer,
+		LEGACY_MANAGER_SUMMARY_FRESHNESS_TIMEOUT_MS,
+		LocalRelayHost,
+		MANAGER_CONTROL_IPC_TIMEOUT_MS,
+	} = await importBuilt("extensions/discord/relay-host.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const {
@@ -2030,6 +2035,101 @@ try {
 	}), { ok: false, message: "This Discord thread is not mapped to a Pi session." });
 	await managerControlCore.stop();
 
+	async function verifySummaryTransportOwnerFence(kind, retryFirst = false) {
+		const channelId = `summary-fence-${kind}`;
+		FakeGateway.channelMessages.delete(channelId);
+		const fenceState = new DiscordStateStore(join(dataDir, `summary-fence-${kind}.json`));
+		const fenceGateway = new FakeGateway();
+		fenceGateway.ensureProjectChannel = async () => channelId;
+		const fenceCore = new DiscordRelayCore(
+			{ token: "token", guildId: "12345", epoch: 1 },
+			fenceState,
+			fenceGateway,
+		);
+		await fenceCore.start();
+		for (const producer of ["old", "new"]) {
+			await fenceCore.prepareRegistration(`${producer}-${kind}-client`, `${producer}-${kind}-generation`, {
+				cwd: "/the-manager",
+				projectIdentityResolved: true,
+				sessionId: `${producer}-${kind}-session`,
+			});
+			await fenceCore.activateRegistration(
+				`${producer}-${kind}-client`,
+				`${producer}-${kind}-generation`,
+				`${producer}-${kind}-session`,
+				() => true,
+				undefined,
+				false,
+				undefined,
+				true,
+			);
+		}
+		await fenceCore.queueProjectSummary(`old-${kind}-client`, `old-${kind}-generation`, `old-${kind}-session`, `seed ${kind}`);
+		await waitFor(() => FakeGateway.channelMessages.get(channelId)?.at(-1)?.text === `seed ${kind}`, `${kind} fence seed`);
+		const seedId = FakeGateway.channelMessages.get(channelId).at(-1).id;
+		if (kind === "send") {
+			await fenceGateway.deleteOwnText(channelId, seedId);
+			await fenceState.recordProjectSummaryDeleted("/the-manager", seedId);
+		} else if (kind === "delete") {
+			FakeGateway.channelMessages.get(channelId).push({ id: `human-${kind}`, text: "displacing message", botOwned: false });
+		}
+
+		const method = kind === "send" ? "sendText" : kind === "edit" ? "editOwnText" : "deleteOwnText";
+		const original = fenceGateway[method].bind(fenceGateway);
+		const order = [];
+		let oldAttempts = 0;
+		let releaseOldOperation;
+		let oldOperationStarted;
+		const oldOperation = new Promise((resolveStarted) => { oldOperationStarted = resolveStarted; });
+		fenceGateway[method] = async (...args) => {
+			const oldMutation = kind === "send" ? args[1] === `old ${kind}` : kind === "edit" ? args[2] === `old ${kind}` : true;
+			if (!oldMutation) return original(...args);
+			oldAttempts++;
+			if (retryFirst && oldAttempts === 1) throw new Error(`injected ${kind} retry failure`);
+			oldOperationStarted();
+			await new Promise((resolveOperation) => { releaseOldOperation = resolveOperation; });
+			const result = await original(...args);
+			order.push("old-operation-settled");
+			return result;
+		};
+
+		const retryKeepAlive = retryFirst ? setTimeout(() => {}, 1_000) : undefined;
+		await fenceCore.queueProjectSummary(
+			`old-${kind}-client`,
+			`old-${kind}-generation`,
+			`old-${kind}-session`,
+			`old ${kind}`,
+		);
+		await oldOperation;
+		if (retryKeepAlive) clearTimeout(retryKeepAlive);
+		fenceCore.unregisterClient(`old-${kind}-client`, `old-${kind}-generation`);
+		let newPublicationSettled = false;
+		const newPublication = fenceCore.queueProjectSummary(
+			`new-${kind}-client`,
+			`new-${kind}-generation`,
+			`new-${kind}-session`,
+			`new ${kind}`,
+		).then(() => {
+			newPublicationSettled = true;
+			order.push("new-publication-settled");
+		});
+		await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+		assert.equal(newPublicationSettled, false, `${kind} owner promotion must wait for the old transport operation`);
+		assert.equal((await fenceState.projectSummaries())[0].summary.desiredText, `old ${kind}`,
+			`${kind} owner state must not advance while the old generation can still side-effect Discord`);
+		releaseOldOperation();
+		await newPublication;
+		assert.ok(order.indexOf("old-operation-settled") < order.indexOf("new-publication-settled"),
+			`${kind} old-generation mutation must settle before new-owner publication`);
+		await waitFor(() => FakeGateway.channelMessages.get(channelId)?.at(-1)?.text === `new ${kind}`,
+			`${kind} new-owner reconciliation`);
+		await fenceCore.stop();
+	}
+
+	await verifySummaryTransportOwnerFence("send");
+	await verifySummaryTransportOwnerFence("edit", true);
+	await verifySummaryTransportOwnerFence("delete");
+
 	FakeGateway.channelMessages.delete("summary-channel");
 	FakeGateway.summaryEvents.length = 0;
 	const summaryStateFile = join(dataDir, "project-summary-state.json");
@@ -2911,16 +3011,42 @@ try {
 		"new relays must negotiate summary support with structurally verified old manager clients");
 	assert.equal(oldClientActivatedAsProducer, true);
 	oldClientSocket.write(`${JSON.stringify({ type: "project_summary", requestId: "old-cached-summary", text: "cached stale" })}\n`);
-	await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-	assert.deepEqual(oldClientSummaryFrames, [],
-		"an old client's cached reconnect frame must wait for a post-registration canonical catalogue refresh");
+	await waitFor(() => oldClientServerFrames.some((frame) =>
+		frame.type === "project_summary_queued" && frame.requestId === "old-cached-summary"), "cached legacy summary staging");
+	oldClientSocket.write(`${JSON.stringify({ type: "project_summary", requestId: "old-fresh-summary", text: "fresh canonical" })}\n`);
+	await waitFor(() => oldClientServerFrames.some((frame) =>
+		frame.type === "project_summary_queued" && frame.requestId === "old-fresh-summary"), "fresh legacy summary staging");
+	assert.equal(oldClientServerFrames.some((frame) => frame.type === "error" &&
+		(frame.requestId === "old-cached-summary" || frame.requestId === "old-fresh-summary")), false,
+		"a cached legacy request must not block or reject the actual fresh summary");
+	assert.deepEqual(oldClientSummaryFrames, [], "legacy summary candidates must not publish before their catalogue proof");
 	oldClientSocket.write(`${JSON.stringify({
 		type: "manager_catalogue", requestId: "old-fresh-catalogue", taskCatalogue: [], projectCatalogue: [],
 	})}\n`);
-	await waitFor(() => oldClientServerFrames.some((frame) => frame.type === "project_summary_queued"),
-		"old client summary freshness proof");
-	assert.deepEqual(oldClientSummaryFrames, ["cached stale"],
-		"a post-registration canonical catalogue frame must release an old eligible producer's pending summary");
+	await waitFor(() => oldClientSummaryFrames.length === 1, "old client fresh summary correlation");
+	assert.deepEqual(oldClientSummaryFrames, ["fresh canonical"],
+		"a catalogue refresh must authorize only the latest corresponding fresh legacy summary");
+
+	oldClientSocket.write(`${JSON.stringify({ type: "project_summary", requestId: "old-expired-summary", text: "expired candidate" })}\n`);
+	await waitFor(() => oldClientServerFrames.some((frame) =>
+		frame.type === "project_summary_queued" && frame.requestId === "old-expired-summary"), "expiring legacy summary staging");
+	await new Promise((resolveWait) => setTimeout(resolveWait, LEGACY_MANAGER_SUMMARY_FRESHNESS_TIMEOUT_MS + 50));
+	oldClientSocket.write(`${JSON.stringify({
+		type: "manager_catalogue", requestId: "old-late-catalogue", taskCatalogue: [], projectCatalogue: [],
+	})}\n`);
+	await waitFor(() => oldClientServerFrames.some((frame) =>
+		frame.type === "manager_catalogue_updated" && frame.requestId === "old-late-catalogue"), "late legacy catalogue");
+	assert.deepEqual(oldClientSummaryFrames, ["fresh canonical"],
+		"a later catalogue must not release an expired legacy summary candidate");
+	oldClientSocket.write(`${JSON.stringify({ type: "project_summary", requestId: "old-retry-summary", text: "retry fresh" })}\n`);
+	await waitFor(() => oldClientServerFrames.some((frame) =>
+		frame.type === "project_summary_queued" && frame.requestId === "old-retry-summary"), "legacy summary retry staging");
+	oldClientSocket.write(`${JSON.stringify({
+		type: "manager_catalogue", requestId: "old-retry-catalogue", taskCatalogue: [], projectCatalogue: [],
+	})}\n`);
+	await waitFor(() => oldClientSummaryFrames.length === 2, "legacy summary retry correlation");
+	assert.deepEqual(oldClientSummaryFrames, ["fresh canonical", "retry fresh"],
+		"an expired candidate must not consume the next summary/catalogue retry pair");
 	oldClientSocket.end();
 	await oldClientHost.stop();
 

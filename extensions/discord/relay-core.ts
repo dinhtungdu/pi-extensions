@@ -151,6 +151,8 @@ export class DiscordRelayCore {
 	private readonly summaryRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly summaryAuthorizations = new Map<string, SummaryAuthorization>();
 	private readonly summaryRevisions = new Map<string, number>();
+	private readonly summaryOwners = new Map<string, ActiveSession>();
+	private readonly summaryOwnerRetirements = new Map<string, Promise<void>>();
 	private readonly recentlyDisconnectedSessions = new Set<string>();
 	private nextSummaryProducerOrder = 0;
 	private cancelStateCompaction: (() => void) | undefined;
@@ -278,7 +280,10 @@ export class DiscordRelayCore {
 		this.summaryAuthorizations.clear();
 		this.summaryRevisions.clear();
 		await Promise.allSettled(this.summaryReconciliations.values());
+		await Promise.allSettled(this.summaryOwnerRetirements.values());
 		this.summaryReconciliations.clear();
+		this.summaryOwners.clear();
+		this.summaryOwnerRetirements.clear();
 		await this.transport.disconnect();
 		if (compactionError) throw compactionError;
 	}
@@ -384,6 +389,12 @@ export class DiscordRelayCore {
 			if (!this.deliverMessage(active, message)) break;
 		}
 		if (this.inboundCursorBlockedSessions.has(sessionId)) this.scheduleInboundRetry(sessionId);
+		if (managerTaskSummaryProducer) {
+			if (replaced && this.summaryOwners.get(active.cwd) === replaced) this.retireManagerTaskSummaryOwner(active.cwd, replaced);
+			else if (!this.summaryOwners.has(active.cwd) && !this.summaryOwnerRetirements.has(active.cwd)) {
+				this.summaryOwners.set(active.cwd, active);
+			}
+		}
 		void this.drainOutbound().catch(this.onTerminalError);
 	}
 
@@ -402,11 +413,7 @@ export class DiscordRelayCore {
 				if (this.activeThreadSessions.get(active.threadId) === sessionId) this.activeThreadSessions.delete(active.threadId);
 				this.clearOutboundRetry(sessionId);
 				this.cancelInboundRetry(sessionId);
-				const authorization = this.summaryAuthorizations.get(active.cwd);
-				if (authorization?.owner === active) {
-					this.summaryAuthorizations.delete(active.cwd);
-					this.clearProjectSummaryRetry(active.cwd);
-				}
+				if (this.summaryOwners.get(active.cwd) === active) this.retireManagerTaskSummaryOwner(active.cwd, active);
 			}
 		}
 		if (![...this.activeSessions.values()].some((active) => active.clientId === clientId)) this.clientSessions.delete(clientId);
@@ -638,21 +645,22 @@ export class DiscordRelayCore {
 		if (!text || text.length > 2_000) throw new Error("Discord project summary must contain 1-2000 characters");
 		const active = this.activeSessions.get(sessionId)!;
 		if (!active.managerTaskSummaryProducer) throw new Error("Local client is not registered as a manager task-summary producer");
-		if (this.managerTaskSummaryOwner(active.cwd)?.[1] !== active) return;
-		// Publish the next revision only after the previous owner's Discord operation settles,
-		// so a completed stale operation is always ordered before the newer state.
+		await this.summaryOwnerRetirements.get(active.cwd)?.catch(() => {});
+		if (this.summaryOwners.get(active.cwd) !== active) return;
+		// Publish the next revision only after the current owner's Discord operation settles,
+		// so a completed transport mutation is always ordered before the newer state.
 		await this.summaryReconciliations.get(active.cwd)?.catch(() => {});
-		if (this.managerTaskSummaryOwner(active.cwd)?.[1] !== active) return;
+		if (this.summaryOwners.get(active.cwd) !== active) return;
 		let revision = (this.summaryRevisions.get(active.cwd) ?? 0) + 1;
 		this.summaryRevisions.set(active.cwd, revision);
 		let update = await this.state.setProjectSummaryDesired(sessionId, text, revision);
 		if (!update.accepted && update.revision >= revision &&
-			this.managerTaskSummaryOwner(active.cwd)?.[1] === active && this.summaryRevisions.get(active.cwd) === revision) {
+			this.summaryOwners.get(active.cwd) === active && this.summaryRevisions.get(active.cwd) === revision) {
 			revision = update.revision + 1;
 			this.summaryRevisions.set(active.cwd, revision);
 			update = await this.state.setProjectSummaryDesired(sessionId, text, revision);
 		}
-		if (!update.accepted || this.managerTaskSummaryOwner(active.cwd)?.[1] !== active ||
+		if (!update.accepted || this.summaryOwners.get(active.cwd) !== active ||
 			this.summaryRevisions.get(active.cwd) !== revision) return;
 		this.summaryAuthorizations.set(active.cwd, { owner: active, revision });
 		this.clearProjectSummaryRetry(active.cwd);
@@ -685,17 +693,35 @@ export class DiscordRelayCore {
 		void this.drainOutbound().catch(this.onTerminalError);
 	}
 
-	private managerTaskSummaryOwner(cwd: string): [string, ActiveSession] | undefined {
+	private electManagerTaskSummaryOwner(cwd: string): ActiveSession | undefined {
 		return [...this.activeSessions.entries()]
 			.filter(([, active]) => active.managerTaskSummaryProducer && active.cwd === cwd)
 			.sort(([leftId, left], [rightId, right]) =>
-				left.summaryProducerOrder - right.summaryProducerOrder || leftId.localeCompare(rightId))[0];
+				left.summaryProducerOrder - right.summaryProducerOrder || leftId.localeCompare(rightId))[0]?.[1];
+	}
+
+	private retireManagerTaskSummaryOwner(cwd: string, owner: ActiveSession): void {
+		if (this.summaryOwners.get(cwd) !== owner || this.summaryOwnerRetirements.has(cwd)) return;
+		const authorization = this.summaryAuthorizations.get(cwd);
+		if (authorization?.owner === owner) this.summaryAuthorizations.delete(cwd);
+		this.clearProjectSummaryRetry(cwd);
+		const settlement = this.summaryReconciliations.get(cwd) ?? Promise.resolve();
+		let retirement: Promise<void>;
+		retirement = settlement.catch(() => {}).then(() => {
+			if (this.summaryOwners.get(cwd) !== owner) return;
+			const next = this.electManagerTaskSummaryOwner(cwd);
+			if (next) this.summaryOwners.set(cwd, next);
+			else this.summaryOwners.delete(cwd);
+		}).finally(() => {
+			if (this.summaryOwnerRetirements.get(cwd) === retirement) this.summaryOwnerRetirements.delete(cwd);
+		});
+		this.summaryOwnerRetirements.set(cwd, retirement);
 	}
 
 	private isCurrentSummaryAuthorization(cwd: string, authorization: SummaryAuthorization): boolean {
 		return this.started && this.summaryAuthorizations.get(cwd) === authorization &&
 			this.summaryRevisions.get(cwd) === authorization.revision &&
-			this.managerTaskSummaryOwner(cwd)?.[1] === authorization.owner;
+			this.summaryOwners.get(cwd) === authorization.owner && !this.summaryOwnerRetirements.has(cwd);
 	}
 
 	private scheduleProjectSummaryReconciliation(cwd: string): void {

@@ -30,8 +30,7 @@ interface SocketState {
 	registered: boolean;
 	managerControls: boolean;
 	legacyManagerTaskSummaryProducer: boolean;
-	managerCatalogueUpdates: number;
-	pendingLegacyProjectSummary?: { requestId: string; text: string };
+	legacyProjectSummaryCandidate?: { requestId: string; text: string; timer: ReturnType<typeof setTimeout> };
 	buffer: string;
 	queue: Promise<void>;
 	queuedInputFrames: number;
@@ -48,6 +47,7 @@ interface SocketState {
 const ZERO_CLIENT_GRACE_MS = 1_000;
 const SESSION_CONTROL_TIMEOUT_MS = 10_000;
 export const MANAGER_CONTROL_IPC_TIMEOUT_MS = 170_000;
+export const LEGACY_MANAGER_SUMMARY_FRESHNESS_TIMEOUT_MS = 1_000;
 
 export function isEligibleManagerTaskSummaryProducer(
 	cwd: string,
@@ -167,7 +167,6 @@ export class LocalRelayHost {
 			registered: false,
 			managerControls: false,
 			legacyManagerTaskSummaryProducer: false,
-			managerCatalogueUpdates: 0,
 			buffer: "",
 			queue: Promise.resolve(),
 			queuedInputFrames: 0,
@@ -221,6 +220,8 @@ export class LocalRelayHost {
 				pending.reject(new Error("Pi session disconnected while executing a Discord control"));
 			}
 			state.pendingControls.clear();
+			if (state.legacyProjectSummaryCandidate) clearTimeout(state.legacyProjectSummaryCandidate.timer);
+			state.legacyProjectSummaryCandidate = undefined;
 			this.sockets.delete(socket);
 			this.socketStates.delete(socket);
 			if (state.registered) {
@@ -340,25 +341,19 @@ export class LocalRelayHost {
 					parsed.taskCatalogue,
 					parsed.projectCatalogue,
 				);
-				state.managerCatalogueUpdates++;
 			} catch (error) {
 				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
 				return;
 			}
 			this.write(state, { type: "manager_catalogue_updated", requestId: parsed.requestId });
-			const pendingSummary = state.pendingLegacyProjectSummary;
-			if (!pendingSummary) return;
-			state.pendingLegacyProjectSummary = undefined;
+			const candidate = state.legacyProjectSummaryCandidate;
+			if (!candidate) return;
+			clearTimeout(candidate.timer);
+			state.legacyProjectSummaryCandidate = undefined;
 			try {
-				await this.options.core.queueProjectSummary(
-					clientId,
-					generation,
-					sessionId,
-					pendingSummary.text,
-				);
-				this.write(state, { type: "project_summary_queued", requestId: pendingSummary.requestId });
+				await this.options.core.queueProjectSummary(clientId, generation, sessionId, candidate.text);
 			} catch (error) {
-				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, pendingSummary.requestId);
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false);
 			}
 			return;
 		}
@@ -387,14 +382,19 @@ export class LocalRelayHost {
 			return;
 		}
 		if (parsed.type === "project_summary") {
-			if (state.legacyManagerTaskSummaryProducer && state.managerCatalogueUpdates === 0) {
-				if (state.pendingLegacyProjectSummary) {
-					this.fail(socket, state, "Legacy manager summary refresh is already pending", false, parsed.requestId);
-					return;
-				}
-				// Old clients publish cached text on reconnect, but a canonical producer refresh also
-				// emits a live manager_catalogue frame. Hold the summary until that freshness proof.
-				state.pendingLegacyProjectSummary = { requestId: parsed.requestId, text: parsed.text };
+			if (state.legacyManagerTaskSummaryProducer) {
+				const previous = state.legacyProjectSummaryCandidate;
+				if (previous) clearTimeout(previous.timer);
+				let candidate: NonNullable<SocketState["legacyProjectSummaryCandidate"]>;
+				const timer = setTimeout(() => {
+					if (state.legacyProjectSummaryCandidate === candidate) state.legacyProjectSummaryCandidate = undefined;
+				}, LEGACY_MANAGER_SUMMARY_FRESHNESS_TIMEOUT_MS);
+				timer.unref();
+				candidate = { requestId: parsed.requestId, text: parsed.text, timer };
+				state.legacyProjectSummaryCandidate = candidate;
+				// Acknowledge staging so an old serial publisher can submit its newer snapshot.
+				// Only the next catalogue frame consumes the latest unexpired candidate.
+				this.write(state, { type: "project_summary_queued", requestId: parsed.requestId });
 				return;
 			}
 			try {
