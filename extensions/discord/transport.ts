@@ -41,11 +41,7 @@ const MANAGER_COMMAND_NAME = "m";
 const LEGACY_MANAGER_COMMAND_NAME = "manager";
 
 export interface DiscordPresentationControlRequest {
-	requestId: string;
-	guildId?: string;
-	channelId: string;
-	messageId: string;
-	customId: string;
+	requestId: string; guildId?: string; channelId: string; messageId: string; customId: string;
 }
 
 export interface DiscordInboundMessage {
@@ -175,10 +171,7 @@ export async function collectChronologicalMessages(
 }
 
 const PRESENTATION_BUTTON_STYLES: Record<ManagerPresentationStyle, ButtonStyle> = {
-	primary: ButtonStyle.Primary,
-	secondary: ButtonStyle.Secondary,
-	success: ButtonStyle.Success,
-	danger: ButtonStyle.Danger,
+	primary: ButtonStyle.Primary, secondary: ButtonStyle.Secondary, success: ButtonStyle.Success, danger: ButtonStyle.Danger,
 };
 
 export function presentationComponents(presentation: ManagerPresentation): ActionRowBuilder<ButtonBuilder>[] {

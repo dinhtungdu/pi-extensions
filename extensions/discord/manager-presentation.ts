@@ -2,26 +2,18 @@ import { execFile } from "node:child_process";
 import { watch, type FSWatcher } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
-const RENDER_TIMEOUT_MS = 2_000;
-const MAX_OUTPUT_BYTES = 1_048_576;
-const REFRESH_DEBOUNCE_MS = 100;
-export const MAX_MANAGER_PRESENTATION_CONTENT = 2_000;
-export const MANAGER_PRESENTATION_SCHEMA_VERSION = 1;
+const RENDER_TIMEOUT_MS = 2_000, MAX_OUTPUT_BYTES = 1_048_576, REFRESH_DEBOUNCE_MS = 100;
+export const MAX_MANAGER_PRESENTATION_CONTENT = 2_000, MANAGER_PRESENTATION_SCHEMA_VERSION = 1;
 export const SUPPORTED_MANAGER_PRESENTATION_CONTROL = "github-status-refresh";
 export const MANAGER_PRESENTATION_STYLES = ["primary", "secondary", "success", "danger"] as const;
 export type ManagerPresentationStyle = typeof MANAGER_PRESENTATION_STYLES[number];
-export interface ManagerPresentationControl {
-	id: string; label: string; style: ManagerPresentationStyle; command: string;
-}
+export interface ManagerPresentationControl { id: string; label: string; style: ManagerPresentationStyle; command: string }
 export interface ManagerPresentation {
-	schemaVersion: 1; revision: string; content: string; controls: ManagerPresentationControl[];
-	degraded: boolean; warnings: string[];
+	schemaVersion: 1; revision: string; content: string; controls: ManagerPresentationControl[]; degraded: boolean; warnings: string[]
 }
-export interface ManagerPresentationCallbacks {
-	onPresentation(presentation: ManagerPresentation): void; onUnavailable(error: Error): void;
-}
+export interface ManagerPresentationCallbacks { onPresentation(presentation: ManagerPresentation): void; onUnavailable(error: Error): void }
 export interface ManagerPresentationDependencies {
-	render?: (root: string) => Promise<unknown>; watchDirectory?: (path: string, listener: () => void) => FSWatcher;
+	render?: (root: string) => Promise<unknown>; watchDirectory?: (path: string, listener: () => void) => FSWatcher
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);

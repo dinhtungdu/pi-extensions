@@ -68,7 +68,7 @@ interface ActiveSession {
 	cwd: string;
 	threadId: string;
 	managerTaskSummaryProducer: boolean;
-	managerPresentationControlIds: string[];
+	managerPresentationControlIds: string[]; managerPresentation?: ManagerPresentation;
 	summaryProducerOrder: number;
 	deliver(message: QueuedDiscordMessage): boolean;
 	deliveredIds: Set<string>;
@@ -149,7 +149,7 @@ export class DiscordRelayCore {
 	private readonly managerControlQueueDepths = new Map<string, number>();
 	private readonly inFlightManagerControls = new Map<string, Promise<PiSessionControlResult>>();
 	private readonly completedManagerControls = new Map<string, PiSessionControlResult>();
-	private readonly inFlightPresentationControls = new Map<string, { requestId: string; owner: ActiveSession; result: Promise<PiSessionControlResult> }>();
+	private readonly inFlightPresentationInteractions = new Map<string, Promise<PiSessionControlResult>>(); private readonly inFlightPresentationControls = new Map<string, { owner: ActiveSession; result: Promise<PiSessionControlResult> }>();
 	private readonly completedPresentationControls = new Map<string, PiSessionControlResult>();
 	private inboundQueue: Promise<void> = Promise.resolve();
 	private drainingOutbound = false;
@@ -286,6 +286,7 @@ export class DiscordRelayCore {
 		this.managerControlQueueDepths.clear();
 		this.inFlightManagerControls.clear();
 		this.completedManagerControls.clear();
+		this.inFlightPresentationInteractions.clear();
 		this.inFlightPresentationControls.clear();
 		this.completedPresentationControls.clear();
 		for (const timer of this.outboundRetryTimers.values()) clearTimeout(timer);
@@ -560,12 +561,26 @@ export class DiscordRelayCore {
 		});
 	}
 
-	async executeDiscordPresentationControl(request: DiscordPresentationControlRequest): Promise<PiSessionControlResult> {
+	executeDiscordPresentationControl(request: DiscordPresentationControlRequest): Promise<PiSessionControlResult> {
 		const completed = this.completedPresentationControls.get(request.requestId);
-		if (completed) return { ...completed };
-		for (const active of this.inFlightPresentationControls.values()) {
-			if (active.requestId === request.requestId) return active.result;
-		}
+		if (completed) return Promise.resolve({ ...completed });
+		const duplicate = this.inFlightPresentationInteractions.get(request.requestId); if (duplicate) return duplicate;
+		let tracked: Promise<PiSessionControlResult>;
+		const execution = this.executeCurrentPresentationControl(request).then((result) => {
+			this.completedPresentationControls.set(request.requestId, result);
+			while (this.completedPresentationControls.size > MAX_RECENT_SESSION_CONTROLS)
+				this.completedPresentationControls.delete(this.completedPresentationControls.keys().next().value!);
+			return result;
+		});
+		tracked = execution.finally(() => {
+			if (this.inFlightPresentationInteractions.get(request.requestId) === tracked)
+				this.inFlightPresentationInteractions.delete(request.requestId);
+		});
+		this.inFlightPresentationInteractions.set(request.requestId, tracked);
+		return tracked;
+	}
+
+	private async executeCurrentPresentationControl(request: DiscordPresentationControlRequest): Promise<PiSessionControlResult> {
 		if (request.guildId !== this.config.guildId) return { ok: false, message: "This manager control is not authorized." };
 		const custom = /^m:([a-f0-9]{64}):([a-z0-9-]+)$/.exec(request.customId);
 		if (!custom || custom[2] !== SUPPORTED_MANAGER_PRESENTATION_CONTROL) {
@@ -604,14 +619,8 @@ export class DiscordRelayCore {
 			}
 			return result;
 		})();
-		this.inFlightPresentationControls.set(project.cwd, { requestId: request.requestId, owner, result: execution });
-		return execution.then((result) => {
-			this.completedPresentationControls.set(request.requestId, result);
-			while (this.completedPresentationControls.size > MAX_RECENT_SESSION_CONTROLS) {
-				this.completedPresentationControls.delete(this.completedPresentationControls.keys().next().value!);
-			}
-			return result;
-		}).finally(() => {
+		this.inFlightPresentationControls.set(project.cwd, { owner, result: execution });
+		return execution.finally(() => {
 			if (this.inFlightPresentationControls.get(project.cwd)?.result === execution) {
 				this.inFlightPresentationControls.delete(project.cwd);
 			}
@@ -751,7 +760,8 @@ export class DiscordRelayCore {
 		if (presentation.controls.some((control) => !active.managerPresentationControlIds.includes(control.id))) {
 			throw new Error("Manager presentation contains an unsupported control");
 		}
-		await this.queueSummary(active, presentation.content, presentation);
+		active.managerPresentation = structuredClone(presentation);
+		if (this.summaryOwners.get(active.cwd) === active) await this.queueSummary(active, presentation.content, presentation);
 	}
 
 	private async queueSummary(active: ActiveSession, text: string, presentation?: ManagerPresentation): Promise<void> {
@@ -838,7 +848,10 @@ export class DiscordRelayCore {
 			if (next) this.summaryOwners.set(cwd, next);
 			else this.summaryOwners.delete(cwd);
 		}).finally(() => {
-			if (this.summaryOwnerRetirements.get(cwd) === retirement) this.summaryOwnerRetirements.delete(cwd);
+			if (this.summaryOwnerRetirements.get(cwd) !== retirement) return;
+			this.summaryOwnerRetirements.delete(cwd); const promoted = this.summaryOwners.get(cwd);
+			if (promoted?.managerPresentation)
+				void this.queueSummary(promoted, promoted.managerPresentation.content, promoted.managerPresentation).catch(this.onTerminalError);
 		});
 		this.summaryOwnerRetirements.set(cwd, retirement);
 	}

@@ -922,14 +922,10 @@ try {
 		taskId: "completed-task", project: "woocommerce", title: "Completed task", status: "complete",
 	}], "completed"), [], "ask targets must include only current active manager tasks");
 	const renderedPresentationComponents = presentationComponents({ schemaVersion: 1, revision: "7".repeat(64), content: "opaque",
-		controls: [{ id: "github-status-refresh", label: "Exact manager label", style: "secondary", command: "github-status-refresh" }],
-		degraded: false, warnings: [] });
-	assert.deepEqual(renderedPresentationComponents.map((row) => row.toJSON()), [{
-		type: 1,
-		components: [{ type: 2, emoji: undefined, custom_id: `m:${"7".repeat(64)}:github-status-refresh`, label: "Exact manager label", style: 2 }],
-	}], "Discord components must preserve manager labels and revision-fenced IDs");
-	assert.deepEqual(presentationComponents({ schemaVersion: 1, revision: "7".repeat(64), content: "opaque",
-		controls: [], degraded: false, warnings: [] }), [], "zero controls must remove components");
+		controls: [{ id: "github-status-refresh", label: "Exact manager label", style: "secondary", command: "github-status-refresh" }], degraded: false, warnings: [] });
+	assert.deepEqual(renderedPresentationComponents.map((row) => row.toJSON()), [{ type: 1,
+		components: [{ type: 2, emoji: undefined, custom_id: `m:${"7".repeat(64)}:github-status-refresh`, label: "Exact manager label", style: 2 }] }],
+	"Discord components must preserve manager labels and revision-fenced IDs");
 	const managerDefinition = managerCommandDefinition();
 	assert.equal(managerDefinition.name, "m");
 	const commandRegistrationEvents = [];
@@ -2698,8 +2694,8 @@ try {
 		customId: `m:${firstPresentation.revision}:github-status-refresh`,
 	};
 	const firstControl = presentationCore.executeDiscordPresentationControl(controlRequest);
-	await waitFor(() => presentationExecutions === 1, "one in-flight presentation control");
 	const duplicatePresentationControl = presentationCore.executeDiscordPresentationControl(controlRequest);
+	await waitFor(() => presentationExecutions === 1, "one atomic duplicate presentation control");
 	assert.deepEqual(await presentationCore.executeDiscordPresentationControl({ ...controlRequest, requestId: "busy-interaction" }),
 		{ ok: false, message: "A manager presentation control is already running; retry later." }, "busy click must not queue");
 	assert.equal(presentationExecutions, 1);
@@ -2730,6 +2726,12 @@ try {
 	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.revision === ownerLossPresentation.revision,
 		"owner-loss presentation delivery");
 	const ownerLossMessage = FakeGateway.channelMessages.get(presentationMapping.channelId).at(-1);
+	await presentationCore.prepareRegistration("backup-client", "backup-generation",
+		{ cwd: "/presentation-manager", projectIdentityResolved: true, sessionId: "backup-session" });
+	await presentationCore.activateRegistration("backup-client", "backup-generation", "backup-session", () => true,
+		undefined, false, undefined, true, { controlIds: ["github-status-refresh"], execute: async () => ({ ok: true, message: "backup" }) });
+	const backupPresentation = managerPresentationPayload("6".repeat(64), "backup owner payload");
+	await presentationCore.queueManagerPresentation("backup-client", "backup-generation", "backup-session", backupPresentation);
 	const ownerLossControl = presentationCore.executeDiscordPresentationControl({ requestId: "owner-loss-control", guildId: "12345",
 		channelId: presentationMapping.channelId, messageId: ownerLossMessage.id,
 		customId: `m:${ownerLossPresentation.revision}:github-status-refresh` });
@@ -2739,8 +2741,11 @@ try {
 	assert.deepEqual(await ownerLossControl, { ok: false,
 		message: "The manager presentation owner disconnected while the control was running." },
 	"owner loss must fence stale completion");
-	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.controls.length === 0,
-		"owner-loss component stripping");
+	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.revision === backupPresentation.revision, "backup owner publication");
+	assert.equal(FakeGateway.channelMessages.get(presentationMapping.channelId).filter((message) => message.botOwned).length, 1);
+	assert.deepEqual(FakeGateway.channelMessages.get(presentationMapping.channelId).at(-1).presentation.controls, backupPresentation.controls);
+	presentationCore.unregisterClient("backup-client", "backup-generation");
+	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.controls.length === 0, "final owner stripping");
 	await presentationCore.stop();
 
 	assert.equal(projectChannelName("/one/My Project"), "my-project");
@@ -3290,18 +3295,14 @@ try {
 		type: "manager_presentation_control", requestId: "interaction", revision: "4".repeat(64),
 		controlId: "github-status-refresh", command: "github-status-refresh",
 	}), true);
-	assert.equal(isServerFrame({
-		type: "registered", channelId: "channel", threadId: "thread", leaderPid: 1,
-		managerPresentation: { schemaVersion: 1, controlIds: ["github-status-refresh"] },
-	}), true);
-	assert.equal(isClientFrame({
-		type: "register", token: "token", clientId: "client", generation: "generation", configFingerprint: "fingerprint",
-		configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: true,
-	}), true, "manager summary eligibility must be an optional backward-compatible registration capability");
+	assert.equal(isClientFrame({ type: "register", token: "token", clientId: "client", generation: "generation",
+		configFingerprint: "fingerprint", configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: true,
+		managerPresentation: { schemaVersion: 1, controlIds: ["github-status-refresh", "future-control"] } }), true, "additive controls accepted");
 	assert.equal(isClientFrame({
 		type: "register", token: "token", clientId: "client", generation: "generation", configFingerprint: "fingerprint",
 		configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: false,
 	}), false, "manager summary eligibility must fail closed unless explicitly true");
+	assert.equal(isClientFrame({ type: "register", token: "t", clientId: "c", generation: "g", configFingerprint: "f", configEpoch: 1, cwd: "/the-manager", sessionId: "m", managerPresentation: { schemaVersion: 1, controlIds: ["bad id"] } }), false);
 	const oldManagerRegistration = {
 		type: "register", token: "token", clientId: "old-manager", generation: "generation", configFingerprint: "fingerprint",
 		configEpoch: 1, cwd: "/the-manager", sessionId: "old-manager-session", managerControls: { taskCatalogue: [] },
@@ -3312,15 +3313,12 @@ try {
 	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/the-manager", {
 		...oldManagerRegistration, managerTaskSummaryProducer: true,
 	}), true, "new relays must grant legacy summary ownership to explicitly capable verified manager clients");
-	assert.deepEqual(negotiatedManagerPresentation("/workspace/the-manager", {
-		...oldManagerRegistration,
-		managerTaskSummaryProducer: true,
-		managerPresentation: { schemaVersion: 1, controlIds: ["github-status-refresh"] },
-	}), { schemaVersion: 1, controlIds: ["github-status-refresh"] },
-	"new relays must negotiate a separate additive manager-presentation capability");
-	assert.equal(negotiatedManagerPresentation("/workspace/the-manager", {
-		...oldManagerRegistration, managerTaskSummaryProducer: true,
-	}), undefined, "legacy owners must remain componentless without presentation capability");
+	assert.deepEqual(negotiatedManagerPresentation("/workspace/the-manager", { ...oldManagerRegistration,
+		managerTaskSummaryProducer: true, managerPresentation: { schemaVersion: 1,
+			controlIds: ["github-status-refresh", "future-control"] } }),
+	{ schemaVersion: 1, controlIds: ["github-status-refresh"] }, "negotiation must intersect additive controls");
+	assert.equal(negotiatedManagerPresentation("/workspace/the-manager",
+		{ ...oldManagerRegistration, managerTaskSummaryProducer: true }), undefined, "legacy owners remain componentless");
 	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/unrelated", oldManagerRegistration), false,
 		"manager-shaped clients from unrelated project identities must not claim summary ownership");
 	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/the-manager", { managerTaskSummaryProducer: true }), false,
@@ -3889,22 +3887,16 @@ try {
 		}
 	}
 	const managerSummaryMapping = await new DiscordStateStore(stateFile).getSession("manager-summary-session");
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "opaque manager payload @everyone",
-		"extension-produced opaque manager presentation");
-	assert.deepEqual(JSON.parse(await readFile(join(managerFixture, "summary-render-args.json"), "utf8")), [
-		"summary-render", "--root", await realpath(managerFixture), "--max-chars", "2000",
-	], "manager producer must invoke the exact bounded summary-render command against its verified root");
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "opaque manager payload @everyone", "opaque manager presentation");
+	assert.deepEqual(JSON.parse(await readFile(join(managerFixture, "summary-render-args.json"), "utf8")),
+		["summary-render", "--root", await realpath(managerFixture), "--max-chars", "2000"], "exact summary-render command");
 	const managerSummaryMessage = FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1);
 	const managerSummaryMessageId = managerSummaryMessage.id;
 	assert.equal(managerSummaryMessage.presentation.controls[0].label, "Refresh GitHub");
-	assert.deepEqual(await FakeGateway.instances[0].executePresentationControl({
-		requestId: "manager-presentation-refresh",
-		guildId: "12345",
-		channelId: managerSummaryMapping.channelId,
-		messageId: managerSummaryMessageId,
-		customId: `m:${"a".repeat(64)}:github-status-refresh`,
-	}), { ok: true, message: "Manager control completed." },
-	"presentation control must traverse current-message fencing and the verified manager executor");
+	assert.deepEqual(await FakeGateway.instances[0].executePresentationControl({ requestId: "manager-presentation-refresh",
+		guildId: "12345", channelId: managerSummaryMapping.channelId, messageId: managerSummaryMessageId,
+		customId: `m:${"a".repeat(64)}:github-status-refresh` }),
+	{ ok: true, message: "Manager control completed." }, "presentation control must traverse the verified executor");
 	managerStatus = {
 		...managerStatus,
 		summary: { tasks: 1, pending_events: 0, ready_tasks: 0, orphan_events: 0 },

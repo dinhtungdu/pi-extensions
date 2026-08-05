@@ -99,7 +99,7 @@ function isManagerPresentationCapability(value: unknown): boolean {
 	const capability = value as Record<string, unknown>;
 	return capability.schemaVersion === MANAGER_PRESENTATION_SCHEMA_VERSION && Array.isArray(capability.controlIds) &&
 		capability.controlIds.length <= 25 && new Set(capability.controlIds).size === capability.controlIds.length && capability.controlIds.every((id) =>
-			typeof id === "string" && id === SUPPORTED_MANAGER_PRESENTATION_CONTROL);
+			typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,99}$/.test(id));
 }
 
 export function isClientFrame(value: unknown): value is ClientFrame {
