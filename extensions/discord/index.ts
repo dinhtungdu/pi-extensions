@@ -300,7 +300,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			});
 			const candidate = new DiscordBridge(
 				config,
-				session,
+				{
+					...session,
+					...(publishManagerTaskSummary ? { managerTaskSummaryProducer: true as const } : {}),
+				},
 				{
 					onUserMessage(content) {
 						if (ctx.isIdle()) pi.sendUserMessage(content);
@@ -315,7 +318,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 							STATUS_KEY,
 							status.connected ? STATUS_CONNECTED : STATUS_RECONNECTING,
 						);
-						if (status.connected) publishTaskSummary(ctx);
+						if (status.connected) taskSummaryProducer?.requestRefresh(0);
 					},
 					supportsImageInput: () => ctx.model?.input?.includes("image") === true,
 					modelCatalogue: () => modelCatalogue(ctx),

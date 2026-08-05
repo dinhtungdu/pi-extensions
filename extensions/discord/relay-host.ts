@@ -267,7 +267,7 @@ export class LocalRelayHost {
 				leaderPid: this.options.lease.pid,
 				leaderNonce: this.options.lease.nonce,
 				lifecycleReactions: true,
-				projectSummaries: true,
+				...(parsed.managerTaskSummaryProducer ? { projectSummaries: true as const } : {}),
 				sessionControls: true,
 				managerControls: true,
 				inboundImages: true,
@@ -292,6 +292,7 @@ export class LocalRelayHost {
 					projectCatalogue: parsed.managerControls.projectCatalogue,
 					execute: (request) => this.requestManagerControl(state, request),
 				} : undefined,
+				parsed.managerTaskSummaryProducer === true,
 			);
 			if (state.closed) {
 				this.options.core.unregisterClient(parsed.clientId, parsed.generation);

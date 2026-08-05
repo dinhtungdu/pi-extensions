@@ -44,6 +44,7 @@ export interface RelaySessionRegistration {
 	projectIdentityResolved?: boolean;
 	sessionId: string;
 	sessionName?: string;
+	managerTaskSummaryProducer?: true;
 }
 
 export interface PreparedRegistration {
@@ -54,7 +55,10 @@ export interface PreparedRegistration {
 interface ActiveSession {
 	clientId: string;
 	generation: string;
+	cwd: string;
 	threadId: string;
+	managerTaskSummaryProducer: boolean;
+	summaryProducerOrder: number;
 	deliver(message: QueuedDiscordMessage): boolean;
 	deliveredIds: Set<string>;
 	modelCatalogue: PiModelCatalogueEntry[];
@@ -140,6 +144,7 @@ export class DiscordRelayCore {
 	private readonly summaryRetryAttempts = new Map<string, number>();
 	private readonly summaryRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly recentlyDisconnectedSessions = new Set<string>();
+	private nextSummaryProducerOrder = 0;
 	private cancelStateCompaction: (() => void) | undefined;
 	private stateCompaction: Promise<void> | undefined;
 	private started = false;
@@ -176,7 +181,6 @@ export class DiscordRelayCore {
 		this.cancelStateCompaction = this.dependencies.scheduleStateCompaction(() => this.compactInactiveState().catch((error) => {
 			this.onTerminalError(error instanceof Error ? error : new Error(String(error)));
 		}));
-		for (const { cwd } of await this.state.projectSummaries()) this.scheduleProjectSummaryReconciliation(cwd);
 	}
 
 	private protectedSessionIds(): ReadonlySet<string> {
@@ -326,6 +330,7 @@ export class DiscordRelayCore {
 			projectCatalogue?: ManagerProjectCatalogueEntry[];
 			execute(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 		},
+		managerTaskSummaryProducer = false,
 	): Promise<void> {
 		const reserved = this.reservedSessions.get(sessionId);
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
@@ -341,7 +346,10 @@ export class DiscordRelayCore {
 		const active: ActiveSession = {
 			clientId,
 			generation,
+			cwd: mapping!.cwd,
 			threadId: mapping!.threadId,
+			managerTaskSummaryProducer,
+			summaryProducerOrder: this.nextSummaryProducerOrder++,
 			deliver,
 			deliveredIds: new Set(),
 			modelCatalogue: controls?.modelCatalogue.map((model) => ({ ...model })) ?? [],
@@ -363,6 +371,7 @@ export class DiscordRelayCore {
 			if (!this.deliverMessage(active, message)) break;
 		}
 		if (this.inboundCursorBlockedSessions.has(sessionId)) this.scheduleInboundRetry(sessionId);
+		if (managerTaskSummaryProducer) this.scheduleProjectSummaryReconciliation(active.cwd);
 		void this.drainOutbound().catch(this.onTerminalError);
 	}
 
@@ -381,6 +390,9 @@ export class DiscordRelayCore {
 				if (this.activeThreadSessions.get(active.threadId) === sessionId) this.activeThreadSessions.delete(active.threadId);
 				this.clearOutboundRetry(sessionId);
 				this.cancelInboundRetry(sessionId);
+				if (active.managerTaskSummaryProducer && this.hasManagerTaskSummaryProducer(active.cwd)) {
+					this.scheduleProjectSummaryReconciliation(active.cwd);
+				}
 			}
 		}
 		if (![...this.activeSessions.values()].some((active) => active.clientId === clientId)) this.clientSessions.delete(clientId);
@@ -610,6 +622,9 @@ export class DiscordRelayCore {
 	): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
 		if (!text || text.length > 2_000) throw new Error("Discord project summary must contain 1-2000 characters");
+		const active = this.activeSessions.get(sessionId)!;
+		if (!active.managerTaskSummaryProducer) throw new Error("Local client is not registered as a manager task-summary producer");
+		if (this.managerTaskSummaryOwner(active.cwd)?.[0] !== sessionId) return;
 		const cwd = await this.state.setProjectSummaryDesired(sessionId, text);
 		this.scheduleProjectSummaryReconciliation(cwd);
 	}
@@ -640,8 +655,19 @@ export class DiscordRelayCore {
 		void this.drainOutbound().catch(this.onTerminalError);
 	}
 
+	private managerTaskSummaryOwner(cwd: string): [string, ActiveSession] | undefined {
+		return [...this.activeSessions.entries()]
+			.filter(([, active]) => active.managerTaskSummaryProducer && active.cwd === cwd)
+			.sort(([leftId, left], [rightId, right]) =>
+				left.summaryProducerOrder - right.summaryProducerOrder || leftId.localeCompare(rightId))[0];
+	}
+
+	private hasManagerTaskSummaryProducer(cwd: string): boolean {
+		return this.managerTaskSummaryOwner(cwd) !== undefined;
+	}
+
 	private scheduleProjectSummaryReconciliation(cwd: string): void {
-		if (!this.started) return;
+		if (!this.started || !this.hasManagerTaskSummaryProducer(cwd)) return;
 		if (this.summaryReconciliations.has(cwd)) {
 			this.summaryReconcileRequested.add(cwd);
 			return;
@@ -658,13 +684,14 @@ export class DiscordRelayCore {
 	}
 
 	private async reconcileProjectSummary(cwd: string): Promise<void> {
-		for (let step = 0; step < 16 && this.started; step++) {
+		for (let step = 0; step < 16 && this.started && this.hasManagerTaskSummaryProducer(cwd); step++) {
 			const project = (await this.state.projectSummaries()).find((candidate) => candidate.cwd === cwd);
 			if (!project) return;
 			const { mapping, summary } = project;
 			if (summary.pendingSend) {
 				const pending = await this.state.prepareProjectSummarySend(cwd);
 				if (!pending) continue;
+				if (!this.hasManagerTaskSummaryProducer(cwd)) return;
 				const messageId = await this.transport.sendText(mapping.channelId, pending.content, pending.nonce);
 				await this.state.recordProjectSummarySent(cwd, pending.nonce, messageId);
 				continue;
@@ -674,6 +701,7 @@ export class DiscordRelayCore {
 				continue;
 			}
 			const latestMessageId = await this.transport.latestMessageId(mapping.channelId);
+			if (!this.hasManagerTaskSummaryProducer(cwd)) return;
 			if (latestMessageId === summary.delivery.messageId) {
 				if (summary.delivery.content === summary.desiredText) {
 					this.clearProjectSummaryRetry(cwd);
@@ -688,11 +716,11 @@ export class DiscordRelayCore {
 			await this.transport.deleteOwnText(mapping.channelId, summary.delivery.messageId);
 			await this.state.recordProjectSummaryDeleted(cwd, summary.delivery.messageId);
 		}
-		if (this.started) this.scheduleProjectSummaryRetry(cwd);
+		if (this.started && this.hasManagerTaskSummaryProducer(cwd)) this.scheduleProjectSummaryRetry(cwd);
 	}
 
 	private scheduleProjectSummaryRetry(cwd: string): void {
-		if (!this.started || this.summaryRetryTimers.has(cwd)) return;
+		if (!this.started || !this.hasManagerTaskSummaryProducer(cwd) || this.summaryRetryTimers.has(cwd)) return;
 		const attempt = (this.summaryRetryAttempts.get(cwd) ?? 0) + 1;
 		this.summaryRetryAttempts.set(cwd, attempt);
 		const delay = Math.min(SUMMARY_RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 7), SUMMARY_RETRY_MAX_MS);
@@ -882,7 +910,7 @@ export class DiscordRelayCore {
 			return;
 		}
 		const projectCwd = await this.state.findProjectByChannel(message.channelId);
-		if (projectCwd) this.scheduleProjectSummaryReconciliation(projectCwd);
+		if (projectCwd && this.hasManagerTaskSummaryProducer(projectCwd)) this.scheduleProjectSummaryReconciliation(projectCwd);
 	}
 
 	private async recordMessage(

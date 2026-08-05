@@ -2050,7 +2050,16 @@ try {
 		projectIdentityResolved: true,
 		sessionId: "summary-session",
 	});
-	await summaryCore.activateRegistration("summary-client", "summary-generation", "summary-session", () => true);
+	await summaryCore.activateRegistration(
+		"summary-client",
+		"summary-generation",
+		"summary-session",
+		() => true,
+		undefined,
+		false,
+		undefined,
+		true,
+	);
 	await summaryState.setProjectSummaryDesired("summary-session", "summary one");
 	const initialPendingSummary = await summaryState.prepareProjectSummarySend("/the-manager");
 	const overlongSummaryState = JSON.parse(await readFile(summaryStateFile, "utf8"));
@@ -2072,6 +2081,31 @@ try {
 	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary two", "latest summary edit");
 	assert.equal(FakeGateway.channelMessages.get("summary-channel").length, 1);
 	assert.equal(FakeGateway.channelMessages.get("summary-channel")[0].id, initialSummaryId, "latest summary must edit in place");
+
+	await summaryCore.prepareRegistration("competing-summary-client", "competing-summary-generation", {
+		cwd: "/the-manager",
+		projectIdentityResolved: true,
+		sessionId: "competing-summary-session",
+	});
+	await summaryCore.activateRegistration(
+		"competing-summary-client",
+		"competing-summary-generation",
+		"competing-summary-session",
+		() => true,
+		undefined,
+		false,
+		undefined,
+		true,
+	);
+	await summaryCore.queueProjectSummary(
+		"competing-summary-client",
+		"competing-summary-generation",
+		"competing-summary-session",
+		"delayed stale summary",
+	);
+	assert.equal((await summaryState.projectSummaries())[0].summary.desiredText, "summary two",
+		"a delayed snapshot from a competing eligible producer must not replace the elected producer's newer state");
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").at(-1).text, "summary two");
 
 	FakeGateway.channelMessages.get("summary-channel").push({ id: "external-displacement", text: "human message", botOwned: false });
 	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary three");
@@ -2130,11 +2164,50 @@ try {
 		new DiscordStateStore(summaryStateFile),
 		restartSummaryGateway,
 	);
+	let restartSummaryOperations = 0;
+	for (const method of ["latestMessageId", "sendText", "editOwnText", "deleteOwnText"]) {
+		const original = restartSummaryGateway[method].bind(restartSummaryGateway);
+		restartSummaryGateway[method] = async (...args) => {
+			restartSummaryOperations++;
+			return original(...args);
+		};
+	}
 	await restartSummaryCore.start();
+	await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+	assert.equal(restartSummaryOperations, 0, "relay startup alone must not reconcile a persisted manager summary");
+	await restartSummaryCore.prepareRegistration("unrelated-client", "unrelated-generation", {
+		cwd: "/unrelated-project",
+		projectIdentityResolved: true,
+		sessionId: "unrelated-session",
+	});
+	await restartSummaryCore.activateRegistration("unrelated-client", "unrelated-generation", "unrelated-session", () => true);
+	await assert.rejects(
+		() => restartSummaryCore.queueProjectSummary("unrelated-client", "unrelated-generation", "unrelated-session", "hostile summary"),
+		/not registered as a manager task-summary producer/,
+		"an unrelated session must not publish project-summary state",
+	);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+	assert.equal(restartSummaryOperations, 0, "an unrelated active project must not reconcile a persisted manager summary");
+	await restartSummaryCore.prepareRegistration("restart-summary-client", "restart-summary-generation", {
+		cwd: "/the-manager",
+		projectIdentityResolved: true,
+		sessionId: "restart-summary-session",
+	});
+	await restartSummaryCore.activateRegistration(
+		"restart-summary-client",
+		"restart-summary-generation",
+		"restart-summary-session",
+		() => true,
+		undefined,
+		false,
+		undefined,
+		true,
+	);
 	await waitFor(async () => {
 		const project = (await new DiscordStateStore(summaryStateFile).projectSummaries())[0];
 		return project?.summary.delivery?.content === "summary six" && project.summary.delivery.messageId !== beforeRestartSummaryId;
-	}, "durable displaced-summary restart reconciliation");
+	}, "matching manager registration restart reconciliation");
+	assert.ok(restartSummaryOperations > 0, "matching eligible registration must activate persisted summary recovery");
 	assert.equal(FakeGateway.channelMessages.get("summary-channel").filter((message) => message.botOwned).length, 1);
 	assert.equal(FakeGateway.channelMessages.get("summary-channel").at(-1).text, "summary six");
 	await restartSummaryCore.stop();
@@ -2674,6 +2747,14 @@ try {
 		choice.value === "task:task-39"), "ask target filtering must search task IDs beyond the first unfiltered page");
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "summary" }), true);
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "x".repeat(2_001) }), false);
+	assert.equal(isClientFrame({
+		type: "register", token: "token", clientId: "client", generation: "generation", configFingerprint: "fingerprint",
+		configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: true,
+	}), true, "manager summary eligibility must be an optional backward-compatible registration capability");
+	assert.equal(isClientFrame({
+		type: "register", token: "token", clientId: "client", generation: "generation", configFingerprint: "fingerprint",
+		configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: false,
+	}), false, "manager summary eligibility must fail closed unless explicitly true");
 	const previousValidator = (frame) => frame?.type === "outbound" && typeof frame.requestId === "string" &&
 		typeof frame.messageId === "string" && typeof frame.text === "string" && (frame.kind === "user" || frame.kind === "assistant");
 	const previousRegisterValidator = (frame) => frame?.type === "register" &&

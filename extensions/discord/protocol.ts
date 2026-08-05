@@ -28,6 +28,7 @@ export type ClientFrame =
 		configEpoch: number;
 		sessionControls?: { modelCatalogue: PiModelCatalogueEntry[] };
 		managerControls?: { taskCatalogue: ManagerTaskCatalogueEntry[]; projectCatalogue?: ManagerProjectCatalogueEntry[] };
+		managerTaskSummaryProducer?: true;
 		inboundImages?: true;
 	} & RelaySessionRegistration)
 	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
@@ -92,6 +93,7 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(frame.projectIdentityResolved === undefined || typeof frame.projectIdentityResolved === "boolean") &&
 			(frame.sessionName === undefined || typeof frame.sessionName === "string") &&
 			(frame.inboundImages === undefined || frame.inboundImages === true) &&
+			(frame.managerTaskSummaryProducer === undefined || frame.managerTaskSummaryProducer === true) &&
 			(frame.sessionControls === undefined || (
 				Boolean(frame.sessionControls) && typeof frame.sessionControls === "object" && !Array.isArray(frame.sessionControls) &&
 				isPiModelCatalogue((frame.sessionControls as Record<string, unknown>).modelCatalogue)

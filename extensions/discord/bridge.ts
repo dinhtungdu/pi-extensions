@@ -25,6 +25,7 @@ export interface BridgeSession {
 	projectIdentityResolved?: boolean;
 	sessionId: string;
 	sessionName?: string;
+	managerTaskSummaryProducer?: true;
 }
 
 export interface BridgeCallbacks {
