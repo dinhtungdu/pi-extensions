@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { chmod, mkdir, mkdtemp, open, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -377,7 +377,7 @@ try {
 		MANAGER_CONTROL_PROCESS_TIMEOUT_MS,
 		ManagerControlExecutor,
 	} = await importBuilt("extensions/discord/manager-controls.js");
-	const { MANAGER_CONTROL_IPC_TIMEOUT_MS } = await importBuilt("extensions/discord/relay-host.js");
+	const { isEligibleManagerTaskSummaryProducer, LocalRelayHost, MANAGER_CONTROL_IPC_TIMEOUT_MS } = await importBuilt("extensions/discord/relay-host.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const {
@@ -2072,6 +2072,8 @@ try {
 		"a repaired nonce must remain durable for idempotent retries");
 	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary one");
 	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary one", "initial parent-channel summary");
+	assert.equal(summaryGateway.sent.at(-1).nonce, repairedPendingSummary.nonce,
+		"a fresh same-text frame must retain the durable nonce for uncertain-send crash recovery");
 	const initialSummaryId = FakeGateway.channelMessages.get("summary-channel").at(-1).id;
 	assert.equal(summaryGateway.sent.at(-1).channelId, "summary-channel", "summary must target the mapped project parent channel");
 	assert.ok(summaryGateway.sent.every((message) => message.nonce.length <= MAX_DISCORD_NONCE_LENGTH),
@@ -2103,12 +2105,85 @@ try {
 		"competing-summary-session",
 		"delayed stale summary",
 	);
-	assert.equal((await summaryState.projectSummaries())[0].summary.desiredText, "summary two",
+	const ownedSummaryState = (await summaryState.projectSummaries())[0].summary;
+	assert.equal(ownedSummaryState.desiredText, "summary two",
 		"a delayed snapshot from a competing eligible producer must not replace the elected producer's newer state");
 	assert.equal(FakeGateway.channelMessages.get("summary-channel").at(-1).text, "summary two");
+	const rejectedStaleRevision = await summaryState.setProjectSummaryDesired(
+		"competing-summary-session",
+		"stale persisted revision",
+		ownedSummaryState.revision,
+	);
+	assert.equal(rejectedStaleRevision.accepted, false, "persisted monotonic revisions must reject stale state writes");
+	assert.equal((await summaryState.projectSummaries())[0].summary.desiredText, "summary two");
+
+	const originalSummaryLatestMessageId = summaryGateway.latestMessageId.bind(summaryGateway);
+	let releaseStaleOwnerRead;
+	let staleOwnerReadStarted;
+	const staleOwnerRead = new Promise((resolveStarted) => { staleOwnerReadStarted = resolveStarted; });
+	summaryGateway.latestMessageId = async (...args) => {
+		staleOwnerReadStarted();
+		await new Promise((resolveRead) => { releaseStaleOwnerRead = resolveRead; });
+		return originalSummaryLatestMessageId(...args);
+	};
+	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "in-flight stale owner");
+	await staleOwnerRead;
+	summaryCore.unregisterClient("summary-client", "summary-generation");
+	const promotedOwnerPublication = summaryCore.queueProjectSummary(
+		"competing-summary-client",
+		"competing-summary-generation",
+		"competing-summary-session",
+		"promoted owner snapshot",
+	);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+	assert.equal((await summaryState.projectSummaries())[0].summary.desiredText, "in-flight stale owner",
+		"new ownership must not publish while an old-owner reconciliation operation remains in flight");
+	releaseStaleOwnerRead();
+	await promotedOwnerPublication;
+	summaryGateway.latestMessageId = originalSummaryLatestMessageId;
+	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "promoted owner snapshot",
+		"promoted owner revision after an in-flight stale reconciliation");
+	assert.equal(FakeGateway.summaryEvents.some((event) => event.text === "in-flight stale owner"), false,
+		"an old-owner reconciliation must be fenced after ownership promotion");
+
+	const promotedSummaryId = FakeGateway.channelMessages.get("summary-channel").at(-1).id;
+	FakeGateway.failEditOnce.add(promotedSummaryId);
+	await summaryCore.queueProjectSummary(
+		"competing-summary-client",
+		"competing-summary-generation",
+		"competing-summary-session",
+		"failed stale retry",
+	);
+	await waitFor(() => !FakeGateway.failEditOnce.has(promotedSummaryId), "old-owner summary edit failure");
+	await summaryCore.prepareRegistration("final-summary-client", "final-summary-generation", {
+		cwd: "/the-manager",
+		projectIdentityResolved: true,
+		sessionId: "final-summary-session",
+	});
+	await summaryCore.activateRegistration(
+		"final-summary-client",
+		"final-summary-generation",
+		"final-summary-session",
+		() => true,
+		undefined,
+		false,
+		undefined,
+		true,
+	);
+	summaryCore.unregisterClient("competing-summary-client", "competing-summary-generation");
+	await summaryCore.queueProjectSummary(
+		"final-summary-client",
+		"final-summary-generation",
+		"final-summary-session",
+		"new owner after failed retry",
+	);
+	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "new owner after failed retry",
+		"new owner summary after stale retry fencing");
+	assert.equal(FakeGateway.summaryEvents.some((event) => event.text === "failed stale retry"), false,
+		"a failed old-owner retry must not edit after a new owner publishes a newer revision");
 
 	FakeGateway.channelMessages.get("summary-channel").push({ id: "external-displacement", text: "human message", botOwned: false });
-	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary three");
+	await summaryCore.queueProjectSummary("final-summary-client", "final-summary-generation", "final-summary-session", "summary three");
 	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary three", "displaced summary replacement");
 	const displacedEvents = FakeGateway.summaryEvents.filter((event) => event.text === "summary three" || event.messageId === initialSummaryId);
 	assert.deepEqual(displacedEvents.slice(-2).map((event) => event.type), ["delete", "send"], "displaced summary must delete before send");
@@ -2118,7 +2193,7 @@ try {
 	FakeGateway.channelMessages.get("summary-channel").push({ id: "failure-displacement", text: "another human message", botOwned: false });
 	FakeGateway.failDeleteOnce.add(replacementId);
 	const sendsBeforeFailure = summaryGateway.sent.length;
-	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary four");
+	await summaryCore.queueProjectSummary("final-summary-client", "final-summary-generation", "final-summary-session", "summary four");
 	await new Promise((resolveWait) => setTimeout(resolveWait, 100));
 	assert.equal(summaryGateway.sent.length, sendsBeforeFailure, "delete failure must not send a duplicate replacement");
 	await waitFor(() => FakeGateway.channelMessages.get("summary-channel")?.at(-1)?.text === "summary four", "bounded delete retry recovery");
@@ -2128,7 +2203,7 @@ try {
 	const beforeSendFailureId = FakeGateway.channelMessages.get("summary-channel").at(-1).id;
 	FakeGateway.channelMessages.get("summary-channel").push({ id: "send-failure-displacement", text: "human again", botOwned: false });
 	FakeGateway.failOnceTexts.add("summary five");
-	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary five");
+	await summaryCore.queueProjectSummary("final-summary-client", "final-summary-generation", "final-summary-session", "summary five");
 	await waitFor(() => FakeGateway.sendAttempts.get("summary five") === 1, "first failed replacement send");
 	assert.ok(!FakeGateway.channelMessages.get("summary-channel").some((message) => message.id === beforeSendFailureId), "old summary must be deleted before replacement attempt");
 	assert.equal(FakeGateway.channelMessages.get("summary-channel").filter((message) => message.botOwned).length, 0, "failed replacement send must not retain the deleted summary");
@@ -2147,7 +2222,7 @@ try {
 		}
 		return recordSummarySent(...args);
 	};
-	await summaryCore.queueProjectSummary("summary-client", "summary-generation", "summary-session", "summary six");
+	await summaryCore.queueProjectSummary("final-summary-client", "final-summary-generation", "final-summary-session", "summary six");
 	await waitFor(async () => (await summaryState.projectSummaries())[0]?.summary.delivery?.content === "summary six", "uncertain accepted-send recovery");
 	assert.ok(!FakeGateway.channelMessages.get("summary-channel").some((message) => message.id === uncertainSummaryId));
 	assert.equal(FakeGateway.sendAttempts.get("summary six"), 2, "uncertain send must retry its durable nonce");
@@ -2165,6 +2240,7 @@ try {
 		restartSummaryGateway,
 	);
 	let restartSummaryOperations = 0;
+	const restartSummaryEventOffset = FakeGateway.summaryEvents.length;
 	for (const method of ["latestMessageId", "sendText", "editOwnText", "deleteOwnText"]) {
 		const original = restartSummaryGateway[method].bind(restartSummaryGateway);
 		restartSummaryGateway[method] = async (...args) => {
@@ -2203,13 +2279,25 @@ try {
 		undefined,
 		true,
 	);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+	assert.equal(restartSummaryOperations, 0,
+		"matching registration must wait for a fresh canonical producer frame before persisted recovery");
+	await restartSummaryCore.queueProjectSummary(
+		"restart-summary-client",
+		"restart-summary-generation",
+		"restart-summary-session",
+		"summary seven from disconnected canonical change",
+	);
 	await waitFor(async () => {
 		const project = (await new DiscordStateStore(summaryStateFile).projectSummaries())[0];
-		return project?.summary.delivery?.content === "summary six" && project.summary.delivery.messageId !== beforeRestartSummaryId;
-	}, "matching manager registration restart reconciliation");
-	assert.ok(restartSummaryOperations > 0, "matching eligible registration must activate persisted summary recovery");
+		return project?.summary.delivery?.content === "summary seven from disconnected canonical change" &&
+			project.summary.delivery.messageId !== beforeRestartSummaryId;
+	}, "fresh manager publication restart reconciliation");
+	assert.ok(restartSummaryOperations > 0, "a fresh matching producer frame must activate persisted summary recovery");
+	assert.equal(FakeGateway.summaryEvents.slice(restartSummaryEventOffset).some((event) => event.text === "summary six"), false,
+		"restart recovery must not publish persisted stale text before the fresh canonical snapshot");
 	assert.equal(FakeGateway.channelMessages.get("summary-channel").filter((message) => message.botOwned).length, 1);
-	assert.equal(FakeGateway.channelMessages.get("summary-channel").at(-1).text, "summary six");
+	assert.equal(FakeGateway.channelMessages.get("summary-channel").at(-1).text, "summary seven from disconnected canonical change");
 	await restartSummaryCore.stop();
 
 	assert.equal(projectChannelName("/one/My Project"), "my-project");
@@ -2755,6 +2843,87 @@ try {
 		type: "register", token: "token", clientId: "client", generation: "generation", configFingerprint: "fingerprint",
 		configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: false,
 	}), false, "manager summary eligibility must fail closed unless explicitly true");
+	const oldManagerRegistration = {
+		type: "register", token: "token", clientId: "old-manager", generation: "generation", configFingerprint: "fingerprint",
+		configEpoch: 1, cwd: "/the-manager", sessionId: "old-manager-session", managerControls: { taskCatalogue: [] },
+	};
+	assert.equal(isClientFrame(oldManagerRegistration), true, "new relays must parse old manager registrations without the additive capability");
+	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/the-manager", oldManagerRegistration), true,
+		"new relays must infer old manager eligibility from verified controls and canonical project identity");
+	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/unrelated", oldManagerRegistration), false,
+		"manager-shaped clients from unrelated project identities must not claim summary ownership");
+	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/the-manager", { managerTaskSummaryProducer: true }), false,
+		"the additive capability alone must not let an ordinary session claim summary ownership");
+
+	const oldClientRelayDirectory = join(dataDir, "old-client-new-relay");
+	await mkdir(oldClientRelayDirectory, { recursive: true });
+	const oldClientRelayPaths = relayPaths(oldClientRelayDirectory);
+	const oldClientSummaryFrames = [];
+	let oldClientActivatedAsProducer;
+	const oldClientCore = {
+		async start() {},
+		async stop() {},
+		async prepareRegistration() {
+			return { channelId: "old-client-channel", threadId: "old-client-thread", cwd: "/workspace/the-manager" };
+		},
+		async activateRegistration(...args) { oldClientActivatedAsProducer = args.at(-1); },
+		unregisterClient() {},
+		async resumeDelivery() {},
+		updateManagerCatalogues() {},
+		async queueProjectSummary(_clientId, _generation, _sessionId, text) { oldClientSummaryFrames.push(text); },
+	};
+	const oldClientHost = new LocalRelayHost({
+		paths: oldClientRelayPaths,
+		token: "old-client-token",
+		configFingerprint: "old-client-fingerprint",
+		configEpoch: 1,
+		lease: { pid: process.pid, nonce: "old-client-lease", heartbeat: async () => true, release: async () => {} },
+		core: oldClientCore,
+	});
+	await oldClientHost.start();
+	const oldClientSocket = createConnection(oldClientRelayPaths.socket);
+	oldClientSocket.setEncoding("utf8");
+	const oldClientServerFrames = [];
+	let oldClientBuffer = "";
+	oldClientSocket.on("data", (data) => {
+		oldClientBuffer += data;
+		let newline = oldClientBuffer.indexOf("\n");
+		while (newline >= 0) {
+			const line = oldClientBuffer.slice(0, newline);
+			oldClientBuffer = oldClientBuffer.slice(newline + 1);
+			if (line) oldClientServerFrames.push(JSON.parse(line));
+			newline = oldClientBuffer.indexOf("\n");
+		}
+	});
+	await new Promise((resolveConnect, rejectConnect) => {
+		oldClientSocket.once("connect", resolveConnect);
+		oldClientSocket.once("error", rejectConnect);
+	});
+	oldClientSocket.write(`${JSON.stringify({
+		...oldManagerRegistration,
+		token: "old-client-token",
+		clientId: "old-client",
+		generation: "old-generation",
+		configFingerprint: "old-client-fingerprint",
+	})}\n`);
+	await waitFor(() => oldClientServerFrames.some((frame) => frame.type === "registered"), "old client registration on new relay");
+	assert.equal(oldClientServerFrames.find((frame) => frame.type === "registered").projectSummaries, true,
+		"new relays must negotiate summary support with structurally verified old manager clients");
+	assert.equal(oldClientActivatedAsProducer, true);
+	oldClientSocket.write(`${JSON.stringify({ type: "project_summary", requestId: "old-cached-summary", text: "cached stale" })}\n`);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+	assert.deepEqual(oldClientSummaryFrames, [],
+		"an old client's cached reconnect frame must wait for a post-registration canonical catalogue refresh");
+	oldClientSocket.write(`${JSON.stringify({
+		type: "manager_catalogue", requestId: "old-fresh-catalogue", taskCatalogue: [], projectCatalogue: [],
+	})}\n`);
+	await waitFor(() => oldClientServerFrames.some((frame) => frame.type === "project_summary_queued"),
+		"old client summary freshness proof");
+	assert.deepEqual(oldClientSummaryFrames, ["cached stale"],
+		"a post-registration canonical catalogue frame must release an old eligible producer's pending summary");
+	oldClientSocket.end();
+	await oldClientHost.stop();
+
 	const previousValidator = (frame) => frame?.type === "outbound" && typeof frame.requestId === "string" &&
 		typeof frame.messageId === "string" && typeof frame.text === "string" && (frame.kind === "user" || frame.kind === "assistant");
 	const previousRegisterValidator = (frame) => frame?.type === "register" &&
@@ -2802,13 +2971,16 @@ try {
 	const compatibilityErrors = [];
 	const compatibilityClient = new LocalRelayClient(
 		{ token: "token", guildId: "12345", epoch: 1 },
-		{ cwd: "/compatibility", sessionId: "compatibility-session" },
+		{ cwd: "/the-manager", sessionId: "compatibility-session", managerTaskSummaryProducer: true },
 		{
 			onInbound() {},
 			onError(error) { compatibilityErrors.push(error); },
 			onStatus() {},
 			modelCatalogue: () => [{ provider: "compat", id: "model", name: "Compatibility Model" }],
 			onControl: async () => assert.fail("an older relay must not send unsupported controls"),
+			managerTaskCatalogue: () => [],
+			managerProjectCatalogue: () => [],
+			onManagerControl: async () => assert.fail("an older relay must not send unsupported manager controls"),
 		},
 		{ paths: compatibilityPaths, launchRelay: async () => {} },
 	);
@@ -2818,6 +2990,10 @@ try {
 		{ provider: "compat", id: "model", name: "Compatibility Model" },
 	], "new clients may advertise controls to older relays because registration fields are additive");
 	assert.equal(previousHostRegistrations[0].inboundImages, true, "new clients may advertise additive image support to older relays");
+	assert.equal(previousHostRegistrations[0].managerTaskSummaryProducer, true,
+		"new eligible manager clients may advertise summary ownership to an older relay without breaking registration");
+	assert.equal(previousRegisterValidator(previousHostRegistrations[0]), true,
+		"the previous relay registration validator must accept the additive producer capability");
 	assert.equal(compatibilityClient.status().sessionControls, undefined, "an older relay must not advertise unsupported controls");
 	assert.equal(compatibilityClient.status().inboundImages, undefined, "an older relay must preserve text-only rolling compatibility");
 	compatibilityClient.updateLifecycle("compatibility-inbound", "thinking");

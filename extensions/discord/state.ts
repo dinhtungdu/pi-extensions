@@ -28,6 +28,7 @@ function isValidDiscordNonce(nonce: string): boolean {
 
 export interface ProjectSummaryState {
 	desiredText: string;
+	revision: number;
 	delivery?: {
 		messageId: string;
 		content: string;
@@ -208,8 +209,12 @@ function parseProjectSummary(value: unknown, file: string): ProjectSummaryState 
 		}
 		pendingSend = { nonce: value.pendingSend.nonce, content: value.pendingSend.content };
 	}
+	if (value.revision !== undefined && (!Number.isSafeInteger(value.revision) || Number(value.revision) < 0)) {
+		throw new Error(`Discord bridge state ${file} has an invalid project summary revision`);
+	}
 	return {
 		desiredText: value.desiredText,
+		revision: value.revision === undefined ? 0 : Number(value.revision),
 		...(delivery ? { delivery } : {}),
 		...(pendingSend ? { pendingSend } : {}),
 	};
@@ -422,23 +427,39 @@ export class DiscordStateStore {
 		return Object.entries(state.projects).find(([, mapping]) => mapping.channelId === channelId && mapping.summary)?.[0];
 	}
 
-	async setProjectSummaryDesired(sessionId: string, desiredText: string): Promise<string> {
+	async setProjectSummaryDesired(
+		sessionId: string,
+		desiredText: string,
+		candidateRevision?: number,
+	): Promise<{ cwd: string; revision: number; accepted: boolean }> {
 		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
 			session.lastActiveAt = this.now();
 			const project = state.projects[session.cwd];
 			if (!project || project.channelId !== session.channelId) throw new Error(`Pi session ${sessionId} has no Discord project mapping`);
-			if (project.summary) project.summary.desiredText = desiredText;
-			else project.summary = { desiredText };
-			return session.cwd;
+			const revision = candidateRevision ?? (project.summary?.revision ?? 0) + 1;
+			if (!Number.isSafeInteger(revision) || revision <= 0) throw new Error("Discord project summary revision is invalid");
+			if (project.summary && revision <= project.summary.revision) {
+				return { cwd: session.cwd, revision: project.summary.revision, accepted: false };
+			}
+			if (project.summary) {
+				const changed = project.summary.desiredText !== desiredText;
+				project.summary.desiredText = desiredText;
+				project.summary.revision = revision;
+				if (changed) delete project.summary.pendingSend;
+			} else project.summary = { desiredText, revision };
+			return { cwd: session.cwd, revision, accepted: true };
 		});
 	}
 
-	async prepareProjectSummarySend(cwd: string): Promise<ProjectSummaryState["pendingSend"] | undefined> {
+	async prepareProjectSummarySend(
+		cwd: string,
+		expectedRevision?: number,
+	): Promise<ProjectSummaryState["pendingSend"] | undefined> {
 		return this.mutate(async (state) => {
 			const summary = state.projects[cwd]?.summary;
-			if (!summary || summary.delivery) return undefined;
+			if (!summary || summary.delivery || (expectedRevision !== undefined && summary.revision !== expectedRevision)) return undefined;
 			if (!summary.pendingSend) summary.pendingSend = { nonce: projectSummaryNonce(), content: summary.desiredText };
 			else if (!isValidDiscordNonce(summary.pendingSend.nonce)) {
 				// Previous versions persisted UUID nonces that Discord rejected as too long.
@@ -448,26 +469,31 @@ export class DiscordStateStore {
 		});
 	}
 
-	async recordProjectSummarySent(cwd: string, nonce: string, messageId: string): Promise<void> {
+	async recordProjectSummarySent(cwd: string, nonce: string, messageId: string, expectedRevision?: number): Promise<void> {
 		await this.mutate(async (state) => {
 			const summary = state.projects[cwd]?.summary;
-			if (!summary?.pendingSend || summary.pendingSend.nonce !== nonce) return;
+			if (!summary?.pendingSend || summary.pendingSend.nonce !== nonce ||
+				(expectedRevision !== undefined && summary.revision !== expectedRevision)) return;
 			summary.delivery = { messageId, content: summary.pendingSend.content };
 			delete summary.pendingSend;
 		});
 	}
 
-	async recordProjectSummaryEdited(cwd: string, messageId: string, content: string): Promise<void> {
+	async recordProjectSummaryEdited(cwd: string, messageId: string, content: string, expectedRevision?: number): Promise<void> {
 		await this.mutate(async (state) => {
-			const delivery = state.projects[cwd]?.summary?.delivery;
-			if (delivery?.messageId === messageId) delivery.content = content;
+			const summary = state.projects[cwd]?.summary;
+			const delivery = summary?.delivery;
+			if (delivery?.messageId === messageId && (expectedRevision === undefined || summary?.revision === expectedRevision)) {
+				delivery.content = content;
+			}
 		});
 	}
 
-	async recordProjectSummaryDeleted(cwd: string, messageId: string): Promise<void> {
+	async recordProjectSummaryDeleted(cwd: string, messageId: string, expectedRevision?: number): Promise<void> {
 		await this.mutate(async (state) => {
 			const summary = state.projects[cwd]?.summary;
-			if (summary?.delivery?.messageId === messageId) delete summary.delivery;
+			if (summary?.delivery?.messageId === messageId &&
+				(expectedRevision === undefined || summary.revision === expectedRevision)) delete summary.delivery;
 		});
 	}
 

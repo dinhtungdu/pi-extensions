@@ -1,5 +1,6 @@
 import { chmod, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
+import { basename } from "node:path";
 import type { RelayPaths } from "./config.js";
 import type { LeaderLease } from "./leader.js";
 import { encodeFrame, isClientFrame, MAX_IPC_FRAME_BYTES, parseFrame, type ServerFrame } from "./protocol.js";
@@ -28,6 +29,9 @@ interface SocketState {
 	closed: boolean;
 	registered: boolean;
 	managerControls: boolean;
+	legacyManagerTaskSummaryProducer: boolean;
+	managerCatalogueUpdates: number;
+	pendingLegacyProjectSummary?: { requestId: string; text: string };
 	buffer: string;
 	queue: Promise<void>;
 	queuedInputFrames: number;
@@ -44,6 +48,15 @@ interface SocketState {
 const ZERO_CLIENT_GRACE_MS = 1_000;
 const SESSION_CONTROL_TIMEOUT_MS = 10_000;
 export const MANAGER_CONTROL_IPC_TIMEOUT_MS = 170_000;
+
+export function isEligibleManagerTaskSummaryProducer(
+	cwd: string,
+	registration: { managerControls?: unknown; managerTaskSummaryProducer?: true },
+): boolean {
+	if (basename(cwd) !== "the-manager" || registration.managerControls === undefined) return false;
+	// Missing capability is an old verified manager client. Explicit true is the new protocol.
+	return registration.managerTaskSummaryProducer === undefined || registration.managerTaskSummaryProducer === true;
+}
 
 export class LocalRelayHost {
 	private server: Server | undefined;
@@ -153,6 +166,8 @@ export class LocalRelayHost {
 			closed: false,
 			registered: false,
 			managerControls: false,
+			legacyManagerTaskSummaryProducer: false,
+			managerCatalogueUpdates: 0,
 			buffer: "",
 			queue: Promise.resolve(),
 			queuedInputFrames: 0,
@@ -260,6 +275,8 @@ export class LocalRelayHost {
 			state.generation = parsed.generation;
 			state.sessionId = parsed.sessionId;
 			state.managerControls = parsed.managerControls !== undefined;
+			const managerTaskSummaryProducer = isEligibleManagerTaskSummaryProducer(prepared.cwd, parsed);
+			state.legacyManagerTaskSummaryProducer = managerTaskSummaryProducer && parsed.managerTaskSummaryProducer === undefined;
 			if (!this.write(state, {
 				type: "registered",
 				channelId: prepared.channelId,
@@ -267,7 +284,7 @@ export class LocalRelayHost {
 				leaderPid: this.options.lease.pid,
 				leaderNonce: this.options.lease.nonce,
 				lifecycleReactions: true,
-				...(parsed.managerTaskSummaryProducer ? { projectSummaries: true as const } : {}),
+				...(managerTaskSummaryProducer ? { projectSummaries: true as const } : {}),
 				sessionControls: true,
 				managerControls: true,
 				inboundImages: true,
@@ -292,7 +309,7 @@ export class LocalRelayHost {
 					projectCatalogue: parsed.managerControls.projectCatalogue,
 					execute: (request) => this.requestManagerControl(state, request),
 				} : undefined,
-				parsed.managerTaskSummaryProducer === true,
+				managerTaskSummaryProducer,
 			);
 			if (state.closed) {
 				this.options.core.unregisterClient(parsed.clientId, parsed.generation);
@@ -323,11 +340,26 @@ export class LocalRelayHost {
 					parsed.taskCatalogue,
 					parsed.projectCatalogue,
 				);
+				state.managerCatalogueUpdates++;
 			} catch (error) {
 				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
 				return;
 			}
 			this.write(state, { type: "manager_catalogue_updated", requestId: parsed.requestId });
+			const pendingSummary = state.pendingLegacyProjectSummary;
+			if (!pendingSummary) return;
+			state.pendingLegacyProjectSummary = undefined;
+			try {
+				await this.options.core.queueProjectSummary(
+					clientId,
+					generation,
+					sessionId,
+					pendingSummary.text,
+				);
+				this.write(state, { type: "project_summary_queued", requestId: pendingSummary.requestId });
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, pendingSummary.requestId);
+			}
 			return;
 		}
 		if (parsed.type === "ack_inbound") {
@@ -355,6 +387,16 @@ export class LocalRelayHost {
 			return;
 		}
 		if (parsed.type === "project_summary") {
+			if (state.legacyManagerTaskSummaryProducer && state.managerCatalogueUpdates === 0) {
+				if (state.pendingLegacyProjectSummary) {
+					this.fail(socket, state, "Legacy manager summary refresh is already pending", false, parsed.requestId);
+					return;
+				}
+				// Old clients publish cached text on reconnect, but a canonical producer refresh also
+				// emits a live manager_catalogue frame. Hold the summary until that freshness proof.
+				state.pendingLegacyProjectSummary = { requestId: parsed.requestId, text: parsed.text };
+				return;
+			}
 			try {
 				await this.options.core.queueProjectSummary(clientId, generation, sessionId, parsed.text);
 			} catch (error) {
