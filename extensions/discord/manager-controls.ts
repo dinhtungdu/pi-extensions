@@ -10,6 +10,7 @@ import {
 	type PiSessionControlResult,
 } from "./controls.js";
 import { managerProjectCatalogue, managerTaskCatalogue } from "./manager-task-summary.js";
+import { isSupportedManagerPresentationControl } from "./manager-presentation.js";
 
 const STATUS_TIMEOUT_MS = 2_000;
 const VALIDATE_TIMEOUT_MS = 30_000;
@@ -131,30 +132,30 @@ function isReconcileReference(value: unknown): boolean {
 function isReconcileReferencedTaskSuccess(output: Record<string, unknown>, taskId: string): boolean {
 	const baseKeys = ["ok", "command", "task_id", "state", "archived", "references"] as const;
 	if (output.ok !== true || output.command !== "task-reconcile-pr" || output.task_id !== taskId ||
-		typeof output.state !== "string" || !["open", "closed", "merged", "terminal", "mixed"].includes(output.state) ||
-		typeof output.archived !== "boolean" || !Array.isArray(output.references) || output.references.length < 1 ||
-		output.references.length > 5 || !output.references.every(isReconcileReference)) return false;
+		typeof output.state !== "string" || typeof output.archived !== "boolean" || !Array.isArray(output.references) ||
+		output.references.length < 1 || output.references.length > 5 || !output.references.every(isReconcileReference)) return false;
+	const references = output.references as Array<Record<string, unknown>>;
+	const allTerminal = references.every((reference) =>
+		reference.kind === "issue" ? reference.state === "closed" : reference.state === "merged");
+	const allOpen = references.every((reference) => reference.state === "open");
+	const kinds = new Set(references.map((reference) => reference.kind));
+	const expectedState = allTerminal ? kinds.size > 1 ? "terminal" : kinds.has("issue") ? "closed" : "merged"
+		: allOpen ? "open" : "mixed";
+	if (output.state !== expectedState || output.archived !== allTerminal) return false;
 	if (!output.archived) return hasExactKeys(output, baseKeys);
 	return hasValidOptionalCleanupFields(output) &&
 		hasOnlyKeys(output, [...baseKeys, "checkout_mode", "slot_state", "replay"]);
 }
 
+type LegacyReconcileSummary = { merged: number; open: number; closed: number; not_found: number; failed: number };
+type ReconcileSummary = LegacyReconcileSummary & { archived: number; terminal: number; mixed: number };
 interface ReconcilePullRequestBatchSuccess extends Record<string, unknown> {
 	ok: true;
 	command: "task-reconcile-pr";
 	scope: "all";
 	scanned: number;
 	results: Array<Record<string, unknown>>;
-	summary: {
-		archived: number;
-		merged: number;
-		closed: number;
-		terminal: number;
-		open: number;
-		mixed: number;
-		not_found: number;
-		failed: number;
-	};
+	summary: LegacyReconcileSummary | ReconcileSummary;
 }
 
 function isReconcilePullRequestBatchSuccess(output: Record<string, unknown>): output is ReconcilePullRequestBatchSuccess {
@@ -166,8 +167,12 @@ function isReconcilePullRequestBatchSuccess(output: Record<string, unknown>): ou
 	}
 	if (!output.summary || typeof output.summary !== "object" || Array.isArray(output.summary)) return false;
 	const summary = output.summary as Record<string, unknown>;
+	const legacySummaryKeys = ["merged", "open", "closed", "not_found", "failed"] as const;
 	const summaryKeys = ["archived", "merged", "closed", "terminal", "open", "mixed", "not_found", "failed"] as const;
-	if (!hasExactKeys(summary, summaryKeys) || summaryKeys.some((key) =>
+	const legacySummary = hasExactKeys(summary, legacySummaryKeys);
+	const currentSummary = hasExactKeys(summary, summaryKeys);
+	const selectedKeys = legacySummary ? legacySummaryKeys : currentSummary ? summaryKeys : undefined;
+	if (!selectedKeys || selectedKeys.some((key) =>
 		!Number.isSafeInteger(summary[key]) || (summary[key] as number) < 0 || (summary[key] as number) > MAX_RECONCILE_BATCH_TASKS)) {
 		return false;
 	}
@@ -186,23 +191,29 @@ function isReconcilePullRequestBatchSuccess(output: Record<string, unknown>): ou
 			continue;
 		}
 		const normalized = { ok: true, command: "task-reconcile-pr", ...result };
-		if (!("references" in result
-			? isReconcileReferencedTaskSuccess(normalized, result.task_id)
-			: isReconcilePullRequestSuccess(normalized, result.task_id))) return false;
+		if ("references" in result
+			? legacySummary || !isReconcileReferencedTaskSuccess(normalized, result.task_id)
+			: !isReconcilePullRequestSuccess(normalized, result.task_id)) return false;
 		if (result.archived) counts.archived++;
 		if (result.state === "merged" || result.state === "closed" || result.state === "terminal" ||
 			result.state === "open" || result.state === "mixed") counts[result.state]++;
 		else if (result.state === "not-found") counts.not_found++;
 		else return false;
 	}
-	return summaryKeys.every((key) => summary[key] === counts[key]);
+	return selectedKeys.every((key) => summary[key] === counts[key]);
 }
 
 function formatReconcilePullRequestBatch(output: ReconcilePullRequestBatchSuccess): string {
 	const summary = output.summary;
-	const terminal = summary.merged + summary.closed + summary.terminal;
-	let message = `Reconciled ${output.scanned} tasks: ${summary.archived} archived, ${summary.open} open, ${terminal} terminal, ` +
-		`${summary.not_found} not found, ${summary.failed} failed.`;
+	let message: string;
+	if ("archived" in summary) {
+		const terminal = summary.merged + summary.closed + summary.terminal;
+		message = `Reconciled ${output.scanned} tasks: ${summary.archived} archived, ${summary.open} open, ${terminal} terminal, ` +
+			`${summary.not_found} not found, ${summary.failed} failed.`;
+	} else {
+		message = `Reconciled ${output.scanned} tasks: ${summary.merged} merged, ${summary.open} open, ${summary.closed} closed, ` +
+			`${summary.not_found} not found, ${summary.failed} failed.`;
+	}
 	const failedTaskIds = output.results.filter((result) => result.state === "error").map((result) => result.task_id as string);
 	if (failedTaskIds.length > 0) {
 		const shown = failedTaskIds.slice(0, MAX_FAILED_TASK_IDS).map((taskId) => `@${taskId}`).join(", ");
@@ -242,8 +253,10 @@ export class ManagerControlExecutor {
 		return executor;
 	}
 
-	async executePresentationControl(command: string, signal?: AbortSignal): Promise<PiSessionControlResult> {
-		if (command !== "github-status-refresh") return { ok: false, message: "Unsupported manager presentation control." };
+	async executePresentationControl(controlId: string, command: string, signal?: AbortSignal): Promise<PiSessionControlResult> {
+		if (!isSupportedManagerPresentationControl(controlId, command)) {
+			return { ok: false, message: "Unsupported manager presentation control." };
+		}
 		try {
 			await this.validateRuntime(signal);
 			if (signal?.aborted) return { ok: false, message: "Manager presentation control was aborted." };
@@ -256,6 +269,13 @@ export class ManagerControlExecutor {
 			if (signal?.aborted) return { ok: false, message: "Manager presentation control was aborted." };
 			if (result.code !== 0) {
 				return boundedControlResult({ ok: false, message: failureMessage(result, `Manager control failed with exit ${result.code}.`) });
+			}
+			if (command === "task-reconcile-pr") {
+				const output = parseJson(result.stdout, "task-reconcile-pr");
+				if (!isReconcilePullRequestBatchSuccess(output)) {
+					return { ok: false, message: "task-reconcile-pr returned conflicting manager output." };
+				}
+				return boundedControlResult({ ok: true, message: formatReconcilePullRequestBatch(output) });
 			}
 			return { ok: true, message: "Manager control completed." };
 		} catch (error) {

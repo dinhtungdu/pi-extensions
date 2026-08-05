@@ -43,7 +43,8 @@ import {
 	type PiSessionControlResult,
 } from "./controls.js";
 import {
-	SUPPORTED_MANAGER_PRESENTATION_CONTROL,
+	isSupportedManagerPresentationControl,
+	SUPPORTED_MANAGER_PRESENTATION_CONTROLS,
 	type ManagerPresentation,
 } from "./manager-presentation.js";
 
@@ -591,7 +592,7 @@ export class DiscordRelayCore {
 	private async executeCurrentPresentationControl(request: DiscordPresentationControlRequest): Promise<PiSessionControlResult> {
 		if (request.guildId !== this.config.guildId) return { ok: false, message: "This manager control is not authorized." };
 		const custom = /^m:([a-f0-9]{64}):([a-z0-9-]+)$/.exec(request.customId);
-		if (!custom || custom[2] !== SUPPORTED_MANAGER_PRESENTATION_CONTROL) {
+		if (!custom || !SUPPORTED_MANAGER_PRESENTATION_CONTROLS.includes(custom[2]!)) {
 			return { ok: false, message: "This manager control is malformed or unsupported." };
 		}
 		const project = await this.state.projectSummaryByChannel(request.channelId);
@@ -604,7 +605,7 @@ export class DiscordRelayCore {
 		if (!owner?.executePresentationControl || this.activeSessions.get(owner.sessionId) !== owner ||
 			!authorization || authorization.owner !== owner || authorization.revision !== project.summary.revision ||
 			project.summary.delivery?.messageId !== request.messageId || desired?.revision !== custom[1] ||
-			delivered?.revision !== custom[1] || !control || control.command !== SUPPORTED_MANAGER_PRESENTATION_CONTROL) {
+			delivered?.revision !== custom[1] || !control || !isSupportedManagerPresentationControl(control.id, control.command)) {
 			return { ok: false, message: "This manager control is stale or no longer authorized." };
 		}
 		const execution = (async () => {

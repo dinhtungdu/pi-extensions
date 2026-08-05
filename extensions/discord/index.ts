@@ -374,7 +374,9 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					...(managerExecutor && managerPresentationProducer ? {
 						onManagerPresentationControl: async (request, signal) => {
 							try {
-								return boundedControlResult(await managerExecutor!.executePresentationControl(request.command, signal));
+								return boundedControlResult(await managerExecutor!.executePresentationControl(
+									request.controlId, request.command, signal,
+								));
 							} finally {
 								managerPresentationProducer.requestRefresh(0);
 							}

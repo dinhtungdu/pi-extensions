@@ -23,7 +23,7 @@ import {
 } from "./controls.js";
 import {
 	MANAGER_PRESENTATION_SCHEMA_VERSION,
-	SUPPORTED_MANAGER_PRESENTATION_CONTROL,
+	SUPPORTED_MANAGER_PRESENTATION_CONTROLS,
 	type ManagerPresentation,
 } from "./manager-presentation.js";
 
@@ -372,7 +372,7 @@ export class LocalRelayClient {
 					...(this.callbacks.onManagerPresentationControl ? {
 						managerPresentation: {
 							schemaVersion: MANAGER_PRESENTATION_SCHEMA_VERSION,
-							controlIds: [SUPPORTED_MANAGER_PRESENTATION_CONTROL],
+							controlIds: [...SUPPORTED_MANAGER_PRESENTATION_CONTROLS],
 						},
 					} : {}),
 				};

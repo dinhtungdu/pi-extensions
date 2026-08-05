@@ -4,7 +4,15 @@ import { realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 const RENDER_TIMEOUT_MS = 2_000, MAX_OUTPUT_BYTES = 1_048_576, REFRESH_DEBOUNCE_MS = 100;
 export const MAX_MANAGER_PRESENTATION_CONTENT = 2_000, MANAGER_PRESENTATION_SCHEMA_VERSION = 1;
-export const SUPPORTED_MANAGER_PRESENTATION_CONTROL = "github-status-refresh";
+export const MANAGER_PRESENTATION_CONTROL_COMMANDS = {
+	"github-status-refresh": "github-status-refresh",
+	"github-task-reconcile": "task-reconcile-pr",
+} as const;
+export const SUPPORTED_MANAGER_PRESENTATION_CONTROLS = Object.freeze(Object.keys(MANAGER_PRESENTATION_CONTROL_COMMANDS));
+export function isSupportedManagerPresentationControl(id: unknown, command: unknown): boolean {
+	return typeof id === "string" && typeof command === "string" &&
+		MANAGER_PRESENTATION_CONTROL_COMMANDS[id as keyof typeof MANAGER_PRESENTATION_CONTROL_COMMANDS] === command;
+}
 export const MANAGER_PRESENTATION_STYLES = ["primary", "secondary", "success", "danger"] as const;
 export type ManagerPresentationStyle = typeof MANAGER_PRESENTATION_STYLES[number];
 export interface ManagerPresentationControl { id: string; label: string; style: ManagerPresentationStyle; command: string }
@@ -26,8 +34,8 @@ export function isManagerPresentation(value: unknown): value is ManagerPresentat
 		!value.warnings.every((warning) => typeof warning === "string" && warning.length <= 500)) return false;
 	const ids = new Set<string>();
 	return value.controls.every((control) => {
-		if (!isRecord(control) || control.id !== SUPPORTED_MANAGER_PRESENTATION_CONTROL ||
-			control.command !== SUPPORTED_MANAGER_PRESENTATION_CONTROL || typeof control.label !== "string" ||
+		if (!isRecord(control) || typeof control.id !== "string" || typeof control.command !== "string" ||
+			!isSupportedManagerPresentationControl(control.id, control.command) || typeof control.label !== "string" ||
 			control.label.length < 1 || control.label.length > 80 || typeof control.style !== "string" ||
 			!(MANAGER_PRESENTATION_STYLES as readonly string[]).includes(control.style) || ids.has(control.id)) return false;
 		ids.add(control.id);

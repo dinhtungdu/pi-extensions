@@ -12,7 +12,7 @@ import {
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
 } from "./controls.js";
-import { MANAGER_PRESENTATION_SCHEMA_VERSION, SUPPORTED_MANAGER_PRESENTATION_CONTROL } from "./manager-presentation.js";
+import { MANAGER_PRESENTATION_SCHEMA_VERSION, SUPPORTED_MANAGER_PRESENTATION_CONTROLS } from "./manager-presentation.js";
 
 export interface RelayHostOptions {
 	paths: RelayPaths;
@@ -64,7 +64,7 @@ export function negotiatedManagerPresentation(
 		registration.managerPresentation?.schemaVersion !== MANAGER_PRESENTATION_SCHEMA_VERSION) return undefined;
 	return {
 		schemaVersion: 1,
-		controlIds: registration.managerPresentation.controlIds.filter((id) => id === SUPPORTED_MANAGER_PRESENTATION_CONTROL),
+		controlIds: registration.managerPresentation.controlIds.filter((id) => SUPPORTED_MANAGER_PRESENTATION_CONTROLS.includes(id)),
 	};
 }
 

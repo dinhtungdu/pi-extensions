@@ -17,8 +17,8 @@ import {
 } from "./controls.js";
 import {
 	isManagerPresentation,
+	isSupportedManagerPresentationControl,
 	MANAGER_PRESENTATION_SCHEMA_VERSION,
-	SUPPORTED_MANAGER_PRESENTATION_CONTROL,
 	type ManagerPresentation,
 } from "./manager-presentation.js";
 
@@ -176,7 +176,7 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 	if (frame.type === "manager_control") return isPiManagerControlRequest(frame);
 	if (frame.type === "manager_presentation_control") {
 		return typeof frame.requestId === "string" && typeof frame.revision === "string" && /^[a-f0-9]{64}$/.test(frame.revision) &&
-			frame.controlId === SUPPORTED_MANAGER_PRESENTATION_CONTROL && frame.command === SUPPORTED_MANAGER_PRESENTATION_CONTROL;
+			isSupportedManagerPresentationControl(frame.controlId, frame.command);
 	}
 	if (frame.type === "inbound_acked" || frame.type === "inbound_images_released") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
