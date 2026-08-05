@@ -415,7 +415,7 @@ try {
 		MANAGER_CONTROL_IPC_TIMEOUT_MS,
 	} = await importBuilt("extensions/discord/relay-host.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
-	const { inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
+	const { DiscordBridge, inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const {
 		InboundImageStore,
 		INBOUND_IMAGE_DOWNLOAD_ATTEMPTS,
@@ -2886,13 +2886,29 @@ try {
 	assert.equal(assistantText({
 		role: "assistant",
 		stopReason: "stop",
-		content: [{ type: "thinking", thinking: "secret" }, { type: "text", text: "Final" }],
-	}), "Final");
+		content: [{ type: "thinking", thinking: "secret" }, { type: "text", text: " Final " }, { type: "text", text: "answer " }],
+	}), "Final answer");
 	assert.equal(assistantText({
 		role: "assistant",
-		stopReason: "aborted",
-		content: [{ type: "text", text: "partial" }],
-	}), undefined);
+		stopReason: "length",
+		content: [{ type: "text", text: "bounded" }],
+	}), "bounded");
+	const omittedAssistantMessages = [
+		{ role: "user", stopReason: "stop", content: [{ type: "text", text: "user" }] },
+		{ role: "system", stopReason: "stop", content: [{ type: "text", text: "system" }] },
+		...(["toolUse", "pending", "aborted", "error", undefined].map((stopReason) => ({
+			role: "assistant", stopReason, content: [{ type: "text", text: "partial" }],
+		}))),
+		{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "visible" }, { type: "toolCall" }] },
+		...(["tool_call", "progress", "thinking", "image", "audio"].map((type) => ({
+			role: "assistant", stopReason: "stop", content: [{ type }],
+		}))),
+		{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: " \n " }] },
+		{ role: "assistant", stopReason: "stop", content: "malformed" },
+		{ role: "assistant", stopReason: "stop", content: [null] },
+		{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: 7 }] },
+	];
+	for (const message of omittedAssistantMessages) assert.equal(assistantText(message), undefined);
 	const chunks = splitDiscordText("a".repeat(4_100));
 	assert.equal(chunks.join(""), "a".repeat(4_100));
 	assert.ok(chunks.every((chunk) => chunk.length <= 1_900));
@@ -3527,8 +3543,11 @@ try {
 	const compatibilityPaths = relayPaths(compatibilityDirectory);
 	const previousHostFrames = [];
 	const previousHostRegistrations = [];
+	const compatibilitySockets = [];
 	let rejectOutbound = false;
+	let handleOutbound;
 	const compatibilityServer = createServer((socket) => {
+		compatibilitySockets.push(socket);
 		socket.setEncoding("utf8");
 		let buffer = "";
 		socket.on("data", (data) => {
@@ -3547,6 +3566,8 @@ try {
 						previousHostFrames.push(frame);
 						if (!previousValidator(frame)) {
 							socket.write(`${JSON.stringify({ type: "error", message: "Invalid local Discord relay IPC frame" })}\n`);
+						} else if (handleOutbound?.(frame, socket)) {
+							// The focused persistence tests control acknowledgement or disconnection.
 						} else if (rejectOutbound) {
 							socket.write(`${JSON.stringify({ type: "error", message: "injected correlated rejection", requestId: frame.requestId })}\n`);
 						} else {
@@ -3604,6 +3625,81 @@ try {
 	await assert.rejects(() => compatibilityClient.sendUserText("reject once"), /injected correlated rejection/);
 	assert.ok(Date.now() - rejectionStarted < 1_000, "correlated request failures must reject without the 30s request timeout");
 	assert.equal(previousHostFrames.filter((frame) => frame.text === "reject once").length, 1, "declared request failures must not retry forever");
+	rejectOutbound = false;
+
+	const bridgeErrors = [];
+	const chainBridge = new DiscordBridge(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		{ cwd: "/compat-chain", sessionId: "compat-chain" },
+		{ onUserMessage() {}, onError(error) { bridgeErrors.push(error); }, onStatus() {} },
+		{ paths: compatibilityPaths, launchRelay: async () => {} },
+	);
+	await chainBridge.start();
+	let heldAcknowledgement;
+	handleOutbound = (frame, socket) => {
+		if (frame.text !== "ordered A") return false;
+		heldAcknowledgement = { frame, socket };
+		return true;
+	};
+	const orderedA = chainBridge.enqueueAssistantMessage("stable-a", "ordered A");
+	chainBridge.beginAgentRun("unrelated-inbound");
+	const orderedB = chainBridge.enqueueAssistantMessage("stable-b", "ordered B");
+	await waitFor(() => heldAcknowledgement, "withheld A persistence frame");
+	await chainBridge.settleAgentRun();
+	await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+	assert.equal(previousHostFrames.some((frame) => frame.text === "ordered B"), false,
+		"settlement and a withheld A acknowledgement must not let B overtake");
+	heldAcknowledgement.socket.write(`${JSON.stringify({
+		type: "outbound_queued", requestId: heldAcknowledgement.frame.requestId, messageId: heldAcknowledgement.frame.messageId,
+	})}\n`);
+	await Promise.all([orderedA, orderedB]);
+	assert.deepEqual(previousHostFrames.filter((frame) => frame.text.startsWith("ordered ")).map((frame) => [frame.messageId, frame.text]), [
+		["stable-a", "ordered A"], ["stable-b", "ordered B"],
+	], "assistant persistence must retain capture order and producer IDs");
+
+	let lostAckAttempts = 0;
+	handleOutbound = (frame, socket) => {
+		if (frame.text !== "lost acknowledgement") return false;
+		if (++lostAckAttempts === 1) socket.destroy();
+		return lostAckAttempts === 1;
+	};
+	await chainBridge.enqueueAssistantMessage("stable-lost", "lost acknowledgement");
+	const lostAckFrames = previousHostFrames.filter((frame) => frame.text === "lost acknowledgement");
+	assert.equal(lostAckFrames.length, 2);
+	assert.equal(new Set(lostAckFrames.map((frame) => frame.messageId)).size, 1,
+		"ACK uncertainty must retain the producer message ID for relay deduplication");
+	assert.notEqual(lostAckFrames[0].requestId, lostAckFrames[1].requestId,
+		"each persistence retry needs a fresh correlated request ID");
+
+	handleOutbound = undefined;
+	compatibilitySockets.at(-1).destroy();
+	await chainBridge.enqueueAssistantMessage("stable-pre-disconnect", "pre-enqueue disconnect");
+	assert.ok(previousHostFrames.some((frame) => frame.messageId === "stable-pre-disconnect"),
+		"a pre-enqueue disconnect must reconnect and persist the captured ID");
+	rejectOutbound = true;
+	await assert.rejects(() => chainBridge.enqueueAssistantMessage("stable-rejected", "rejected assistant"),
+		/injected correlated rejection/);
+	rejectOutbound = false;
+	await chainBridge.enqueueAssistantMessage("stable-after-rejection", "after rejection");
+	await assert.rejects(() => chainBridge.stop(), /injected correlated rejection/);
+	await assert.rejects(() => chainBridge.enqueueAssistantMessage("closed", "must fail"), /not accepting/);
+	assert.equal(bridgeErrors.length, 0);
+
+	const shutdownBridge = new DiscordBridge(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		{ cwd: "/compat-shutdown", sessionId: "compat-shutdown" },
+		{ onUserMessage() {}, onError(error) { bridgeErrors.push(error); }, onStatus() {} },
+		{ paths: compatibilityPaths, launchRelay: async () => {} },
+	);
+	await shutdownBridge.start();
+	handleOutbound = (frame) => frame.text === "withheld during shutdown";
+	const unpersisted = shutdownBridge.enqueueAssistantMessage("stable-shutdown", "withheld during shutdown");
+	void unpersisted.catch(() => {});
+	await waitFor(() => previousHostFrames.some((frame) => frame.messageId === "stable-shutdown"), "shutdown persistence frame");
+	const assistantShutdownStarted = Date.now();
+	await assert.rejects(() => shutdownBridge.stop(), /Timed out after 2000ms draining/);
+	assert.ok(Date.now() - assistantShutdownStarted < 4_000, "shutdown persistence drain must remain bounded");
+	handleOutbound = undefined;
 	await compatibilityClient.stop();
 	await new Promise((resolveClose) => compatibilityServer.close(resolveClose));
 	await rm(compatibilityDirectory, { recursive: true, force: true });
@@ -4637,13 +4733,21 @@ try {
 	await first.emit("input", { text: "Discord echo", source: "extension" });
 	assert.equal(gateway.sent.length, sentBeforeLoopCheck, "Discord-origin extension input must not loop back to Discord");
 	await first.emit("before_agent_start", { prompt: "local assistant mirror" });
+	FakeGateway.failOnceTexts.add("final only");
 	await first.emit("message_end", {
 		message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "final only" }] },
 	});
-	assert.notEqual(gateway.sent.at(-1)?.text, "final only");
+	await waitFor(() => FakeGateway.sendAttempts.get("final only") === 1, "post-persistence Discord attempt");
+	const persistedAssistant = (await new DiscordStateStore(stateFile).getSession("session-11111111")).outboundMessages
+		.find((message) => message.chunks.map((chunk) => chunk.content).join("") === "final only");
+	assert.ok(persistedAssistant, "eligible message_end must durably persist before settlement and Discord delivery");
+	assert.match(persistedAssistant.id, /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/,
+		"message_end capture must assign a stable UUID before persistence");
+	await waitFor(() => gateway.sent.some((message) => message.text === "final only"), "transient Discord retry");
+	assert.equal(gateway.sent.filter((message) => message.text === "final only").length, 1);
 	await first.emit("agent_settled", {});
-	await waitFor(() => gateway.sent.some((message) => message.text === "final only"), "durable final assistant send");
-	assert.equal(gateway.sent.at(-1)?.text, "final only", "assistant output must wait for agent_settled");
+	assert.equal(gateway.sent.filter((message) => message.text === "final only").length, 1,
+		"agent settlement must not own or duplicate assistant persistence");
 
 	async function runTerminalLifecycle(id, stopReason) {
 		const delivery = second.nextUserMessage();

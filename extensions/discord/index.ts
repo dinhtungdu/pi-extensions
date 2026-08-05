@@ -1,8 +1,10 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DiscordBridge, inboundMessageId, stripInboundMarker, type BridgeSession } from "./bridge.js";
+import { assistantText } from "./text.js";
 import {
 	DISCORD_CONFIG_FILE,
 	type DiscordBridgeConfig,
@@ -523,9 +525,17 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			bridge?.agentEnded(event.messages, ctx.signal?.aborted === true);
 		});
 
-		pi.on("message_end", (event, ctx) => {
+		pi.on("message_end", async (event, ctx) => {
 			if (event.message.role === "assistant") {
-				bridge?.captureAssistantMessage(event.message);
+				const acceptingBridge = bridge;
+				const text = assistantText(event.message);
+				if (!acceptingBridge || !text) return;
+				const messageId = randomUUID();
+				try {
+					await acceptingBridge.enqueueAssistantMessage(messageId, text);
+				} catch (error) {
+					ctx.ui.notify(`Discord assistant-message mirror failed: ${errorMessage(error)}`, "error");
+				}
 				return;
 			}
 			if (event.message.role !== "user" || !bridge) return;
@@ -552,11 +562,6 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				await bridge?.settleAgentRun();
 			} catch (error) {
 				ctx.ui.notify(`Discord settled-image cleanup deferred: ${errorMessage(error)}`, "warning");
-			}
-			try {
-				await bridge?.flushSettledAssistant();
-			} catch (error) {
-				ctx.ui.notify(`Discord assistant-message mirror failed: ${errorMessage(error)}`, "error");
 			}
 		});
 

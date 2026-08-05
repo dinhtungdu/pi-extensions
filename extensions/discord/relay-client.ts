@@ -206,8 +206,8 @@ export class LocalRelayClient {
 		for (const chunk of interactiveUserChunks(text)) await this.queueOutbound("user", chunk);
 	}
 
-	async sendAssistantText(text: string): Promise<void> {
-		await this.queueOutbound("assistant", text);
+	async sendAssistantText(messageId: string, text: string): Promise<void> {
+		await this.queueOutbound("assistant", text, messageId);
 	}
 
 	async sendProjectSummary(text: string): Promise<boolean> {
@@ -550,9 +550,8 @@ export class LocalRelayClient {
 		}
 	}
 
-	private async queueOutbound(kind: "user" | "assistant", text: string): Promise<void> {
+	private async queueOutbound(kind: "user" | "assistant", text: string, messageId: string = randomUUID()): Promise<void> {
 		if (!text.trim()) return;
-		const messageId = randomUUID();
 		for (;;) {
 			if (this.stopped) throw new Error("Local Discord relay client is stopped");
 			try {

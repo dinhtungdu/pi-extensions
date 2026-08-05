@@ -1,6 +1,5 @@
 import type { DiscordBridgeConfig } from "./config.js";
 import { LocalRelayClient, type RelayClientDependencies, type RelayClientStatus } from "./relay-client.js";
-import { assistantText } from "./text.js";
 import type {
 	ManagerProjectCatalogueEntry,
 	ManagerTaskCatalogueEntry,
@@ -20,6 +19,7 @@ import type { ManagerPresentation } from "./manager-presentation.js";
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
 const ONE = "\u200c";
+const ASSISTANT_DRAIN_TIMEOUT_MS = 2_000;
 
 export interface BridgeSession {
 	cwd: string;
@@ -74,7 +74,9 @@ export function stripInboundMarker(text: string): string {
 
 export class DiscordBridge {
 	private readonly relay: LocalRelayClient;
-	private finalAssistantText: string | undefined;
+	private assistantPersistence = Promise.resolve();
+	private assistantPersistenceFailure: Error | undefined;
+	private acceptingAssistantMessages = false;
 	private readonly submittedInboundIds = new Set<string>();
 	private readonly acceptedInboundIds = new Set<string>();
 	private readonly restoredImageInboundIds = new Set<string>();
@@ -114,15 +116,37 @@ export class DiscordBridge {
 			await this.acknowledgeAndRelease(messageId, true);
 		}
 		this.restoredImageInboundIds.clear();
+		this.assistantPersistenceFailure = undefined;
+		this.acceptingAssistantMessages = true;
 		return this.status();
 	}
 
 	async stop(): Promise<void> {
-		this.finalAssistantText = undefined;
-		this.resetAgentRun();
-		this.imageInboundIds.clear();
-		this.restoredImageInboundIds.clear();
-		await this.relay.stop();
+		this.acceptingAssistantMessages = false;
+		let failure: Error | undefined;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				this.assistantPersistence,
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(() => reject(new Error(`Timed out after ${ASSISTANT_DRAIN_TIMEOUT_MS}ms draining Discord assistant messages`)),
+						ASSISTANT_DRAIN_TIMEOUT_MS);
+				}),
+			]);
+			failure = this.assistantPersistenceFailure;
+		} catch (error) {
+			failure = error instanceof Error ? error : new Error(String(error));
+		} finally {
+			if (timer) clearTimeout(timer);
+			this.assistantPersistenceFailure = undefined;
+			this.resetAgentRun();
+			this.imageInboundIds.clear();
+			this.restoredImageInboundIds.clear();
+			try { await this.relay.stop(); } catch (error) {
+				failure ??= error instanceof Error ? error : new Error(String(error));
+			}
+		}
+		if (failure) throw failure;
 	}
 
 	status(): BridgeStatus {
@@ -172,7 +196,6 @@ export class DiscordBridge {
 	}
 
 	beginAgentRun(messageId?: string): void {
-		this.finalAssistantText = undefined;
 		this.resetAgentRun();
 		this.initialInboundId = messageId;
 		this.activeInboundId = messageId;
@@ -208,16 +231,13 @@ export class DiscordBridge {
 		}));
 	}
 
-	captureAssistantMessage(message: { role?: string; content?: unknown; stopReason?: string }): void {
-		if (message.role !== "assistant") return;
-		this.finalAssistantText = assistantText(message);
-	}
-
-	async flushSettledAssistant(): Promise<void> {
-		const text = this.finalAssistantText;
-		if (!text) return;
-		await this.relay.sendAssistantText(text);
-		if (this.finalAssistantText === text) this.finalAssistantText = undefined;
+	async enqueueAssistantMessage(messageId: string, text: string): Promise<void> {
+		if (!this.acceptingAssistantMessages) throw new Error("Discord bridge is not accepting assistant messages");
+		const pending = this.assistantPersistence.then(() => this.relay.sendAssistantText(messageId, text));
+		this.assistantPersistence = pending.catch((error) => {
+			this.assistantPersistenceFailure ??= error instanceof Error ? error : new Error(String(error));
+		});
+		return pending;
 	}
 
 	private associateInbound(messageId: string): void {

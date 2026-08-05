@@ -54,8 +54,10 @@ export function assistantText(message: {
 	content?: unknown;
 	stopReason?: string;
 }): string | undefined {
-	if (message.role !== "assistant" || !Array.isArray(message.content)) return undefined;
-	if (message.stopReason === "aborted" || message.stopReason === "error") return undefined;
+	if (message.role !== "assistant" || (message.stopReason !== "stop" && message.stopReason !== "length") ||
+		!Array.isArray(message.content)) return undefined;
+	if (message.content.some((part) => Boolean(part) && typeof part === "object" &&
+		(part as { type?: unknown }).type === "toolCall")) return undefined;
 	const text = message.content
 		.filter((part): part is { type: "text"; text: string } => {
 			return Boolean(part) && typeof part === "object" && (part as { type?: unknown }).type === "text" &&
