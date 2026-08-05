@@ -2428,6 +2428,140 @@ try {
 	assert.equal(FakeGateway.channelMessages.get("summary-channel").at(-1).text, "summary seven from disconnected canonical change");
 	await restartSummaryCore.stop();
 
+	const teardownSummaryChannel = "teardown-summary-channel";
+	FakeGateway.channelMessages.delete(teardownSummaryChannel);
+	const teardownSummaryStateFile = join(dataDir, "teardown-summary-state.json");
+	const teardownSummaryState = new DiscordStateStore(teardownSummaryStateFile);
+	const teardownSummaryGateway = new FakeGateway();
+	teardownSummaryGateway.ensureProjectChannel = async () => teardownSummaryChannel;
+	const teardownSummaryCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		teardownSummaryState,
+		teardownSummaryGateway,
+	);
+	await teardownSummaryCore.start();
+	await teardownSummaryCore.prepareRegistration("teardown-summary-client", "teardown-summary-generation", {
+		cwd: "/teardown-manager",
+		projectIdentityResolved: true,
+		sessionId: "teardown-summary-session",
+	});
+	await teardownSummaryCore.activateRegistration(
+		"teardown-summary-client",
+		"teardown-summary-generation",
+		"teardown-summary-session",
+		() => true,
+		undefined,
+		false,
+		undefined,
+		true,
+	);
+	const recordTeardownSummarySent = teardownSummaryState.recordProjectSummarySent.bind(teardownSummaryState);
+	let releaseTeardownRecord;
+	let teardownRecordStarted;
+	const teardownRecordAttempt = new Promise((resolveStarted) => { teardownRecordStarted = resolveStarted; });
+	let failTeardownRecord = true;
+	teardownSummaryState.recordProjectSummarySent = async (...args) => {
+		if (!failTeardownRecord) return recordTeardownSummarySent(...args);
+		failTeardownRecord = false;
+		teardownRecordStarted();
+		await new Promise((resolveRecord) => { releaseTeardownRecord = resolveRecord; });
+		throw new Error("injected teardown after accepted summary send");
+	};
+	await teardownSummaryCore.queueProjectSummary(
+		"teardown-summary-client",
+		"teardown-summary-generation",
+		"teardown-summary-session",
+		"summary accepted before teardown",
+	);
+	await teardownRecordAttempt;
+	const acceptedTeardownMessage = FakeGateway.channelMessages.get(teardownSummaryChannel).at(-1);
+	const pendingTeardownSummary = (await teardownSummaryState.projectSummaries())[0].summary.pendingSend;
+	assert.ok(pendingTeardownSummary, "accepted summary send must retain its durable pending nonce until recorded");
+	const compactTeardownSummaryState = teardownSummaryState.compact.bind(teardownSummaryState);
+	let teardownStopCompacted;
+	const teardownStopCompaction = new Promise((resolveCompacted) => { teardownStopCompacted = resolveCompacted; });
+	teardownSummaryState.compact = async (...args) => {
+		const result = await compactTeardownSummaryState(...args);
+		teardownStopCompacted();
+		return result;
+	};
+	const teardownStop = teardownSummaryCore.stop();
+	await teardownStopCompaction;
+	await new Promise((resolveTurn) => setImmediate(resolveTurn));
+	releaseTeardownRecord();
+	await teardownStop;
+	assert.equal(FakeGateway.sendAttempts.get("summary accepted before teardown"), 1,
+		"teardown must prevent the stopped relay from retrying uncertain summary transport");
+	assert.equal((await new DiscordStateStore(teardownSummaryStateFile).projectSummaries())[0].summary.pendingSend.nonce,
+		pendingTeardownSummary.nonce, "teardown must preserve the uncertain send nonce for restart recovery");
+
+	const teardownRestartGateway = new FakeGateway();
+	teardownRestartGateway.ensureProjectChannel = async () => teardownSummaryChannel;
+	const teardownRestartCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		new DiscordStateStore(teardownSummaryStateFile),
+		teardownRestartGateway,
+	);
+	let teardownRestartSummaryOperations = 0;
+	for (const method of ["latestMessageId", "sendText", "editOwnText", "deleteOwnText"]) {
+		const original = teardownRestartGateway[method].bind(teardownRestartGateway);
+		teardownRestartGateway[method] = async (...args) => {
+			teardownRestartSummaryOperations++;
+			return original(...args);
+		};
+	}
+	await teardownRestartCore.start();
+	await teardownRestartCore.prepareRegistration("teardown-unrelated-client", "teardown-unrelated-generation", {
+		cwd: "/teardown-unrelated",
+		projectIdentityResolved: true,
+		sessionId: "teardown-unrelated-session",
+	});
+	await teardownRestartCore.activateRegistration(
+		"teardown-unrelated-client",
+		"teardown-unrelated-generation",
+		"teardown-unrelated-session",
+		() => true,
+	);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+	assert.equal(teardownRestartSummaryOperations, 0,
+		"an unrelated restarted session must not reconcile another project's pending summary nonce");
+	await teardownRestartCore.prepareRegistration("teardown-recovery-client", "teardown-recovery-generation", {
+		cwd: "/teardown-manager",
+		projectIdentityResolved: true,
+		sessionId: "teardown-recovery-session",
+	});
+	await teardownRestartCore.activateRegistration(
+		"teardown-recovery-client",
+		"teardown-recovery-generation",
+		"teardown-recovery-session",
+		() => true,
+		undefined,
+		false,
+		undefined,
+		true,
+	);
+	await teardownRestartCore.queueProjectSummary(
+		"teardown-recovery-client",
+		"teardown-recovery-generation",
+		"teardown-recovery-session",
+		"changed summary after restart",
+	);
+	await waitFor(async () => {
+		const summary = (await new DiscordStateStore(teardownSummaryStateFile).projectSummaries())[0]?.summary;
+		return summary?.delivery?.content === "changed summary after restart" && !summary.pendingSend;
+	}, "accepted teardown summary nonce recovery before changed restart summary");
+	assert.equal(FakeGateway.sendAttempts.get("summary accepted before teardown"), 2,
+		"restart must recover the accepted send with its durable nonce");
+	assert.equal(FakeGateway.sendAttempts.get("changed summary after restart"), undefined,
+		"changed desired text must edit the recovered send instead of creating a second summary");
+	assert.equal(FakeGateway.channelMessages.get(teardownSummaryChannel).filter((message) => message.botOwned).length, 1,
+		"teardown recovery and changed desired text must retain one bot summary");
+	assert.deepEqual(FakeGateway.channelMessages.get(teardownSummaryChannel).find((message) => message.botOwned), {
+		...acceptedTeardownMessage,
+		text: "changed summary after restart",
+	}, "restart recovery must update the originally accepted Discord message");
+	await teardownRestartCore.stop();
+
 	assert.equal(projectChannelName("/one/My Project"), "my-project");
 	assert.equal(projectChannelName("/one/project"), projectChannelName("/two/project"));
 	assert.equal(projectChannelName(`/tmp/${"a".repeat(150)}`).length, 100);

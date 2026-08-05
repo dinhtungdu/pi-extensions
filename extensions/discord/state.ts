@@ -444,10 +444,10 @@ export class DiscordStateStore {
 				return { cwd: session.cwd, revision: project.summary.revision, accepted: false };
 			}
 			if (project.summary) {
-				const changed = project.summary.desiredText !== desiredText;
+				// A pending nonce may already identify an accepted Discord send. Keep it so
+				// reconciliation can recover that message before applying newer text.
 				project.summary.desiredText = desiredText;
 				project.summary.revision = revision;
-				if (changed) delete project.summary.pendingSend;
 			} else project.summary = { desiredText, revision };
 			return { cwd: session.cwd, revision, accepted: true };
 		});
