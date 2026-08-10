@@ -2965,11 +2965,13 @@ try {
 	assert.equal(projectChannelName("/tmp/项目"), "project");
 	assert.match(collidingProjectChannelName("/tmp/另一个项目"), /^project-[a-f0-9]{8}$/);
 	assert.equal(projectChannelName("/tmp/Café déjà"), "cafe-deja");
-	assert.match(sessionThreadName("12345678-abcd", "Fix Things"), /^pi-fix-things-12345678$/);
-	assert.equal(sessionThreadName("12345678-abcd"), "pi-session-12345678");
-	assert.equal(sessionThreadName("aaaaaaaa-1111", "Shared task"), "pi-shared-task-aaaaaaaa");
-	assert.equal(sessionThreadName("bbbbbbbb-2222", "Shared task"), "pi-shared-task-bbbbbbbb");
+	assert.equal(sessionThreadName("12345678-abcd", "Fix Things"), "fix-things-12345678");
+	assert.equal(sessionThreadName("12345678-abcd", "strip-pi-prefix-from-thread"), "strip-pi-prefix-from-thread-12345678");
+	assert.equal(sessionThreadName("12345678-abcd"), "session-12345678");
+	assert.equal(sessionThreadName("aaaaaaaa-1111", "Shared task"), "shared-task-aaaaaaaa");
+	assert.equal(sessionThreadName("bbbbbbbb-2222", "Shared task"), "shared-task-bbbbbbbb");
 	assert.notEqual(sessionThreadName("aaaaaaaa-1111", "Shared task"), sessionThreadName("bbbbbbbb-2222", "Shared task"));
+	assert.equal(sessionThreadName("12345678-abcd", "a".repeat(150)).length, 100);
 	assert.equal(assistantText({
 		role: "assistant",
 		stopReason: "stop",

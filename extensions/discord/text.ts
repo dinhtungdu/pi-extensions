@@ -45,7 +45,7 @@ export function collidingProjectChannelName(cwd: string): string {
 
 export function sessionThreadName(sessionId: string, sessionName?: string): string {
 	const suffix = slug(sessionId.replaceAll("-", "").slice(0, 8), "session");
-	const prefix = `pi-${slug(sessionName ?? "session", "session")}`;
+	const prefix = slug(sessionName ?? "session", "session");
 	return `${prefix.slice(0, DISCORD_NAME_LIMIT - suffix.length - 1)}-${suffix}`;
 }
 
