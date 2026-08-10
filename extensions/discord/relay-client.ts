@@ -47,6 +47,7 @@ export interface RelayClientStatus {
 	managerControls?: true;
 	managerPresentation?: { schemaVersion: 1; controlIds: string[] };
 	inboundImages?: true;
+	automaticThreadTitle?: true;
 }
 
 export interface RelayClientCallbacks {
@@ -72,7 +73,7 @@ export interface RelayClientDependencies {
 }
 
 interface PendingRequest {
-	resolve(): void;
+	resolve(value?: boolean): void;
 	reject(error: Error): void;
 	timer: ReturnType<typeof setTimeout>;
 }
@@ -208,6 +209,17 @@ export class LocalRelayClient {
 
 	async sendAssistantText(messageId: string, text: string): Promise<void> {
 		await this.queueOutbound("assistant", text, messageId);
+	}
+
+	async claimAutomaticThreadTitle(): Promise<boolean> {
+		if (!this.currentStatus.automaticThreadTitle) return false;
+		const claimed = await this.sendRequest({ type: "claim_thread_title", requestId: randomUUID() }, REQUEST_TIMEOUT_MS);
+		if (claimed) delete this.currentStatus.automaticThreadTitle;
+		return claimed === true;
+	}
+
+	async renameSessionThread(name: string): Promise<void> {
+		await this.sendRequest({ type: "rename_session_thread", requestId: randomUUID(), name }, REQUEST_TIMEOUT_MS);
 	}
 
 	async sendProjectSummary(text: string): Promise<boolean> {
@@ -441,6 +453,7 @@ export class LocalRelayClient {
 					controlIds: frame.managerPresentation.controlIds.slice(),
 				} } : {}),
 				...(frame.inboundImages ? { inboundImages: true as const } : {}),
+				...(frame.automaticThreadTitle ? { automaticThreadTitle: true as const } : {}),
 			});
 			this.flushLifecycleStatuses();
 			return;
@@ -539,13 +552,14 @@ export class LocalRelayClient {
 			return;
 		}
 		if (frame.type === "inbound_acked" || frame.type === "inbound_images_released" ||
-			frame.type === "outbound_queued" || frame.type === "project_summary_queued" ||
+			frame.type === "outbound_queued" || frame.type === "thread_title_claimed" ||
+			frame.type === "session_thread_renamed" || frame.type === "project_summary_queued" ||
 			frame.type === "manager_presentation_queued" || frame.type === "manager_catalogue_updated") {
 			const pending = this.pendingRequests.get(frame.requestId);
 			if (pending) {
 				clearTimeout(pending.timer);
 				this.pendingRequests.delete(frame.requestId);
-				pending.resolve();
+				pending.resolve(frame.type === "thread_title_claimed" ? frame.claimed : undefined);
 			}
 		}
 	}
@@ -565,13 +579,13 @@ export class LocalRelayClient {
 		}
 	}
 
-	private async sendRequest(frame: Extract<ClientFrame, { requestId: string }>, timeoutMs: number): Promise<void> {
+	private async sendRequest(frame: Extract<ClientFrame, { requestId: string }>, timeoutMs: number): Promise<boolean | undefined> {
 		if (this.stopped) throw new Error("Local Discord relay client is stopped");
 		await this.ensureConnected();
 		const socket = this.socket;
 		const writer = this.writer;
 		if (!socket || socket.destroyed || !writer) throw new Error("Local Discord relay is disconnected");
-		await new Promise<void>((resolve, reject) => {
+		return new Promise<boolean | undefined>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pendingRequests.delete(frame.requestId);
 				reject(new Error(`Local Discord relay request timed out after ${timeoutMs}ms`));

@@ -158,6 +158,14 @@ export class DiscordBridge {
 		return this.relay.restartRelay();
 	}
 
+	async claimAutomaticThreadTitle(): Promise<boolean> {
+		return this.relay.claimAutomaticThreadTitle();
+	}
+
+	async renameSessionThread(name: string): Promise<void> {
+		await this.relay.renameSessionThread(name);
+	}
+
 	async publishProjectSummary(text: string): Promise<boolean> {
 		return this.relay.sendProjectSummary(text);
 	}

@@ -1,10 +1,10 @@
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DiscordBridge, inboundMessageId, stripInboundMarker, type BridgeSession } from "./bridge.js";
-import { assistantText } from "./text.js";
+import { assistantText, sessionThreadName } from "./text.js";
 import {
 	DISCORD_CONFIG_FILE,
 	type DiscordBridgeConfig,
@@ -43,6 +43,9 @@ const STATUS_RECONNECTING = "🔄";
 const STATUS_ERROR = "⚠️";
 const ACCEPTED_INBOUND_ENTRY = "discord-bridge-inbound-accepted";
 const MANAGER_SUMMARY_COMMAND = "/github-refresh-reconcile";
+const AUTOMATIC_THREAD_TITLE_REPLY_COUNT = 3;
+const MAX_THREAD_TITLE_CONVERSATION_CHARS = 12_000;
+const THREAD_TITLE_SYSTEM_PROMPT = "Generate a concise 3-8 word title for this conversation. Return only the title, without quotes or punctuation commentary.";
 export const MANAGER_CONTROL_RESULT_ENTRY = "discord-manager-control-result";
 
 interface ManagerSummaryTurn {
@@ -58,6 +61,32 @@ interface ManagerControlResultEntryData {
 	taskId?: string;
 	ok: boolean;
 	message: string;
+}
+
+function completedAssistantReplyCount(entries: SessionEntry[]): number {
+	return entries.filter((entry) => entry.type === "message" && assistantText(entry.message) !== undefined).length;
+}
+
+function conversationMessageText(message: unknown): string | undefined {
+	if (!message || typeof message !== "object" || Array.isArray(message)) return undefined;
+	const candidate = message as { role?: unknown; content?: unknown };
+	if (candidate.role !== "user" && candidate.role !== "assistant") return undefined;
+	const text = typeof candidate.content === "string"
+		? candidate.content
+		: Array.isArray(candidate.content)
+			? candidate.content.filter((part): part is { type: "text"; text: string } => Boolean(part) &&
+				typeof part === "object" && (part as { type?: unknown }).type === "text" &&
+				typeof (part as { text?: unknown }).text === "string").map((part) => part.text).join("\n")
+			: "";
+	const clean = (candidate.role === "user" ? stripInboundMarker(text) : text).trim();
+	return clean ? `${candidate.role === "user" ? "User" : "Assistant"}: ${clean}` : undefined;
+}
+
+function threadTitleConversation(entries: SessionEntry[], currentReply?: unknown): string {
+	const messages: unknown[] = entries.filter((entry) => entry.type === "message").map((entry) => entry.message);
+	if (currentReply && messages.at(-1) !== currentReply) messages.push(currentReply);
+	return messages.map(conversationMessageText).filter((line): line is string => line !== undefined)
+		.join("\n\n").slice(-MAX_THREAD_TITLE_CONVERSATION_CHARS);
 }
 
 function compactEntry(text: string) {
@@ -110,6 +139,38 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 	const createTransport = dependencies.createTransport ?? (() => new DiscordJsTransport());
 	const autoStartForCwd = dependencies.autoStartForCwd ?? shouldAutoStartDiscordBridge;
 	const environment = dependencies.environment ?? process.env;
+	const completeThreadTitle = async (ctx: ExtensionContext, conversation: string) => {
+		if (!ctx.model) throw new Error("no Pi model is selected");
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		if (!auth.ok) throw new Error(auth.error);
+		const provider = ctx.modelRegistry.getProvider(ctx.model.provider);
+		if (!provider) throw new Error(`Pi model provider is unavailable: ${ctx.model.provider}`);
+		const response = await provider.stream(
+			ctx.model,
+			{
+				systemPrompt: THREAD_TITLE_SYSTEM_PROMPT,
+				messages: [{
+					role: "user",
+					content: [{ type: "text", text: conversation }],
+					timestamp: Date.now(),
+				}],
+			},
+			{
+				...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+				...(auth.headers ? { headers: auth.headers } : {}),
+				cacheRetention: "none",
+				sessionId: randomUUID(),
+				...(ctx.signal ? { signal: ctx.signal } : {}),
+			},
+		).result();
+		if (response.stopReason !== "stop" && response.stopReason !== "length") {
+			throw new Error(`model stopped with ${response.stopReason}`);
+		}
+		const generated = response.content.filter((part): part is { type: "text"; text: string } => part.type === "text")
+			.map((part) => part.text).join(" ").trim();
+		if (!generated) throw new Error("model returned an empty title");
+		return generated;
+	};
 	let inProcessRelay: Promise<boolean> | undefined;
 	const launchRelay = dependencies.launchRelay ?? (dependencies.createStateStore || dependencies.createTransport
 		? async () => {
@@ -157,6 +218,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		let publishingPresentation: Promise<void> | undefined;
 		let presentationPublishRequested = false;
 		let operation: Promise<void> = Promise.resolve();
+		let completedAssistantReplies = 0;
+		let automaticThreadTitleAttempt: Promise<void> | undefined;
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
 
 		function modelCatalogue(ctx: ExtensionContext): PiModelCatalogueEntry[] {
@@ -231,6 +294,46 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					...(shouldSubscribeOwnerToMiddleManagerThread(environment) ? { subscribeOwnerToThread: true as const } : {}),
 				},
 			};
+		}
+
+		async function maybeAttemptAutomaticThreadTitle(ctx: ExtensionContext, currentReply?: unknown): Promise<void> {
+			if (completedAssistantReplies !== AUTOMATIC_THREAD_TITLE_REPLY_COUNT) return;
+			if (automaticThreadTitleAttempt) return automaticThreadTitleAttempt;
+			const active = bridge;
+			if (!active?.status().automaticThreadTitle) return;
+			let tracked: Promise<void>;
+			tracked = (async () => {
+				let claimed: boolean;
+				try {
+					claimed = await active.claimAutomaticThreadTitle();
+				} catch (error) {
+					ctx.ui.notify(`Discord automatic thread-title claim failed: ${errorMessage(error)}`, "warning");
+					return;
+				}
+				if (!claimed) return;
+
+				let name: string;
+				try {
+					const conversation = threadTitleConversation(ctx.sessionManager.getBranch(), currentReply);
+					if (!conversation) throw new Error("conversation text is unavailable");
+					const generated = (await completeThreadTitle(ctx, conversation)).trim();
+					if (!generated) throw new Error("model returned an empty title");
+					name = sessionThreadName(ctx.sessionManager.getSessionId(), generated);
+				} catch (error) {
+					ctx.ui.notify(`Discord automatic thread-title generation failed: ${errorMessage(error)}`, "warning");
+					return;
+				}
+
+				try {
+					await active.renameSessionThread(name);
+				} catch (error) {
+					ctx.ui.notify(`Discord automatic thread rename failed: ${errorMessage(error)}`, "warning");
+				}
+			})().finally(() => {
+				if (automaticThreadTitleAttempt === tracked) automaticThreadTitleAttempt = undefined;
+			});
+			automaticThreadTitleAttempt = tracked;
+			await tracked;
 		}
 
 		function publishPresentation(ctx: ExtensionContext): void {
@@ -428,6 +531,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				presentationProducer = managerPresentationProducer;
 				taskSummaryProducer?.start();
 				presentationProducer?.start();
+				await maybeAttemptAutomaticThreadTitle(ctx);
 			} catch (error) {
 				managerProducer?.stop();
 				managerPresentationProducer?.stop();
@@ -493,6 +597,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		}
 
 		pi.on("session_start", async (_event, ctx) => {
+			completedAssistantReplies = completedAssistantReplyCount(ctx.sessionManager.getBranch());
 			await serialize(() => autoStartForCwd(ctx.cwd) ? startBridge(ctx, false) : stopBridge(ctx));
 		});
 
@@ -574,13 +679,17 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			if (event.message.role === "assistant") {
 				const acceptingBridge = bridge;
 				const text = assistantText(event.message);
-				if (!acceptingBridge || !text) return;
-				const messageId = randomUUID();
-				try {
-					await acceptingBridge.enqueueAssistantMessage(messageId, text);
-				} catch (error) {
-					ctx.ui.notify(`Discord assistant-message mirror failed: ${errorMessage(error)}`, "error");
+				if (!text) return;
+				completedAssistantReplies++;
+				if (acceptingBridge) {
+					const messageId = randomUUID();
+					try {
+						await acceptingBridge.enqueueAssistantMessage(messageId, text);
+					} catch (error) {
+						ctx.ui.notify(`Discord assistant-message mirror failed: ${errorMessage(error)}`, "error");
+					}
 				}
+				await maybeAttemptAutomaticThreadTitle(ctx, event.message);
 				return;
 			}
 			if (event.message.role !== "user" || !bridge) return;

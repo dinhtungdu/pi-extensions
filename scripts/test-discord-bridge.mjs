@@ -58,6 +58,7 @@ class FakeGateway {
 	static summaryEvents = [];
 	static failDeleteOnce = new Set();
 	static failEditOnce = new Set();
+	static failNextThreadRename = false;
 
 	connected = false;
 	listeners = new Set();
@@ -69,6 +70,8 @@ class FakeGateway {
 	presentationControlListeners = new Set();
 	projectRequests = [];
 	threadRequests = [];
+	threadRenameRequests = [];
+	threadNames = new Map();
 	sent = [];
 	threadCounter = 0;
 
@@ -157,7 +160,18 @@ class FakeGateway {
 	async ensureSessionThread(request) {
 		this.threadRequests.push(request);
 		if (request.mappedThreadId && !FakeGateway.deletedThreads.has(request.mappedThreadId)) return request.mappedThreadId;
-		return `thread-${++this.threadCounter}-${request.name.slice(-8)}`;
+		const threadId = `thread-${++this.threadCounter}-${request.name.slice(-8)}`;
+		this.threadNames.set(threadId, request.name);
+		return threadId;
+	}
+
+	async renameSessionThread(request) {
+		this.threadRenameRequests.push({ ...request });
+		if (FakeGateway.failNextThreadRename) {
+			FakeGateway.failNextThreadRename = false;
+			throw new Error("injected Discord thread rename failure");
+		}
+		this.threadNames.set(request.threadId, request.name);
 	}
 
 	async fetchMessagesAfter(threadId, afterId) {
@@ -261,6 +275,7 @@ function createExtensionHarness(extension, {
 	sessionName,
 	entries = [],
 	entryRendererError = false,
+	threadTitleResult = "Generated conversation title",
 	models = [
 		{ provider: "openai", id: "gpt-test", name: "GPT Test", input: ["text", "image"] },
 		{ provider: "anthropic", id: "claude-test", name: "Claude Test", input: ["text", "image"] },
@@ -282,6 +297,7 @@ function createExtensionHarness(extension, {
 	let appendError = false;
 	let appendCalls = 0;
 	let abortRequests = 0;
+	const modelCompletions = [];
 	const pi = {
 		on(name, handler) {
 			const handlers = events.get(name) ?? [];
@@ -334,6 +350,16 @@ function createExtensionHarness(extension, {
 		modelRegistry: {
 			getAvailable: () => models,
 			find: (provider, id) => models.find((model) => model.provider === provider && model.id === id),
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: { "x-test": "automatic-title" } }),
+			getProvider: (provider) => provider === currentModel?.provider ? {
+				stream(model, context, options) {
+					modelCompletions.push({ model, context, options });
+					return { async result() {
+						if (threadTitleResult instanceof Error) throw threadTitleResult;
+						return { stopReason: "stop", content: [{ type: "text", text: threadTitleResult }] };
+					} };
+				},
+			} : undefined,
 		},
 		sessionManager: { getSessionId: () => sessionId, getBranch: () => entries },
 		ui: {
@@ -350,6 +376,7 @@ function createExtensionHarness(extension, {
 		statuses,
 		userMessages,
 		entries,
+		modelCompletions,
 		setIdle(value) { idle = value; },
 		setPendingMessages(value) { pendingMessages = value; },
 		setAppendError(value) { appendError = value; },
@@ -371,6 +398,12 @@ function createExtensionHarness(extension, {
 			return commands.get(name).handler(args, ctx);
 		},
 	};
+}
+
+async function emitCompletedAssistantReply(harness, text) {
+	const message = { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] };
+	await harness.emit("message_end", { message });
+	harness.entries.push({ type: "message", message });
 }
 
 try {
@@ -1103,6 +1136,21 @@ try {
 		allowedMentions: { parse: [] },
 		flags: MessageFlags.SuppressEmbeds,
 	}], "ordinary edits must retain embed suppression");
+	const transportThreadRenames = [];
+	const automaticTitleTransport = new DiscordJsTransport();
+	automaticTitleTransport.readyClient = () => ({ channels: { async fetch(threadId) {
+		assert.equal(threadId, "automatic-title-thread");
+		return {
+			parentId: "automatic-title-channel",
+			isThread: () => true,
+			async setName(name, reason) { transportThreadRenames.push({ name, reason }); },
+		};
+	} } });
+	await automaticTitleTransport.renameSessionThread({
+		channelId: "automatic-title-channel", threadId: "automatic-title-thread", name: "generated-title",
+	});
+	assert.deepEqual(transportThreadRenames, [{ name: "generated-title", reason: "Pi session conversation title" }],
+		"automatic naming must invoke only the mapped Discord thread rename API");
 	const managerDefinition = managerCommandDefinition();
 	assert.equal(managerDefinition.name, "m");
 	const commandRegistrationEvents = [];
@@ -3012,6 +3060,20 @@ try {
 	assert.equal(sessionThreadName("bbbbbbbb-2222", "Shared task"), "shared-task");
 	assert.equal(sessionThreadName("aaaaaaaa-1111", "Shared task"), sessionThreadName("bbbbbbbb-2222", "Shared task"));
 	assert.equal(sessionThreadName("12345678-abcd", "a".repeat(150)).length, 100);
+	const automaticTitleState = new DiscordStateStore(join(dataDir, "automatic-title-state.json"));
+	await automaticTitleState.resolveSessionThread("initially-named", "/named", "named-channel", async () => "named-thread");
+	await automaticTitleState.resolveSessionThread("initially-named", "/named", "named-channel", async (threadId) => threadId, true);
+	assert.equal((await automaticTitleState.getSession("initially-named")).automaticThreadTitle, undefined,
+		"an initially named mapping must never become eligible when later registration metadata is absent");
+	await automaticTitleState.resolveSessionThread("initially-generic", "/generic", "generic-channel", async () => "generic-thread", true);
+	assert.equal((await automaticTitleState.getSession("initially-generic")).automaticThreadTitle, "eligible");
+	assert.equal(await automaticTitleState.claimAutomaticThreadTitle("initially-generic"), true);
+	assert.equal(await automaticTitleState.claimAutomaticThreadTitle("initially-generic"), false,
+		"generation-attempt ownership must be atomic and one-shot");
+	assert.equal((await automaticTitleState.getSession("initially-generic")).automaticThreadTitle, "generation-attempted");
+	assert.equal((await automaticTitleState.reserveAutomaticThreadRename("initially-generic")).automaticThreadTitle, "rename-attempted");
+	assert.equal(await automaticTitleState.reserveAutomaticThreadRename("initially-generic"), undefined,
+		"Discord rename reservation must be atomic and one-shot");
 	assert.equal(assistantText({
 		role: "assistant",
 		stopReason: "stop",
@@ -3137,6 +3199,14 @@ try {
 		"older lifecycle-only manager clients must remain protocol-compatible without ask targets");
 	assert.equal(isClientFrame({ type: "manager_control_result", requestId: "manager-1", ok: true, message: "done" }), true);
 	assert.equal(isClientFrame({ type: "release_inbound_images", requestId: "release-1", messageId: "message-1" }), true);
+	assert.equal(isClientFrame({ type: "claim_thread_title", requestId: "title-claim-1" }), true);
+	assert.equal(isClientFrame({ type: "rename_session_thread", requestId: "title-rename-1", name: "concise-thread-title" }), true);
+	assert.equal(isClientFrame({ type: "rename_session_thread", requestId: "title-rename-2", name: "x".repeat(101) }), false,
+		"automatic Discord thread titles must retain the 100-character limit");
+	assert.equal(isClientFrame({ type: "rename_session_thread", requestId: "title-rename-3", name: "Unsafe title!" }), false,
+		"automatic Discord thread titles must retain slug conventions");
+	assert.equal(isServerFrame({ type: "thread_title_claimed", requestId: "title-claim-1", claimed: true }), true);
+	assert.equal(isServerFrame({ type: "session_thread_renamed", requestId: "title-rename-1" }), true);
 	assert.equal(isServerFrame({ type: "inbound_images_released", requestId: "release-1", messageId: "message-1" }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "high" } }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "turbo" } }), false);
@@ -4223,8 +4293,116 @@ try {
 		cwd: nonGitDirectory,
 		sessionId: metadataAbsentSessionId,
 		sessionName: undefined,
+		threadTitleResult: "Investigate generic bridge naming",
 	});
 	await metadataAbsent.emit("session_start", { reason: "startup" });
+
+	const namingGateway = FakeGateway.instances[0];
+	const metadataAbsentInitialMapping = await new DiscordStateStore(stateFile).getSession(metadataAbsentSessionId);
+	const automaticRenamesBeforeReplies = namingGateway.threadRenameRequests.length;
+	await emitCompletedAssistantReply(metadataAbsent, "First generic reply");
+	await emitCompletedAssistantReply(metadataAbsent, "Second generic reply");
+	assert.equal(metadataAbsent.modelCompletions.length, 0, "generic sessions must not generate a title before three completed replies");
+	assert.equal(namingGateway.threadRenameRequests.length, automaticRenamesBeforeReplies,
+		"generic sessions must not rename before three completed replies");
+	await emitCompletedAssistantReply(metadataAbsent, "Third generic reply");
+	const metadataAbsentMapping = await new DiscordStateStore(stateFile).getSession(metadataAbsentSessionId);
+	assert.equal(metadataAbsent.modelCompletions.length, 1, "the third completed generic reply must trigger exactly one title generation");
+	assert.match(metadataAbsent.modelCompletions[0].context.messages[0].content[0].text, /Third generic reply/,
+		"automatic title generation must receive the completed conversation through the current Pi provider");
+	assert.equal(metadataAbsent.modelCompletions[0].options.apiKey, "test-key");
+	assert.deepEqual(metadataAbsent.modelCompletions[0].options.headers, { "x-test": "automatic-title" });
+	assert.deepEqual(namingGateway.threadRenameRequests.at(-1), {
+		channelId: metadataAbsentMapping.channelId,
+		threadId: metadataAbsentMapping.threadId,
+		name: "investigate-generic-bridge-naming",
+	}, "the generated title must slug and rename only the mapped Discord thread");
+	assert.equal(namingGateway.threadNames.get(metadataAbsentMapping.threadId), "investigate-generic-bridge-naming");
+	assert.deepEqual(
+		{ cwd: metadataAbsentMapping.cwd, channelId: metadataAbsentMapping.channelId, threadId: metadataAbsentMapping.threadId },
+		{ cwd: metadataAbsentInitialMapping.cwd, channelId: metadataAbsentInitialMapping.channelId, threadId: metadataAbsentInitialMapping.threadId },
+		"automatic naming must preserve the Discord session/thread identity and mapping",
+	);
+	assert.equal(metadataAbsentMapping.automaticThreadTitle, "rename-attempted",
+		"a successful rename must retain a durable one-attempt marker");
+
+	await emitCompletedAssistantReply(taskNamed, "First explicit reply");
+	await emitCompletedAssistantReply(taskNamed, "Second explicit reply");
+	await emitCompletedAssistantReply(taskNamed, "Third explicit reply");
+	await emitCompletedAssistantReply(taskFallback, "First task-derived reply");
+	await emitCompletedAssistantReply(taskFallback, "Second task-derived reply");
+	await emitCompletedAssistantReply(taskFallback, "Third task-derived reply");
+	assert.equal(taskNamed.modelCompletions.length, 0,
+		"explicit Pi names must never enter automatic title generation");
+	assert.equal(taskFallback.modelCompletions.length, 0,
+		"task-derived names must never enter automatic title generation");
+
+	const generationFailureSessionId = "77777777-generation-failure";
+	const generationFailure = createExtensionHarness(extension, {
+		cwd: nonGitDirectory,
+		sessionId: generationFailureSessionId,
+		sessionName: undefined,
+		threadTitleResult: new Error("injected title generation failure"),
+	});
+	await generationFailure.emit("session_start", { reason: "startup" });
+	await emitCompletedAssistantReply(generationFailure, "Generation failure reply one");
+	await emitCompletedAssistantReply(generationFailure, "Generation failure reply two");
+	await emitCompletedAssistantReply(generationFailure, "Generation failure reply three");
+	const generationFailureMapping = await new DiscordStateStore(stateFile).getSession(generationFailureSessionId);
+	assert.equal(generationFailureMapping.automaticThreadTitle, "generation-attempted");
+	assert.equal(namingGateway.threadNames.get(generationFailureMapping.threadId), "pi-session-77777777",
+		"generation failure must leave the generic Discord thread name unchanged");
+	assert.ok(generationFailure.notifications.some(([message, level]) =>
+		level === "warning" && message.includes("injected title generation failure")));
+	await generationFailure.emit("session_shutdown", { reason: "quit" });
+	const generationCallsBeforeRestart = generationFailure.modelCompletions.length;
+	const generationFailureRestart = createExtensionHarness(extension, {
+		cwd: nonGitDirectory,
+		sessionId: generationFailureSessionId,
+		sessionName: undefined,
+		entries: generationFailure.entries,
+	});
+	await generationFailureRestart.emit("session_start", { reason: "resume" });
+	assert.equal(generationFailureRestart.modelCompletions.length, 0,
+		"a durable generation attempt must suppress restart retries");
+	assert.equal(generationCallsBeforeRestart, 1);
+	await generationFailureRestart.emit("session_shutdown", { reason: "quit" });
+
+	const renameFailureSessionId = "88888888-rename-failure";
+	const renameFailure = createExtensionHarness(extension, {
+		cwd: nonGitDirectory,
+		sessionId: renameFailureSessionId,
+		sessionName: undefined,
+		threadTitleResult: "Rename failure conversation",
+	});
+	await renameFailure.emit("session_start", { reason: "startup" });
+	await emitCompletedAssistantReply(renameFailure, "Rename failure reply one");
+	await emitCompletedAssistantReply(renameFailure, "Rename failure reply two");
+	FakeGateway.failNextThreadRename = true;
+	await emitCompletedAssistantReply(renameFailure, "Rename failure reply three");
+	const renameFailureMapping = await new DiscordStateStore(stateFile).getSession(renameFailureSessionId);
+	const renameAttemptsBeforeRestart = namingGateway.threadRenameRequests.filter(
+		(request) => request.threadId === renameFailureMapping.threadId).length;
+	assert.equal(renameAttemptsBeforeRestart, 1, "Discord rename failure must consume the sole rename attempt");
+	assert.equal(renameFailureMapping.automaticThreadTitle, "rename-attempted");
+	assert.equal(namingGateway.threadNames.get(renameFailureMapping.threadId), "pi-session-88888888",
+		"Discord rename failure must leave the generic thread name unchanged");
+	assert.ok(renameFailure.notifications.some(([message, level]) =>
+		level === "warning" && message.includes("injected Discord thread rename failure")));
+	await renameFailure.emit("session_shutdown", { reason: "quit" });
+	const renameFailureRestart = createExtensionHarness(extension, {
+		cwd: nonGitDirectory,
+		sessionId: renameFailureSessionId,
+		sessionName: undefined,
+		entries: renameFailure.entries,
+	});
+	await renameFailureRestart.emit("session_start", { reason: "resume" });
+	assert.equal(namingGateway.threadRenameRequests.filter((request) => request.threadId === renameFailureMapping.threadId).length,
+		renameAttemptsBeforeRestart, "a durable rename attempt must suppress restart retries");
+	assert.equal(renameFailureRestart.modelCompletions.length, 0,
+		"a durable rename attempt must also suppress title regeneration");
+	await renameFailureRestart.emit("session_shutdown", { reason: "quit" });
+
 	const managerSummarySession = createExtensionHarness(extension, {
 		cwd: managerFixture,
 		sessionId: "manager-summary-session",

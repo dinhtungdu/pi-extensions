@@ -83,10 +83,13 @@ export interface RetainedInboundImages {
 	images: QueuedInboundImage[];
 }
 
+export type AutomaticThreadTitleState = "eligible" | "generation-attempted" | "rename-attempted";
+
 export interface SessionThreadMapping {
 	cwd: string;
 	channelId: string;
 	threadId: string;
+	automaticThreadTitle?: AutomaticThreadTitleState;
 	lastActiveAt: number;
 	threadCursors: Record<string, string>;
 	pendingMessages: QueuedDiscordMessage[];
@@ -273,7 +276,9 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 			typeof mapping.threadId !== "string" ||
 			(mapping.lastActiveAt !== undefined && (!Number.isSafeInteger(mapping.lastActiveAt) || Number(mapping.lastActiveAt) < 0)) ||
 			(mapping.lastMessageId !== undefined && typeof mapping.lastMessageId !== "string") ||
-			(mapping.threadCursors !== undefined && !isRecord(mapping.threadCursors))
+			(mapping.threadCursors !== undefined && !isRecord(mapping.threadCursors)) ||
+			(mapping.automaticThreadTitle !== undefined && mapping.automaticThreadTitle !== "eligible" &&
+				mapping.automaticThreadTitle !== "generation-attempted" && mapping.automaticThreadTitle !== "rename-attempted")
 		) {
 			throw new Error(`Discord bridge state ${file} has an invalid session mapping`);
 		}
@@ -291,6 +296,7 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 			cwd: mapping.cwd,
 			channelId: mapping.channelId,
 			threadId: mapping.threadId,
+			...(mapping.automaticThreadTitle ? { automaticThreadTitle: mapping.automaticThreadTitle as AutomaticThreadTitleState } : {}),
 			lastActiveAt: mapping.lastActiveAt === undefined ? fallbackActivityAt : Number(mapping.lastActiveAt),
 			threadCursors,
 			pendingMessages: parsePendingMessages(mapping.pendingMessages, file),
@@ -414,6 +420,7 @@ export class DiscordStateStore {
 		cwd: string,
 		channelId: string,
 		resolve: (existingThreadId: string | undefined) => Promise<string>,
+		automaticThreadTitleEligible = false,
 	): Promise<SessionThreadMapping> {
 		return this.mutate(async (state) => {
 			const existing = state.sessions[sessionId];
@@ -421,10 +428,13 @@ export class DiscordStateStore {
 			const threadId = await resolve(sameParent ? existing.threadId : undefined);
 			const outboundMessages = existing?.outboundMessages ?? [];
 			for (const message of outboundMessages) message.threadId = threadId;
+			const automaticThreadTitle = existing?.automaticThreadTitle ??
+				(!existing && automaticThreadTitleEligible ? "eligible" as const : undefined);
 			const mapping: SessionThreadMapping = {
 				cwd,
 				channelId,
 				threadId,
+				...(automaticThreadTitle ? { automaticThreadTitle } : {}),
 				lastActiveAt: this.now(),
 				threadCursors: existing?.threadCursors ?? {},
 				pendingMessages: existing?.pendingMessages ?? [],
@@ -434,6 +444,26 @@ export class DiscordStateStore {
 			};
 			state.sessions[sessionId] = mapping;
 			return structuredClone(mapping);
+		});
+	}
+
+	async claimAutomaticThreadTitle(sessionId: string): Promise<boolean> {
+		return this.mutate(async (state) => {
+			const session = state.sessions[sessionId];
+			if (!session || session.automaticThreadTitle !== "eligible") return false;
+			session.automaticThreadTitle = "generation-attempted";
+			session.lastActiveAt = this.now();
+			return true;
+		});
+	}
+
+	async reserveAutomaticThreadRename(sessionId: string): Promise<SessionThreadMapping | undefined> {
+		return this.mutate(async (state) => {
+			const session = state.sessions[sessionId];
+			if (!session || session.automaticThreadTitle !== "generation-attempted") return undefined;
+			session.automaticThreadTitle = "rename-attempted";
+			session.lastActiveAt = this.now();
+			return structuredClone(session);
 		});
 	}
 
