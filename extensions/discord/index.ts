@@ -82,8 +82,8 @@ export function shouldPublishManagerTaskSummary(checkoutRoot: string): boolean {
 	return basename(resolve(checkoutRoot)) === "the-manager";
 }
 
-export function shouldSubscribeOwnerToWorkerThread(environment: NodeJS.ProcessEnv = process.env): boolean {
-	return environment.THE_MANAGER_ROLE === "worker" && environment.THE_MANAGER_SESSION_POLICY === "continue";
+export function shouldSubscribeOwnerToMiddleManagerThread(environment: NodeJS.ProcessEnv = process.env): boolean {
+	return environment.THE_MANAGER_ROLE === "middle-manager";
 }
 
 export interface DiscordExtensionDependencies {
@@ -228,7 +228,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					projectIdentityResolved: true,
 					sessionId: ctx.sessionManager.getSessionId(),
 					sessionName: pi.getSessionName() ?? await discoverTaskTitle(project.checkoutRoot),
-					...(shouldSubscribeOwnerToWorkerThread(environment) ? { subscribeOwnerToThread: true as const } : {}),
+					...(shouldSubscribeOwnerToMiddleManagerThread(environment) ? { subscribeOwnerToThread: true as const } : {}),
 				},
 			};
 		}
