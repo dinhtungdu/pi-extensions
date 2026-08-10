@@ -63,6 +63,7 @@ export interface SessionThreadRequest {
 	channelId: string;
 	mappedThreadId?: string;
 	name: string;
+	subscribeOwner?: true;
 }
 
 export interface DiscordTransport {
@@ -141,6 +142,13 @@ export async function reuseSessionThread(
 	if (!thread?.isThread() || thread.parentId !== channelId) return undefined;
 	if (thread.archived) await thread.setArchived(false, "Pi session resumed");
 	return thread.id;
+}
+
+export async function subscribeThreadOwner(thread: {
+	guild: { ownerId: string };
+	members: { add(userId: string): Promise<unknown> };
+}): Promise<void> {
+	await thread.members.add(thread.guild.ownerId);
 }
 
 function compareIds(left: string, right: string): number {
@@ -414,8 +422,12 @@ export class DiscordJsTransport implements DiscordTransport {
 		const client = this.readyClient();
 		if (request.mappedThreadId) {
 			const mapped = await client.channels.fetch(request.mappedThreadId).catch(() => null);
-			const reused = await reuseSessionThread(mapped?.isThread() ? mapped : null, request.channelId);
-			if (reused) return reused;
+			const thread = mapped?.isThread() ? mapped : null;
+			const reused = await reuseSessionThread(thread, request.channelId);
+			if (reused) {
+				if (request.subscribeOwner) await subscribeThreadOwner(thread!);
+				return reused;
+			}
 		}
 
 		const parent = await client.channels.fetch(request.channelId).catch(() => null);
@@ -428,6 +440,7 @@ export class DiscordJsTransport implements DiscordTransport {
 			type: ChannelType.PublicThread,
 			reason: "Pi Discord bridge session thread",
 		});
+		if (request.subscribeOwner) await subscribeThreadOwner(thread);
 		return thread.id;
 	}
 

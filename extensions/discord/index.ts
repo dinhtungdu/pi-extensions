@@ -82,6 +82,10 @@ export function shouldPublishManagerTaskSummary(checkoutRoot: string): boolean {
 	return basename(resolve(checkoutRoot)) === "the-manager";
 }
 
+export function shouldSubscribeOwnerToWorkerThread(environment: NodeJS.ProcessEnv = process.env): boolean {
+	return environment.THE_MANAGER_ROLE === "worker" && environment.THE_MANAGER_SESSION_POLICY === "continue";
+}
+
 export interface DiscordExtensionDependencies {
 	loadConfig?: ConfigLoader;
 	saveConfig?: (config: Omit<DiscordBridgeConfig, "epoch"> | DiscordBridgeConfig) => Promise<void>;
@@ -91,6 +95,7 @@ export interface DiscordExtensionDependencies {
 	launchRelay?: () => Promise<void>;
 	restartRelay?: (expectedPid: number, expectedNonce?: string) => Promise<void>;
 	autoStartForCwd?: (cwd: string) => boolean;
+	environment?: NodeJS.ProcessEnv;
 }
 
 function errorMessage(error: unknown): string {
@@ -104,6 +109,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 	const createStateStore = dependencies.createStateStore ?? (() => new DiscordStateStore());
 	const createTransport = dependencies.createTransport ?? (() => new DiscordJsTransport());
 	const autoStartForCwd = dependencies.autoStartForCwd ?? shouldAutoStartDiscordBridge;
+	const environment = dependencies.environment ?? process.env;
 	let inProcessRelay: Promise<boolean> | undefined;
 	const launchRelay = dependencies.launchRelay ?? (dependencies.createStateStore || dependencies.createTransport
 		? async () => {
@@ -219,6 +225,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					projectIdentityResolved: true,
 					sessionId: ctx.sessionManager.getSessionId(),
 					sessionName: pi.getSessionName() ?? await discoverTaskTitle(project.checkoutRoot),
+					...(shouldSubscribeOwnerToWorkerThread(environment) ? { subscribeOwnerToThread: true as const } : {}),
 				},
 			};
 		}

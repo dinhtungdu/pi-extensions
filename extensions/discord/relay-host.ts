@@ -275,6 +275,7 @@ export class LocalRelayHost {
 				projectIdentityResolved: parsed.projectIdentityResolved,
 				sessionId: parsed.sessionId,
 				sessionName: parsed.sessionName,
+				subscribeOwnerToThread: parsed.subscribeOwnerToThread,
 			});
 			if (state.closed) {
 				this.options.core.unregisterClient(parsed.clientId, parsed.generation);

@@ -398,6 +398,7 @@ try {
 		MANAGER_CONTROL_RESULT_ENTRY,
 		shouldAutoStartDiscordBridge,
 		shouldPublishManagerTaskSummary,
+		shouldSubscribeOwnerToWorkerThread,
 	} = await importBuilt("extensions/discord/index.js");
 	const { managerProjectCatalogue, managerTaskCatalogue, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
 	const {
@@ -459,6 +460,7 @@ try {
 		presentationComponents,
 		replaceOwnLifecycleReaction,
 		reuseSessionThread,
+		subscribeThreadOwner,
 	} = await importBuilt("extensions/discord/transport.js");
 
 	const activationHome = join(dataDir, "activation-home");
@@ -480,6 +482,14 @@ try {
 		"the-manager checkout must publish task summaries");
 	assert.equal(shouldPublishManagerTaskSummary(join(activationHome, "workspace", "the-manager-copy")), false,
 		"other checkouts must not publish task summaries");
+	assert.equal(shouldSubscribeOwnerToWorkerThread({
+		THE_MANAGER_ROLE: "worker", THE_MANAGER_SESSION_POLICY: "continue",
+	}), true, "retained primary workers must request owner subscription");
+	assert.equal(shouldSubscribeOwnerToWorkerThread({
+		THE_MANAGER_ROLE: "worker", THE_MANAGER_SESSION_POLICY: "fresh",
+	}), false, "fresh review workers must not request owner subscription");
+	assert.equal(shouldSubscribeOwnerToWorkerThread({ THE_MANAGER_SESSION_POLICY: "continue" }), false,
+		"ordinary continued sessions must not request owner subscription");
 
 	let explicitEnableLoads = 0;
 	const explicitRelayDirectory = join(dataDir, "explicit-enable-relay");
@@ -506,6 +516,63 @@ try {
 		"/discord reconnect must explicitly connect an outside session");
 	await explicitEnable.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "explicit-enable relay shutdown");
+
+	const primaryRelayDirectory = join(dataDir, "primary-worker-relay");
+	const primaryStateFile = join(primaryRelayDirectory, "state.json");
+	const primaryGateway = new FakeGateway();
+	const primaryWorker = createExtensionHarness(createDiscordExtension({
+		environment: { THE_MANAGER_ROLE: "worker", THE_MANAGER_SESSION_POLICY: "continue" },
+		paths: relayPaths(primaryRelayDirectory),
+		loadConfig: async () => ({ token: "primary-token", guildId: "12345", epoch: 1 }),
+		createStateStore: () => new DiscordStateStore(primaryStateFile),
+		createTransport: () => primaryGateway,
+		autoStartForCwd: () => true,
+	}), {
+		cwd: "/work/primary-worker",
+		sessionId: "retained-primary-worker",
+		sessionName: "Retained primary worker",
+	});
+	await primaryWorker.emit("session_start", { reason: "startup" });
+	const primaryMapping = await new DiscordStateStore(primaryStateFile).getSession("retained-primary-worker");
+	assert.equal(primaryGateway.threadRequests[0].subscribeOwner, true,
+		"retained primary metadata must request owner subscription");
+	await primaryWorker.runCommand("discord", "reconnect");
+	assert.deepEqual(primaryGateway.threadRequests.at(-1), {
+		channelId: primaryMapping.channelId,
+		mappedThreadId: primaryMapping.threadId,
+		name: sessionThreadName("retained-primary-worker", "Retained primary worker"),
+		subscribeOwner: true,
+	}, "continued primary reconnect must reuse and resubscribe the exact worker thread");
+	assert.equal((await new DiscordStateStore(primaryStateFile).getSession("retained-primary-worker")).threadId,
+		primaryMapping.threadId, "continued primary reconnect must not create another thread");
+	const primarySteering = primaryWorker.nextUserMessage();
+	await primaryGateway.emit({
+		id: "primary-steer", channelId: primaryMapping.threadId, content: "steer exact primary", authorBot: false,
+	});
+	assert.equal(stripInboundMarker((await primarySteering).text), "steer exact primary",
+		"owner-visible thread messages must continue steering the exact retained worker");
+	await primaryWorker.emit("session_shutdown", { reason: "quit" });
+	await waitFor(() => FakeGateway.activeConnections === 0, "primary-worker relay shutdown");
+
+	const freshRelayDirectory = join(dataDir, "fresh-worker-relay");
+	const freshGateway = new FakeGateway();
+	const freshWorker = createExtensionHarness(createDiscordExtension({
+		environment: { THE_MANAGER_ROLE: "worker", THE_MANAGER_SESSION_POLICY: "fresh" },
+		paths: relayPaths(freshRelayDirectory),
+		loadConfig: async () => ({ token: "fresh-token", guildId: "12345", epoch: 1 }),
+		createStateStore: () => new DiscordStateStore(join(freshRelayDirectory, "state.json")),
+		createTransport: () => freshGateway,
+		autoStartForCwd: () => true,
+	}), {
+		cwd: "/work/fresh-worker",
+		sessionId: "fresh-review-worker",
+		sessionName: "Fresh review worker",
+	});
+	await freshWorker.emit("session_start", { reason: "startup" });
+	assert.equal(freshGateway.threadRequests[0].subscribeOwner, undefined,
+		"fresh review workers must not subscribe the owner");
+	await freshWorker.emit("session_shutdown", { reason: "quit" });
+	await waitFor(() => FakeGateway.activeConnections === 0, "fresh-worker relay shutdown");
 
 	assert.deepEqual(parseDiscordConfig({ token: " token ", guildId: "12345", categoryId: "" }), {
 		token: "token",
@@ -563,6 +630,16 @@ try {
 		async setArchived(value) { reopened = value === false; },
 	}, "channel-1"), "thread-1");
 	assert.equal(reopened, true);
+	const subscribedOwners = new Set();
+	const ownerSubscriptionCalls = [];
+	const ownerThread = {
+		guild: { ownerId: "configured-owner" },
+		members: { async add(userId) { ownerSubscriptionCalls.push(userId); subscribedOwners.add(userId); } },
+	};
+	await subscribeThreadOwner(ownerThread);
+	await subscribeThreadOwner(ownerThread);
+	assert.deepEqual(ownerSubscriptionCalls, ["configured-owner", "configured-owner"]);
+	assert.deepEqual([...subscribedOwners], ["configured-owner"], "repeated owner subscription must retain one membership");
 	const malformedConfig = join(dataDir, "malformed-config.json");
 	await writeFile(malformedConfig, "{oops");
 	await assert.rejects(() => loadDiscordConfig(malformedConfig, {}), /Cannot read Discord bridge config/);
@@ -2964,6 +3041,9 @@ try {
 		sessionId: "session",
 	};
 	assert.equal(isClientFrame(resolvedRegistrationFrame), true);
+	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, subscribeOwnerToThread: true }), true);
+	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, subscribeOwnerToThread: false }), false,
+		"owner subscription must be an explicit additive registration capability");
 	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, projectIdentityResolved: "true" }), false);
 	const controlRegistrationFrame = {
 		...resolvedRegistrationFrame,
@@ -4046,6 +4126,7 @@ try {
 	let requestedRestartPid;
 	let requestedRestartNonce;
 	const extension = createDiscordExtension({
+		environment: {},
 		paths,
 		loadConfig: async () => ({ token: "token", guildId: "12345", categoryId: "67890", epoch: 1 }),
 		saveConfig: async () => {},

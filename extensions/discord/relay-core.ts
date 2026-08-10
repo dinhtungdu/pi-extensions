@@ -54,6 +54,7 @@ export interface RelaySessionRegistration {
 	sessionId: string;
 	sessionName?: string;
 	managerTaskSummaryProducer?: true;
+	subscribeOwnerToThread?: true;
 }
 
 export interface PreparedRegistration {
@@ -344,6 +345,7 @@ export class DiscordRelayCore {
 					channelId,
 					mappedThreadId,
 					name: sessionThreadName(registration.sessionId, registration.sessionName),
+					...(registration.subscribeOwnerToThread ? { subscribeOwner: true as const } : {}),
 				}),
 			);
 			const catchUp = this.inboundQueue.then(() => this.catchUp(registration.sessionId, mapping));

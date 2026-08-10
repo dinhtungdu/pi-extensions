@@ -114,6 +114,7 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(frame.sessionName === undefined || typeof frame.sessionName === "string") &&
 			(frame.inboundImages === undefined || frame.inboundImages === true) &&
 			(frame.managerTaskSummaryProducer === undefined || frame.managerTaskSummaryProducer === true) &&
+			(frame.subscribeOwnerToThread === undefined || frame.subscribeOwnerToThread === true) &&
 			(frame.managerPresentation === undefined || isManagerPresentationCapability(frame.managerPresentation)) &&
 			(frame.sessionControls === undefined || (
 				Boolean(frame.sessionControls) && typeof frame.sessionControls === "object" && !Array.isArray(frame.sessionControls) &&

@@ -27,6 +27,7 @@ export interface BridgeSession {
 	sessionId: string;
 	sessionName?: string;
 	managerTaskSummaryProducer?: true;
+	subscribeOwnerToThread?: true;
 }
 
 export interface BridgeCallbacks {
