@@ -1064,11 +1064,13 @@ try {
 		nonce: "ordinary-nonce",
 		enforceNonce: true,
 		allowedMentions: { parse: [] },
-	}], "ordinary project and session sends must retain automatic embeds");
+		flags: MessageFlags.SuppressEmbeds,
+	}], "ordinary project and session sends must suppress embeds");
 	assert.deepEqual(ordinaryEditPayloads, [{
 		content: "edited ordinary https://example.com",
 		allowedMentions: { parse: [] },
-	}], "ordinary edits must retain automatic embeds");
+		flags: MessageFlags.SuppressEmbeds,
+	}], "ordinary edits must retain embed suppression");
 	const managerDefinition = managerCommandDefinition();
 	assert.equal(managerDefinition.name, "m");
 	const commandRegistrationEvents = [];
@@ -1133,7 +1135,9 @@ try {
 		await timerTransport.executeManagerControlInteraction({
 			id: "timer-manager-control",
 			channelId: "timer-manager-thread",
-			async deferReply() {},
+			async deferReply(options) {
+				assert.equal(options.flags, MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds);
+			},
 			options: {
 				getSubcommand: () => "handoff",
 				getString: (name, required) => {
@@ -1211,6 +1215,10 @@ try {
 		request: "Inspect it",
 	}, "Discord ask interactions must route both required options without task coercion");
 	assert.equal(managerInteractionReplies[3].content, "✅ settled");
+	assert.ok(
+		managerInteractionReplies.every((reply) => reply.flags === MessageFlags.SuppressEmbeds),
+		"manager interaction replies must suppress embeds",
+	);
 
 	let managerStatus = {
 		...focusedManagerStatus,

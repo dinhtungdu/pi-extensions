@@ -476,6 +476,7 @@ export class DiscordJsTransport implements DiscordTransport {
 			nonce,
 			enforceNonce: true,
 			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
 		});
 		return message.id;
 	}
@@ -503,7 +504,11 @@ export class DiscordJsTransport implements DiscordTransport {
 		const channel = await this.textChannel(channelId, "edit messages");
 		const message = await channel.messages.fetch(messageId);
 		if (message.author.id !== client.user.id) throw new Error(`Discord message ${messageId} is not owned by this bot`);
-		await message.edit({ content: text, allowedMentions: { parse: [] } });
+		await message.edit({
+			content: text,
+			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
+		});
 	}
 
 	async editOwnPresentation(channelId: string, messageId: string, presentation: ManagerPresentation): Promise<void> {
@@ -624,7 +629,7 @@ export class DiscordJsTransport implements DiscordTransport {
 
 	private async executeControlInteraction(command: ChatInputCommandInteraction, channelId?: string): Promise<void> {
 		try {
-			await command.deferReply({ flags: MessageFlags.Ephemeral });
+			await command.deferReply({ flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds });
 		} catch {
 			return;
 		}
@@ -660,6 +665,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		await command.editReply({
 			content: `${bounded.ok ? "✅" : "❌"} ${bounded.message}`,
 			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
 		}).catch(() => {});
 	}
 
@@ -668,11 +674,15 @@ export class DiscordJsTransport implements DiscordTransport {
 		channelId?: string,
 	): Promise<void> {
 		try {
-			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+			await interaction.deferReply({ flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds });
 		} catch {
 			return;
 		}
-		await interaction.editReply({ content: "Running manager control…", allowedMentions: { parse: [] } }).catch(() => {});
+		await interaction.editReply({
+			content: "Running manager control…",
+			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
+		}).catch(() => {});
 		let result: PiSessionControlResult;
 		try {
 			if (!channelId) throw new Error("Discord interaction did not identify its channel.");
@@ -691,12 +701,13 @@ export class DiscordJsTransport implements DiscordTransport {
 		await interaction.editReply({
 			content: `${bounded.ok ? "✅" : "❌"} ${bounded.message}`,
 			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
 		}).catch(() => {});
 	}
 
 	private async executeManagerControlInteraction(command: ChatInputCommandInteraction, channelId?: string): Promise<void> {
 		try {
-			await command.deferReply({ flags: MessageFlags.Ephemeral });
+			await command.deferReply({ flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds });
 		} catch {
 			return;
 		}
@@ -751,6 +762,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		await command.editReply({
 			content: `${bounded.ok ? "✅" : "❌"} ${bounded.message}`,
 			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
 		}).catch(() => {});
 	}
 
