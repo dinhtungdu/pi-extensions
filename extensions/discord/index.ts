@@ -21,7 +21,7 @@ import { resolveProjectContext } from "./project-identity.js";
 import { discoverTaskTitle } from "./task-title.js";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
-import { ManagerPresentationProducer } from "./manager-presentation.js";
+import { ManagerPresentationProducer, type ManagerPresentation } from "./manager-presentation.js";
 import { ManagerControlExecutor } from "./manager-controls.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
@@ -153,6 +153,9 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		let managerTaskCatalogue: ManagerTaskCatalogueEntry[] = [];
 		let managerProjectCatalogue: ManagerProjectCatalogueEntry[] = [];
 		let managerSummaryTurn: ManagerSummaryTurn | undefined;
+		let desiredPresentation: ManagerPresentation | undefined;
+		let publishingPresentation: Promise<void> | undefined;
+		let presentationPublishRequested = false;
 		let operation: Promise<void> = Promise.resolve();
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -230,6 +233,31 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			};
 		}
 
+		function publishPresentation(ctx: ExtensionContext): void {
+			if (!desiredPresentation || !bridge?.status().managerPresentation) return;
+			if (publishingPresentation) {
+				presentationPublishRequested = true;
+				return;
+			}
+			publishingPresentation = (async () => {
+				do {
+					presentationPublishRequested = false;
+					const active = bridge;
+					const presentation = desiredPresentation;
+					if (!active || !presentation || !active.status().managerPresentation) return;
+					try {
+						await active.publishManagerPresentation(presentation);
+					} catch (error) {
+						ctx.ui.notify(`Discord manager-presentation update deferred: ${errorMessage(error)}`, "warning");
+						return;
+					}
+				} while (presentationPublishRequested);
+			})().finally(() => {
+				publishingPresentation = undefined;
+				if (presentationPublishRequested) publishPresentation(ctx);
+			});
+		}
+
 		function setConnectedStatus(ctx: ExtensionContext): void {
 			const status = bridge?.status();
 			ctx.ui.setStatus(
@@ -246,6 +274,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			presentationProducer = undefined;
 			managerTaskCatalogue = [];
 			managerProjectCatalogue = [];
+			desiredPresentation = undefined;
+			presentationPublishRequested = false;
 			const active = bridge;
 			bridge = undefined;
 			await active?.stop();
@@ -288,7 +318,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				},
 			});
 			const managerPresentationProducer = publishManagerTaskSummary ? await ManagerPresentationProducer.create(checkoutRoot, {
-				onPresentation() {},
+				onPresentation(presentation) {
+					desiredPresentation = presentation;
+					publishPresentation(ctx);
+				},
 				onUnavailable(error) {
 					ctx.ui.notify(`Discord manager-presentation producer: ${error.message}`, "warning");
 				},
@@ -313,7 +346,10 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 							STATUS_KEY,
 							status.connected ? STATUS_CONNECTED : STATUS_RECONNECTING,
 						);
-						if (status.connected) taskSummaryProducer?.requestRefresh(0);
+						if (status.connected) {
+							taskSummaryProducer?.requestRefresh(0);
+							presentationProducer?.requestRefresh(0);
+						}
 					},
 					supportsImageInput: () => ctx.model?.input?.includes("image") === true,
 					modelCatalogue: () => modelCatalogue(ctx),
@@ -390,8 +426,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				setConnectedStatus(ctx);
 				taskSummaryProducer = managerProducer;
 				presentationProducer = managerPresentationProducer;
-				// Render only after a correlated command settles; watching manager data could publish partial or failed turn state.
 				taskSummaryProducer?.start();
+				presentationProducer?.start();
 			} catch (error) {
 				managerProducer?.stop();
 				managerPresentationProducer?.stop();
@@ -580,9 +616,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				if (settlementFailure) throw settlementFailure;
 				if (!turn.ended || turn.failed) throw new Error("manager command turn did not complete successfully");
 				if (!presentationProducer) throw new Error("manager presentation producer is unavailable");
-				const presentation = await presentationProducer.renderCurrent();
-				const published = await bridge?.publishManagerPresentation(presentation);
-				if (!published) throw new Error("Discord manager-presentation delivery is unavailable");
+				desiredPresentation = await presentationProducer.renderCurrent();
+				publishPresentation(ctx);
 			} catch (error) {
 				ctx.ui.notify(`Discord manager-summary update failed; retry manually: ${errorMessage(error)}`, "error");
 			} finally {

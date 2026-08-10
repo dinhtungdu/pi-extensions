@@ -2965,12 +2965,12 @@ try {
 	assert.equal(projectChannelName("/tmp/项目"), "project");
 	assert.match(collidingProjectChannelName("/tmp/另一个项目"), /^project-[a-f0-9]{8}$/);
 	assert.equal(projectChannelName("/tmp/Café déjà"), "cafe-deja");
-	assert.equal(sessionThreadName("12345678-abcd", "Fix Things"), "fix-things-12345678");
-	assert.equal(sessionThreadName("12345678-abcd", "strip-pi-prefix-from-thread"), "strip-pi-prefix-from-thread-12345678");
-	assert.equal(sessionThreadName("12345678-abcd"), "session-12345678");
-	assert.equal(sessionThreadName("aaaaaaaa-1111", "Shared task"), "shared-task-aaaaaaaa");
-	assert.equal(sessionThreadName("bbbbbbbb-2222", "Shared task"), "shared-task-bbbbbbbb");
-	assert.notEqual(sessionThreadName("aaaaaaaa-1111", "Shared task"), sessionThreadName("bbbbbbbb-2222", "Shared task"));
+	assert.equal(sessionThreadName("12345678-abcd", "Fix Things"), "fix-things");
+	assert.equal(sessionThreadName("12345678-abcd", "strip-pi-prefix-from-thread"), "strip-pi-prefix-from-thread");
+	assert.equal(sessionThreadName("12345678-abcd"), "session");
+	assert.equal(sessionThreadName("aaaaaaaa-1111", "Shared task"), "shared-task");
+	assert.equal(sessionThreadName("bbbbbbbb-2222", "Shared task"), "shared-task");
+	assert.equal(sessionThreadName("aaaaaaaa-1111", "Shared task"), sessionThreadName("bbbbbbbb-2222", "Shared task"));
 	assert.equal(sessionThreadName("12345678-abcd", "a".repeat(150)).length, 100);
 	assert.equal(assistantText({
 		role: "assistant",
@@ -4202,8 +4202,8 @@ try {
 		}
 	}
 	const managerSummaryMapping = await new DiscordStateStore(stateFile).getSession("manager-summary-session");
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId), undefined,
-		"manager startup must preserve the configured last-good message instead of rendering uncorrelated state");
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "opaque manager payload @everyone",
+		"automatic initial manager presentation");
 	const canonicalSummaryCommand = "/github-refresh-reconcile";
 	const settleManagerCommand = async (stopReason = "stop") => {
 		await managerSummarySession.emit("before_agent_start", { prompt: "expanded canonical manager prompt" });
@@ -4211,11 +4211,6 @@ try {
 		await managerSummarySession.emit("agent_end", { messages: [{ role: "assistant", stopReason }] });
 		await managerSummarySession.emit("agent_settled", {});
 	};
-	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive" }),
-		{ action: "continue" });
-	await settleManagerCommand();
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "opaque manager payload @everyone",
-		"first successful TUI command manager presentation");
 	assert.deepEqual(JSON.parse(await readFile(join(managerFixture, "summary-render-args.json"), "utf8")),
 		["summary-render", "--root", await realpath(managerFixture), "--max-chars", "2000"], "exact summary-render command");
 	const managerSummaryMessage = FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1);
@@ -4228,9 +4223,12 @@ try {
 		{ action: "continue" }, "the exact TUI prompt-template command must retain normal Pi handling");
 	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("b".repeat(64), fullSummary))}\n`);
 	await writeFile(join(managerFixture, "data", "tasks", "tui-command-active.md"), "changed during TUI command\n");
-	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, "opaque manager payload @everyone",
-		"TUI command changes must not replace the last-good summary before settlement");
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === fullSummary,
+		"single canonical task lifecycle change must automatically edit the manager summary");
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
+		"automatic lifecycle publication must edit the existing manager summary message");
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).filter((message) => message.botOwned).length, 1,
+		"automatic lifecycle publication must not post a duplicate manager summary");
 	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive" }),
 		{ action: "handled" }, "a second canonical TUI command must be rejected while one is active");
 	await settleManagerCommand();
@@ -4257,9 +4255,8 @@ try {
 	const discordSummary = "Discord-origin complete summary";
 	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("c".repeat(64), discordSummary))}\n`);
 	await writeFile(join(managerFixture, "data", "tasks", "discord-command-active.md"), "changed during Discord command\n");
-	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, fullSummary,
-		"Discord-origin changes must not replace the last-good summary before settlement");
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === discordSummary,
+		"Discord-origin canonical task change must automatically edit the manager summary");
 	await settleManagerCommand();
 	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === discordSummary,
 		"Discord-origin summary publication after correlated settlement");
@@ -4299,9 +4296,12 @@ try {
 	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
 	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("e".repeat(64), "second opaque payload"))}\n`);
 	await writeFile(join(managerFixture, "data", "tasks", "changed.md"), "changed\n");
-	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, discordSummary,
-		"uncorrelated task changes must not replace the last-good manager summary");
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "second opaque payload",
+		"later canonical task changes must automatically refresh the manager summary");
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
+		"later automatic refresh must retain the existing manager summary message");
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).filter((message) => message.botOwned).length, 1,
+		"later automatic refresh must not post duplicate manager summaries");
 	await waitFor(() => FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "discord").length === 1,
 		"manager catalogue registration and live IPC refresh");
 	assert.deepEqual(FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "discord"), [{
@@ -4438,9 +4438,9 @@ try {
 	const taskFallbackMapping = await namingState.getSession(taskFallbackSessionId);
 	const namedThreadName = sessionThreadName(taskNamedSessionId, "Named Pi session");
 	const namedSiblingThreadName = sessionThreadName(taskNamedSiblingSessionId, "Named Pi session");
-	assert.ok(FakeGateway.instances[0].threadRequests.some((request) => request.name === namedThreadName), "Pi session name must override TASK.md at registration");
-	assert.ok(FakeGateway.instances[0].threadRequests.some((request) => request.name === namedSiblingThreadName), "each named Pi session must retain its session-ID suffix");
-	assert.notEqual(namedThreadName, namedSiblingThreadName, "named sessions under one task must generate unique thread names");
+	assert.equal(namedThreadName, namedSiblingThreadName, "duplicate session names must retain duplicate Discord display names");
+	assert.ok(FakeGateway.instances[0].threadRequests.filter((request) => request.name === namedThreadName).length >= 2,
+		"each named Pi session must create its separate thread with the exact shared display name");
 	assert.equal(taskNamedMapping.channelId, taskNamedSiblingMapping.channelId, "named sessions under one task must share its project channel");
 	assert.notEqual(taskNamedMapping.threadId, taskNamedSiblingMapping.threadId, "named sessions under one task must retain separate threads");
 	assert.ok(FakeGateway.instances[0].threadRequests.some(
