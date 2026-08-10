@@ -10,7 +10,6 @@ import {
 	type PiSessionControlResult,
 } from "./controls.js";
 import { managerProjectCatalogue, managerTaskCatalogue } from "./manager-task-summary.js";
-import { isSupportedManagerPresentationControl } from "./manager-presentation.js";
 
 const STATUS_TIMEOUT_MS = 2_000;
 const VALIDATE_TIMEOUT_MS = 30_000;
@@ -251,36 +250,6 @@ export class ManagerControlExecutor {
 		const executor = new ManagerControlExecutor(canonicalRoot, dependencies.run ?? defaultRun);
 		await executor.validateRuntime();
 		return executor;
-	}
-
-	async executePresentationControl(controlId: string, command: string, signal?: AbortSignal): Promise<PiSessionControlResult> {
-		if (!isSupportedManagerPresentationControl(controlId, command)) {
-			return { ok: false, message: "Unsupported manager presentation control." };
-		}
-		try {
-			await this.validateRuntime(signal);
-			if (signal?.aborted) return { ok: false, message: "Manager presentation control was aborted." };
-			const manager = join(this.root, "bin", "manager.mjs");
-			const result = await this.run(process.execPath, [manager, command, "--root", this.root], {
-				cwd: this.root,
-				timeout: MANAGER_CONTROL_PROCESS_TIMEOUT_MS,
-				signal,
-			});
-			if (signal?.aborted) return { ok: false, message: "Manager presentation control was aborted." };
-			if (result.code !== 0) {
-				return boundedControlResult({ ok: false, message: failureMessage(result, `Manager control failed with exit ${result.code}.`) });
-			}
-			if (command === "task-reconcile-pr") {
-				const output = parseJson(result.stdout, "task-reconcile-pr");
-				if (!isReconcilePullRequestBatchSuccess(output)) {
-					return { ok: false, message: "task-reconcile-pr returned conflicting manager output." };
-				}
-				return boundedControlResult({ ok: true, message: formatReconcilePullRequestBatch(output) });
-			}
-			return { ok: true, message: "Manager control completed." };
-		} catch (error) {
-			return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
-		}
 	}
 
 	async execute(

@@ -21,7 +21,7 @@ import { resolveProjectContext } from "./project-identity.js";
 import { discoverTaskTitle } from "./task-title.js";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
-import { ManagerPresentationProducer, type ManagerPresentation } from "./manager-presentation.js";
+import { ManagerPresentationProducer } from "./manager-presentation.js";
 import { ManagerControlExecutor } from "./manager-controls.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
@@ -42,7 +42,16 @@ const STATUS_CONNECTED = "💬";
 const STATUS_RECONNECTING = "🔄";
 const STATUS_ERROR = "⚠️";
 const ACCEPTED_INBOUND_ENTRY = "discord-bridge-inbound-accepted";
+const MANAGER_SUMMARY_COMMAND = "/github-refresh-reconcile";
 export const MANAGER_CONTROL_RESULT_ENTRY = "discord-manager-control-result";
+
+interface ManagerSummaryTurn {
+	origin: "tui" | "discord";
+	awaitingInput: boolean;
+	started: boolean;
+	ended: boolean;
+	failed: boolean;
+}
 
 interface ManagerControlResultEntryData {
 	action: Exclude<PiManagerControlRequest["action"], "ask">;
@@ -137,9 +146,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		let presentationProducer: ManagerPresentationProducer | undefined;
 		let managerTaskCatalogue: ManagerTaskCatalogueEntry[] = [];
 		let managerProjectCatalogue: ManagerProjectCatalogueEntry[] = [];
-		let desiredPresentation: ManagerPresentation | undefined;
-		let publishingPresentation: Promise<void> | undefined;
-		let presentationPublishRequested = false;
+		let managerSummaryTurn: ManagerSummaryTurn | undefined;
 		let operation: Promise<void> = Promise.resolve();
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -216,31 +223,6 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			};
 		}
 
-		function publishPresentation(ctx: ExtensionContext): void {
-			if (!desiredPresentation || !bridge?.status().managerPresentation) return;
-			if (publishingPresentation) {
-				presentationPublishRequested = true;
-				return;
-			}
-			publishingPresentation = (async () => {
-				do {
-					presentationPublishRequested = false;
-					const active = bridge;
-					const presentation = desiredPresentation;
-					if (!active || !presentation || !active.status().managerPresentation) return;
-					try {
-						await active.publishManagerPresentation(presentation);
-					} catch (error) {
-						ctx.ui.notify(`Discord manager-presentation update deferred: ${errorMessage(error)}`, "warning");
-						return;
-					}
-				} while (presentationPublishRequested);
-			})().finally(() => {
-				publishingPresentation = undefined;
-				if (presentationPublishRequested) publishPresentation(ctx);
-			});
-		}
-
 		function setConnectedStatus(ctx: ExtensionContext): void {
 			const status = bridge?.status();
 			ctx.ui.setStatus(
@@ -250,14 +232,13 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		}
 
 		async function stopBridge(ctx: ExtensionContext): Promise<void> {
+			managerSummaryTurn = undefined;
 			taskSummaryProducer?.stop();
 			taskSummaryProducer = undefined;
 			presentationProducer?.stop();
 			presentationProducer = undefined;
 			managerTaskCatalogue = [];
 			managerProjectCatalogue = [];
-			desiredPresentation = undefined;
-			presentationPublishRequested = false;
 			const active = bridge;
 			bridge = undefined;
 			await active?.stop();
@@ -300,15 +281,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				},
 			});
 			const managerPresentationProducer = publishManagerTaskSummary ? await ManagerPresentationProducer.create(checkoutRoot, {
-				onPresentation(presentation) {
-					desiredPresentation = presentation;
-					publishPresentation(ctx);
-				},
+				onPresentation() {},
 				onUnavailable(error) {
-					if (desiredPresentation?.controls.length) {
-						desiredPresentation = { ...desiredPresentation, controls: [] };
-						publishPresentation(ctx);
-					}
 					ctx.ui.notify(`Discord manager-presentation producer: ${error.message}`, "warning");
 				},
 			}) : undefined;
@@ -332,10 +306,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 							STATUS_KEY,
 							status.connected ? STATUS_CONNECTED : STATUS_RECONNECTING,
 						);
-						if (status.connected) {
-							taskSummaryProducer?.requestRefresh(0);
-							presentationProducer?.requestRefresh(0);
-						}
+						if (status.connected) taskSummaryProducer?.requestRefresh(0);
 					},
 					supportsImageInput: () => ctx.model?.input?.includes("image") === true,
 					modelCatalogue: () => modelCatalogue(ctx),
@@ -373,14 +344,22 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 							return result;
 						},
 					} : {}),
-					...(managerExecutor && managerPresentationProducer ? {
-						onManagerPresentationControl: async (request, signal) => {
+					...(managerPresentationProducer ? {
+						onManagerPresentationControl: async () => {
+							if (managerSummaryTurn || !ctx.isIdle()) {
+								return { ok: false, message: "Refresh & Reconcile is already running; retry when the manager is idle." };
+							}
+							managerSummaryTurn = {
+								origin: "discord", awaitingInput: true, started: false, ended: false, failed: false,
+							};
 							try {
-								return boundedControlResult(await managerExecutor!.executePresentationControl(
-									request.controlId, request.command, signal,
-								));
-							} finally {
-								managerPresentationProducer.requestRefresh(0);
+								pi.sendUserMessage(MANAGER_SUMMARY_COMMAND);
+								return { ok: true, message: "Refresh & Reconcile started in the manager Pi session." };
+							} catch (error) {
+								managerSummaryTurn = undefined;
+								const message = `Refresh & Reconcile was not accepted: ${errorMessage(error)}`;
+								ctx.ui.notify(message, "error");
+								return boundedControlResult({ ok: false, message });
 							}
 						},
 					} : {}),
@@ -404,8 +383,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				setConnectedStatus(ctx);
 				taskSummaryProducer = managerProducer;
 				presentationProducer = managerPresentationProducer;
+				// Render only after a correlated command settles; watching manager data could publish partial or failed turn state.
 				taskSummaryProducer?.start();
-				presentationProducer?.start();
 			} catch (error) {
 				managerProducer?.stop();
 				managerPresentationProducer?.stop();
@@ -481,6 +460,23 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		});
 
 		pi.on("input", async (event, ctx) => {
+			if (event.text === MANAGER_SUMMARY_COMMAND && presentationProducer) {
+				if (event.source === "extension") {
+					if (managerSummaryTurn?.origin !== "discord" || !managerSummaryTurn.awaitingInput) {
+						ctx.ui.notify("Refresh & Reconcile command rejected; retry manually.", "warning");
+						return { action: "handled" };
+					}
+					managerSummaryTurn.awaitingInput = false;
+				} else {
+					if (managerSummaryTurn || !ctx.isIdle()) {
+						ctx.ui.notify("Refresh & Reconcile is already running; retry when the manager is idle.", "warning");
+						return { action: "handled" };
+					}
+					managerSummaryTurn = {
+						origin: "tui", awaitingInput: false, started: false, ended: false, failed: false,
+					};
+				}
+			}
 			if (event.source === "extension" || !bridge) return { action: "continue" };
 			try {
 				await bridge.mirrorUserText(event.text, event.source === "interactive");
@@ -502,6 +498,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		}));
 
 		pi.on("before_agent_start", (event) => {
+			if (managerSummaryTurn && !managerSummaryTurn.awaitingInput) managerSummaryTurn.started = true;
 			bridge?.beginAgentRun(inboundMessageId(event.prompt));
 		});
 
@@ -523,6 +520,11 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 		pi.on("agent_end", (event, ctx) => {
 			bridge?.agentEnded(event.messages, ctx.signal?.aborted === true);
+			if (!managerSummaryTurn?.started) return;
+			const lastAssistant = [...event.messages].reverse().find((message) => message.role === "assistant");
+			managerSummaryTurn.ended = true;
+			managerSummaryTurn.failed = ctx.signal?.aborted === true || lastAssistant?.stopReason === "aborted" ||
+				lastAssistant?.stopReason === "error";
 		});
 
 		pi.on("message_end", async (event, ctx) => {
@@ -558,10 +560,26 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		});
 
 		pi.on("agent_settled", async (_event, ctx) => {
+			let settlementFailure: unknown;
 			try {
 				await bridge?.settleAgentRun();
 			} catch (error) {
+				settlementFailure = error;
 				ctx.ui.notify(`Discord settled-image cleanup deferred: ${errorMessage(error)}`, "warning");
+			}
+			const turn = managerSummaryTurn;
+			if (!turn?.started) return;
+			try {
+				if (settlementFailure) throw settlementFailure;
+				if (!turn.ended || turn.failed) throw new Error("manager command turn did not complete successfully");
+				if (!presentationProducer) throw new Error("manager presentation producer is unavailable");
+				const presentation = await presentationProducer.renderCurrent();
+				const published = await bridge?.publishManagerPresentation(presentation);
+				if (!published) throw new Error("Discord manager-presentation delivery is unavailable");
+			} catch (error) {
+				ctx.ui.notify(`Discord manager-summary update failed; retry manually: ${errorMessage(error)}`, "error");
+			} finally {
+				if (managerSummaryTurn === turn) managerSummaryTurn = undefined;
 			}
 		});
 

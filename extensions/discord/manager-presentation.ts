@@ -5,8 +5,7 @@ import { join } from "node:path";
 const RENDER_TIMEOUT_MS = 2_000, MAX_OUTPUT_BYTES = 1_048_576, REFRESH_DEBOUNCE_MS = 100;
 export const MAX_MANAGER_PRESENTATION_CONTENT = 2_000, MANAGER_PRESENTATION_SCHEMA_VERSION = 1;
 export const MANAGER_PRESENTATION_CONTROL_COMMANDS = {
-	"github-status-refresh": "github-status-refresh",
-	"github-task-reconcile": "task-reconcile-pr",
+	"github-refresh-reconcile": "github-refresh-reconcile",
 } as const;
 export const SUPPORTED_MANAGER_PRESENTATION_CONTROLS = Object.freeze(Object.keys(MANAGER_PRESENTATION_CONTROL_COMMANDS));
 export function isSupportedManagerPresentationControl(id: unknown, command: unknown): boolean {
@@ -113,6 +112,9 @@ export class ManagerPresentationProducer {
 		this.timer = setTimeout(() => { this.timer = undefined; void this.refresh(); }, delay);
 		this.timer.unref();
 	}
+	async renderCurrent(): Promise<ManagerPresentation> {
+		return parseManagerPresentationEnvelope(await this.dependencies.render(this.root));
+	}
 	private async refresh(): Promise<void> {
 		if (this.refreshing) { this.refreshRequested = true; return; }
 		this.refreshing = true;
@@ -120,7 +122,7 @@ export class ManagerPresentationProducer {
 			do {
 				this.refreshRequested = false;
 				try {
-					const presentation = parseManagerPresentationEnvelope(await this.dependencies.render(this.root));
+					const presentation = await this.renderCurrent();
 					if (!this.stopped) this.callbacks.onPresentation(presentation);
 				} catch (error) {
 					if (!this.stopped) this.callbacks.onUnavailable(error instanceof Error ? error : new Error(String(error)));

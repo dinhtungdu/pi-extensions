@@ -850,6 +850,7 @@ try {
 		'if (command === "status") console.log(readFileSync(join(process.cwd(), "status.json"), "utf8"));',
 		'else if (command === "summary-render") { const countPath = join(process.cwd(), "summary-render-count.txt"); let count = 0; try { count = Number(readFileSync(countPath, "utf8")); } catch {} writeFileSync(countPath, String(count + 1)); writeFileSync(join(process.cwd(), "summary-render-args.json"), JSON.stringify(process.argv.slice(2))); console.log(readFileSync(join(process.cwd(), "presentation.json"), "utf8")); }',
 		'else if (command === "github-status-refresh") console.log(JSON.stringify({ ok: true, command }));',
+		'else if (command === "github-refresh-reconcile") { writeFileSync(join(process.cwd(), "forbidden-direct-command.txt"), "called"); console.log(JSON.stringify({ ok: true, command })); }',
 		'else if (command === "task-reconcile-pr" && !process.argv.includes("--task")) { const countPath = join(process.cwd(), "reconcile-count.txt"); let count = 0; try { count = Number(readFileSync(countPath, "utf8")); } catch {} writeFileSync(countPath, String(count + 1)); console.log(JSON.stringify({ ok: true, command, scope: "all", scanned: 0, results: [], summary: { archived: 0, merged: 0, closed: 0, terminal: 0, open: 0, mixed: 0, not_found: 0, failed: 0 } })); }',
 		'else {',
 		'  const taskPath = process.argv[process.argv.indexOf("--task") + 1];',
@@ -922,17 +923,14 @@ try {
 		taskId: "completed-task", project: "woocommerce", title: "Completed task", status: "complete",
 	}], "completed"), [], "ask targets must include only current active manager tasks");
 	const renderedPresentationComponents = presentationComponents({ schemaVersion: 1, revision: "7".repeat(64), content: "opaque",
-		controls: [
-			{ id: "github-status-refresh", label: "Exact manager label", style: "secondary", command: "github-status-refresh" },
-			{ id: "github-task-reconcile", label: "Reconcile Tasks", style: "secondary", command: "task-reconcile-pr" },
-		], degraded: false, warnings: [] });
+		controls: [{ id: "github-refresh-reconcile", label: "Exact manager label", style: "secondary", command: "github-refresh-reconcile" }],
+		degraded: false, warnings: [] });
 	assert.deepEqual(renderedPresentationComponents.map((row) => row.toJSON()), [{ type: 1,
 		components: [
-			{ type: 2, emoji: undefined, custom_id: `m:${"7".repeat(64)}:github-status-refresh`, label: "Exact manager label", style: 2 },
-			{ type: 2, emoji: undefined, custom_id: `m:${"7".repeat(64)}:github-task-reconcile`, label: "Reconcile Tasks", style: 2 },
-		] }], "Discord components must preserve both manager labels and revision-fenced IDs");
+			{ type: 2, emoji: undefined, custom_id: `m:${"7".repeat(64)}:github-refresh-reconcile`, label: "Exact manager label", style: 2 },
+		] }], "Discord components must preserve the manager label and revision-fenced ID");
 	const transportPresentation = { schemaVersion: 1, revision: "8".repeat(64), content: "GitHub: https://example.com/task @everyone",
-		controls: [{ id: "github-status-refresh", label: "Refresh", style: "secondary", command: "github-status-refresh" }],
+		controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "github-refresh-reconcile" }],
 		degraded: false, warnings: [] };
 	const presentationSendPayloads = [];
 	const presentationEditPayloads = [];
@@ -1191,21 +1189,19 @@ try {
 	const opaqueContent = "hostile task: ready\nPROJECTS: never parse\ngithub-status.json: {broken}\n@everyone";
 	const validPresentationEnvelope = {
 		ok: true, command: "summary-render", schema_version: 1, revision: "9".repeat(64), content: opaqueContent,
-		controls: [
-			{ id: "github-status-refresh", label: "Manager label", style: "secondary", command: "github-status-refresh" },
-			{ id: "github-task-reconcile", label: "Reconcile Tasks", style: "secondary", command: "task-reconcile-pr" },
-		], degraded: true, warnings: ["opaque warning"],
+		controls: [{ id: "github-refresh-reconcile", label: "Manager label", style: "secondary", command: "github-refresh-reconcile" }],
+		degraded: true, warnings: ["opaque warning"],
 	};
 	assert.equal(parseManagerPresentationEnvelope(validPresentationEnvelope).content, opaqueContent, "content must remain byte-for-byte opaque");
 	for (const [name, mutation] of [
 		["unknown control", { controls: [{ id: "other", label: "Other", style: "secondary", command: "other" }] }],
-		["unsupported command", { controls: [{ id: "github-status-refresh", label: "Refresh", style: "secondary", command: "status" }] }],
-		["mismatched reconcile command", { controls: [{ id: "github-task-reconcile", label: "Reconcile", style: "secondary", command: "github-status-refresh" }] }],
+		["unsupported command", { controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "status" }] }],
+		["mismatched command", { controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "task-reconcile-pr" }] }],
 		["bad revision", { revision: "A".repeat(64) }],
 		["empty content", { content: "" }],
 		["overlong content", { content: "x".repeat(2_001) }],
-		["overlong label", { controls: [{ id: "github-status-refresh", label: "x".repeat(81), style: "secondary", command: "github-status-refresh" }] }],
-		["unknown style", { controls: [{ id: "github-status-refresh", label: "Refresh", style: "link", command: "github-status-refresh" }] }],
+		["overlong label", { controls: [{ id: "github-refresh-reconcile", label: "x".repeat(81), style: "secondary", command: "github-refresh-reconcile" }] }],
+		["unknown style", { controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "link", command: "github-refresh-reconcile" }] }],
 	]) {
 		assert.throws(() => parseManagerPresentationEnvelope({ ...validPresentationEnvelope, ...mutation }), /invalid presentation/, name);
 	}
@@ -1240,9 +1236,7 @@ try {
 	presentationProducer.stop();
 	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
 	const managerPresentation = (revision, content, controls = [{
-		id: "github-status-refresh", label: "Refresh GitHub", style: "secondary", command: "github-status-refresh",
-	}, {
-		id: "github-task-reconcile", label: "Reconcile Tasks", style: "secondary", command: "task-reconcile-pr",
+		id: "github-refresh-reconcile", label: "Refresh & Reconcile", style: "secondary", command: "github-refresh-reconcile",
 	}]) => ({ ok: true, command: "summary-render", schema_version: 1, revision, content, controls, degraded: false, warnings: [] });
 	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("a".repeat(64), "opaque manager payload @everyone"))}\n`);
 
@@ -1346,51 +1340,6 @@ try {
 		environment: validManagerEnvironment,
 	});
 	assert.ok(managerExecutor, "a protected non-worker Herdr environment plus canonical runtime validation must verify manager controls");
-	const presentationCallStart = managerProcessCalls.length;
-	assert.deepEqual(await managerExecutor.executePresentationControl("github-status-refresh", "github-status-refresh"), {
-		ok: true, message: "Manager control completed.",
-	}, "presentation execution must ignore refresh stdout semantics");
-	assert.deepEqual(managerProcessCalls.slice(presentationCallStart).map((call) => call.args), [
-		[join(managerExecutorRoot, "bin", "manager-runtime.mjs"), "--root", managerExecutorRoot, "validate"],
-		[join(managerExecutorRoot, "bin", "manager.mjs"), "github-status-refresh", "--root", managerExecutorRoot],
-	], "presentation execution must validate runtime then invoke the exact manager command descriptor");
-	assert.deepEqual(await managerExecutor.executePresentationControl("github-task-reconcile", "task-reconcile-pr"), {
-		ok: true,
-		message: "Reconciled 7 tasks: 2 archived, 1 open, 3 terminal, 1 not found, 1 failed. Failed: @batch-failed.",
-	}, "Reconcile Tasks must surface bounded canonical batch feedback");
-	assert.deepEqual(managerProcessCalls.at(-1).args, [join(managerExecutorRoot, "bin", "manager.mjs"),
-		"task-reconcile-pr", "--root", managerExecutorRoot], "Reconcile Tasks must invoke the taskless canonical composite only");
-	assert.equal(managerProcessCalls.at(-1).options.timeout, MANAGER_CONTROL_PROCESS_TIMEOUT_MS);
-	managerProcessFailure = { code: 7, stdout: '{"ok":true}', stderr: "x".repeat(3_000) };
-	const failedPresentationControl = await managerExecutor.executePresentationControl("github-task-reconcile", "task-reconcile-pr");
-	assert.equal(failedPresentationControl.ok, false);
-	assert.equal(failedPresentationControl.message.length, 2_000, "presentation diagnostics must be bounded canonical stderr only");
-	managerProcessFailure = undefined;
-	const callsBeforeMismatchedPresentation = managerProcessCalls.length;
-	assert.equal((await managerExecutor.executePresentationControl("github-task-reconcile", "github-status-refresh")).ok, false);
-	assert.equal((await managerExecutor.executePresentationControl("github-status-refresh", "task-reconcile-pr")).ok, false);
-	assert.equal(managerProcessCalls.length, callsBeforeMismatchedPresentation,
-		"mismatched presentation ID/command pairs must fail before process execution");
-	const presentationControlProcessCalls = new Set(managerProcessCalls.slice(presentationCallStart));
-	let abortObserved = false, markAbortRunStarted;
-	const abortRunStarted = new Promise((resolveStarted) => { markAbortRunStarted = resolveStarted; });
-	const abortingExecutor = await ManagerControlExecutor.create(managerExecutorRoot, {
-		environment: validManagerEnvironment,
-		async run(_executable, args, options) {
-			if (args.at(-1) === "validate") return { code: 0, stdout: '{"valid":true}', stderr: "" };
-			markAbortRunStarted();
-			return new Promise((resolveResult) => options.signal.addEventListener("abort", () => {
-				abortObserved = true; resolveResult({ code: 1, stdout: "", stderr: "aborted" });
-			}, { once: true }));
-		},
-	});
-	const abortController = new AbortController();
-	const abortedExecution = abortingExecutor.executePresentationControl(
-		"github-status-refresh", "github-status-refresh", abortController.signal,
-	);
-	await abortRunStarted;
-	abortController.abort();
-	assert.equal((await abortedExecution).ok, false); assert.equal(abortObserved, true, "owner loss must abort child");
 	const executorCatalogue = [{ taskId: "safe-task", project: "pi-extensions", title: "Safe task", status: "ready" }];
 	let delayedProcessArgs;
 	let delayedProcessOptions;
@@ -1560,8 +1509,7 @@ try {
 			requestId: `executor-reconcile-referenced-${index}`, action: "reconcile-pr", taskId: "safe-task",
 		}, executorCatalogue), { ok: true, message: reconcileCase.message });
 	}
-	const managerActionCalls = managerProcessCalls.filter((call) =>
-		call.args.at(-1) !== "validate" && !presentationControlProcessCalls.has(call));
+	const managerActionCalls = managerProcessCalls.filter((call) => call.args.at(-1) !== "validate");
 	assert.deepEqual(managerActionCalls.map((call) => call.args[1]), [
 		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive",
 		"task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr", "task-reconcile-pr",
@@ -1725,7 +1673,7 @@ try {
 		"canonical stale/removed target refusals must never call deliverAsk");
 	assert.equal(managerProcessCalls.filter((call) => [
 		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive", "task-reconcile-pr",
-	].includes(call.args[1]) && !presentationControlProcessCalls.has(call)).length, 16,
+	].includes(call.args[1])).length, 16,
 	"ask must not invoke or mutate manager lifecycle state");
 	const callsBeforeStale = managerProcessCalls.length;
 	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-stale", action: "archive", taskId: "missing-task" }, executorCatalogue), {
@@ -2697,9 +2645,8 @@ try {
 	assert.equal(FakeGateway.channelMessages.get("summary-channel").at(-1).text, "summary seven from disconnected canonical change");
 	await restartSummaryCore.stop();
 
-	const managerPresentationPayload = (revision, content, controls = [{ id: "github-status-refresh",
-		label: "Refresh exactly", style: "secondary", command: "github-status-refresh" }, {
-		id: "github-task-reconcile", label: "Reconcile Tasks", style: "secondary", command: "task-reconcile-pr" }]) =>
+	const managerPresentationPayload = (revision, content, controls = [{ id: "github-refresh-reconcile",
+		label: "Refresh & Reconcile", style: "secondary", command: "github-refresh-reconcile" }]) =>
 		({ schemaVersion: 1, revision, content, controls, degraded: false, warnings: [] });
 	const teardownSummaryChannel = "teardown-summary-channel";
 	FakeGateway.channelMessages.delete(teardownSummaryChannel);
@@ -2727,7 +2674,7 @@ try {
 		false,
 		undefined,
 		true,
-		{ controlIds: ["github-status-refresh", "github-task-reconcile"], execute: async () => ({ ok: true, message: "unused" }) },
+		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "unused" }) },
 	);
 	const recordTeardownSummarySent = teardownSummaryState.recordProjectSummarySent.bind(teardownSummaryState);
 	let releaseTeardownRecord;
@@ -2812,7 +2759,7 @@ try {
 		false,
 		undefined,
 		true,
-		{ controlIds: ["github-status-refresh", "github-task-reconcile"], execute: async () => ({ ok: true, message: "unused" }) },
+		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "unused" }) },
 	);
 	const changedTeardownPresentation = managerPresentationPayload("7".repeat(64), "changed summary after restart");
 	await teardownRestartCore.queueManagerPresentation(
@@ -2856,7 +2803,7 @@ try {
 	await presentationCore.activateRegistration(
 		"presentation-client", "presentation-generation", "presentation-session", () => true,
 		undefined, false, undefined, true,
-		{ controlIds: ["github-status-refresh", "github-task-reconcile"], execute: executePresentationControl },
+		{ controlIds: ["github-refresh-reconcile"], execute: executePresentationControl },
 	);
 	const firstPresentation = managerPresentationPayload("1".repeat(64), "opaque presentation one");
 	await presentationCore.queueManagerPresentation(
@@ -2869,7 +2816,7 @@ try {
 	assert.deepEqual(deliveredPresentation.presentation.controls, firstPresentation.controls,
 		"manager labels and generic controls must remain unchanged");
 	const controlRequest = { requestId: "presentation-reconcile-interaction", guildId: "12345", channelId: presentationMapping.channelId,
-		messageId: deliveredPresentation.id, customId: `m:${firstPresentation.revision}:github-task-reconcile` };
+		messageId: deliveredPresentation.id, customId: `m:${firstPresentation.revision}:github-refresh-reconcile` };
 	const lookupPresentation = presentationState.projectSummaryByChannel.bind(presentationState);
 	let releaseFirstLookup, markFirstLookupStarted, presentationLookups = 0; const firstLookupStarted = new Promise((resolveStarted) => { markFirstLookupStarted = resolveStarted; });
 	presentationState.projectSummaryByChannel = async (...args) => {
@@ -2893,7 +2840,7 @@ try {
 		["wrong guild", { ...controlRequest, requestId: "wrong-guild", guildId: "999" }],
 		["wrong channel", { ...controlRequest, requestId: "wrong-channel", channelId: "other" }],
 		["wrong message", { ...controlRequest, requestId: "wrong-message", messageId: "other" }],
-		["wrong revision", { ...controlRequest, requestId: "wrong-revision", customId: `m:${"2".repeat(64)}:github-task-reconcile` }],
+		["wrong revision", { ...controlRequest, requestId: "wrong-revision", customId: `m:${"2".repeat(64)}:github-refresh-reconcile` }],
 		["foreign control", { ...controlRequest, requestId: "foreign-control", customId: `m:${firstPresentation.revision}:foreign-control` }],
 	]) assert.equal((await presentationCore.executeDiscordPresentationControl(request)).ok, false, description);
 	const componentlessPresentation = managerPresentationPayload("3".repeat(64), "opaque presentation two", []);
@@ -2914,12 +2861,12 @@ try {
 	await presentationCore.prepareRegistration("backup-client", "backup-generation",
 		{ cwd: "/presentation-manager", projectIdentityResolved: true, sessionId: "backup-session" });
 	await presentationCore.activateRegistration("backup-client", "backup-generation", "backup-session", () => true,
-		undefined, false, undefined, true, { controlIds: ["github-status-refresh", "github-task-reconcile"], execute: async () => ({ ok: true, message: "backup" }) });
+		undefined, false, undefined, true, { controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "backup" }) });
 	const backupPresentation = managerPresentationPayload("6".repeat(64), "backup owner payload");
 	await presentationCore.queueManagerPresentation("backup-client", "backup-generation", "backup-session", backupPresentation);
 	const ownerLossControl = presentationCore.executeDiscordPresentationControl({ requestId: "owner-loss-control", guildId: "12345",
 		channelId: presentationMapping.channelId, messageId: ownerLossMessage.id,
-		customId: `m:${ownerLossPresentation.revision}:github-task-reconcile` });
+		customId: `m:${ownerLossPresentation.revision}:github-refresh-reconcile` });
 	await waitFor(() => presentationExecutions === 2, "owner-loss in-flight control");
 	presentationCore.unregisterClient("presentation-client", "presentation-generation");
 	releasePresentationControl({ ok: true, message: "stale completion" });
@@ -3486,10 +3433,7 @@ try {
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "x".repeat(2_001) }), false);
 	const ipcPresentation = {
 		schemaVersion: 1, revision: "4".repeat(64), content: "opaque", degraded: false, warnings: [],
-		controls: [
-			{ id: "github-status-refresh", label: "Refresh", style: "secondary", command: "github-status-refresh" },
-			{ id: "github-task-reconcile", label: "Reconcile Tasks", style: "secondary", command: "task-reconcile-pr" },
-		],
+		controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "github-refresh-reconcile" }],
 	};
 	assert.equal(isClientFrame({ type: "manager_presentation", requestId: "presentation-request", presentation: ipcPresentation }), true);
 	assert.equal(isClientFrame({ type: "manager_presentation", requestId: "presentation-request", presentation: {
@@ -3497,19 +3441,15 @@ try {
 	} }), false);
 	assert.equal(isServerFrame({
 		type: "manager_presentation_control", requestId: "interaction", revision: "4".repeat(64),
-		controlId: "github-status-refresh", command: "github-status-refresh",
-	}), true);
-	assert.equal(isServerFrame({
-		type: "manager_presentation_control", requestId: "reconcile-interaction", revision: "4".repeat(64),
-		controlId: "github-task-reconcile", command: "task-reconcile-pr",
+		controlId: "github-refresh-reconcile", command: "github-refresh-reconcile",
 	}), true);
 	assert.equal(isServerFrame({
 		type: "manager_presentation_control", requestId: "mismatched-interaction", revision: "4".repeat(64),
-		controlId: "github-task-reconcile", command: "github-status-refresh",
+		controlId: "github-refresh-reconcile", command: "task-reconcile-pr",
 	}), false, "presentation control frames require the exact allowlisted ID/command pair");
 	assert.equal(isClientFrame({ type: "register", token: "token", clientId: "client", generation: "generation",
 		configFingerprint: "fingerprint", configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: true,
-		managerPresentation: { schemaVersion: 1, controlIds: ["github-status-refresh", "github-task-reconcile", "future-control"] } }), true, "additive controls accepted");
+		managerPresentation: { schemaVersion: 1, controlIds: ["github-refresh-reconcile", "future-control"] } }), true, "additive controls accepted");
 	assert.equal(isClientFrame({
 		type: "register", token: "token", clientId: "client", generation: "generation", configFingerprint: "fingerprint",
 		configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: false,
@@ -3527,8 +3467,8 @@ try {
 	}), true, "new relays must grant legacy summary ownership to explicitly capable verified manager clients");
 	assert.deepEqual(negotiatedManagerPresentation("/workspace/the-manager", { ...oldManagerRegistration,
 		managerTaskSummaryProducer: true, managerPresentation: { schemaVersion: 1,
-			controlIds: ["github-status-refresh", "github-task-reconcile", "future-control"] } }),
-	{ schemaVersion: 1, controlIds: ["github-status-refresh", "github-task-reconcile"] }, "negotiation must intersect additive controls");
+			controlIds: ["github-refresh-reconcile", "future-control"] } }),
+	{ schemaVersion: 1, controlIds: ["github-refresh-reconcile"] }, "negotiation must intersect additive controls");
 	assert.equal(negotiatedManagerPresentation("/workspace/the-manager",
 		{ ...oldManagerRegistration, managerTaskSummaryProducer: true }), undefined, "legacy owners remain componentless");
 	assert.equal(isEligibleManagerTaskSummaryProducer("/workspace/unrelated", oldManagerRegistration), false,
@@ -4179,53 +4119,106 @@ try {
 		}
 	}
 	const managerSummaryMapping = await new DiscordStateStore(stateFile).getSession("manager-summary-session");
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "opaque manager payload @everyone", "opaque manager presentation");
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId), undefined,
+		"manager startup must preserve the configured last-good message instead of rendering uncorrelated state");
+	const canonicalSummaryCommand = "/github-refresh-reconcile";
+	const settleManagerCommand = async (stopReason = "stop") => {
+		await managerSummarySession.emit("before_agent_start", { prompt: "expanded canonical manager prompt" });
+		await managerSummarySession.emit("agent_start", {});
+		await managerSummarySession.emit("agent_end", { messages: [{ role: "assistant", stopReason }] });
+		await managerSummarySession.emit("agent_settled", {});
+	};
+	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive" }),
+		{ action: "continue" });
+	await settleManagerCommand();
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "opaque manager payload @everyone",
+		"first successful TUI command manager presentation");
 	assert.deepEqual(JSON.parse(await readFile(join(managerFixture, "summary-render-args.json"), "utf8")),
 		["summary-render", "--root", await realpath(managerFixture), "--max-chars", "2000"], "exact summary-render command");
 	const managerSummaryMessage = FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1);
 	const managerSummaryMessageId = managerSummaryMessage.id;
 	assert.deepEqual(managerSummaryMessage.presentation.controls.map(({ id, label, command }) => ({ id, label, command })), [{
-		id: "github-status-refresh", label: "Refresh GitHub", command: "github-status-refresh",
-	}, {
-		id: "github-task-reconcile", label: "Reconcile Tasks", command: "task-reconcile-pr",
-	}], "the opaque manager presentation must render Refresh GitHub and Reconcile Tasks together");
-	const summaryRenderCount = () => readFile(join(managerFixture, "summary-render-count.txt"), "utf8").then(Number);
-	const rendersBeforeRefresh = await summaryRenderCount();
-	assert.deepEqual(await FakeGateway.instances[0].executePresentationControl({ requestId: "manager-presentation-refresh",
-		guildId: "12345", channelId: managerSummaryMapping.channelId, messageId: managerSummaryMessageId,
-		customId: `m:${"a".repeat(64)}:github-status-refresh` }),
-	{ ok: true, message: "Manager control completed." }, "refresh presentation control must traverse the verified executor");
-	await waitFor(async () => await summaryRenderCount() === rendersBeforeRefresh + 1, "Refresh GitHub summary rerender");
-	const rendersBeforeReconcile = await summaryRenderCount();
-	const reconcilePresentationRequest = { requestId: "manager-presentation-reconcile", guildId: "12345",
-		channelId: managerSummaryMapping.channelId, messageId: managerSummaryMessageId,
-		customId: `m:${"a".repeat(64)}:github-task-reconcile` };
-	assert.deepEqual(await FakeGateway.instances[0].executePresentationControl(reconcilePresentationRequest), {
-		ok: true, message: "Reconciled 0 tasks: 0 archived, 0 open, 0 terminal, 0 not found, 0 failed.",
-	}, "Reconcile Tasks must traverse the fenced presentation path and surface canonical feedback");
-	assert.deepEqual(await FakeGateway.instances[0].executePresentationControl(reconcilePresentationRequest), {
-		ok: true, message: "Reconciled 0 tasks: 0 archived, 0 open, 0 terminal, 0 not found, 0 failed.",
-	}, "duplicate Reconcile Tasks interaction IDs must return the completed result");
-	assert.equal(await readFile(join(managerFixture, "reconcile-count.txt"), "utf8"), "1",
-		"duplicate Reconcile Tasks clicks must execute the canonical composite exactly once");
-	await waitFor(async () => await summaryRenderCount() === rendersBeforeReconcile + 1, "Reconcile Tasks summary rerender");
+		id: "github-refresh-reconcile", label: "Refresh & Reconcile", command: "github-refresh-reconcile",
+	}], "the opaque manager presentation must render the sole canonical control");
+	const fullSummary = `Complete manager payload: ${"x".repeat(1_950)}`;
+	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive" }),
+		{ action: "continue" }, "the exact TUI prompt-template command must retain normal Pi handling");
+	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("b".repeat(64), fullSummary))}\n`);
+	await writeFile(join(managerFixture, "data", "tasks", "tui-command-active.md"), "changed during TUI command\n");
 	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
-	assert.equal(await summaryRenderCount(), rendersBeforeReconcile + 1,
-		"one Reconcile Tasks execution must request exactly one canonical summary rerender");
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, "opaque manager payload @everyone",
+		"TUI command changes must not replace the last-good summary before settlement");
+	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive" }),
+		{ action: "handled" }, "a second canonical TUI command must be rejected while one is active");
+	await settleManagerCommand();
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === fullSummary,
+		"complete untruncated TUI-origin summary publication");
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
+		"TUI-origin publication must edit the configured manager summary message");
+	assert.deepEqual(await managerSummarySession.emit("input", { text: `${canonicalSummaryCommand} extra`, source: "interactive" }),
+		{ action: "continue" }, "commands with arguments must not enter manager-summary correlation");
+
+	const discordRequest = { requestId: "manager-presentation-command", guildId: "12345",
+		channelId: managerSummaryMapping.channelId, messageId: managerSummaryMessageId,
+		customId: `m:${"b".repeat(64)}:github-refresh-reconcile` };
+	assert.deepEqual(await FakeGateway.instances[0].executePresentationControl(discordRequest), {
+		ok: true, message: "Refresh & Reconcile started in the manager Pi session.",
+	}, "Discord control must submit the canonical Pi command");
+	assert.equal(managerSummarySession.userMessages.at(-1).text, canonicalSummaryCommand,
+		"Discord control must inject the exact raw prompt-template command without arguments");
+	assert.deepEqual(await FakeGateway.instances[0].executePresentationControl({ ...discordRequest, requestId: "manager-presentation-busy" }), {
+		ok: false, message: "Refresh & Reconcile is already running; retry when the manager is idle.",
+	}, "a second Discord control must fail while the canonical turn is active");
+	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "extension" }),
+		{ action: "continue" }, "the reserved Discord injection must continue into prompt-template expansion");
+	const discordSummary = "Discord-origin complete summary";
+	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("c".repeat(64), discordSummary))}\n`);
+	await writeFile(join(managerFixture, "data", "tasks", "discord-command-active.md"), "changed during Discord command\n");
+	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, fullSummary,
+		"Discord-origin changes must not replace the last-good summary before settlement");
+	await settleManagerCommand();
+	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === discordSummary,
+		"Discord-origin summary publication after correlated settlement");
+	await assert.rejects(() => readFile(join(managerFixture, "forbidden-direct-command.txt"), "utf8"), { code: "ENOENT" });
+	await assert.rejects(() => readFile(join(managerFixture, "reconcile-count.txt"), "utf8"), { code: "ENOENT" });
+
+	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive" }),
+		{ action: "continue" });
+	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("d".repeat(64), "must not publish"))}\n`);
+	await settleManagerCommand("error");
+	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, discordSummary,
+		"failed command settlement must retain the last-good Discord summary");
+	assert.match(managerSummarySession.notifications.at(-1)[0], /retry manually/);
+
+	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive" }),
+		{ action: "continue" });
+	await writeFile(join(managerFixture, "presentation.json"), '{"ok":true,"command":"summary-render"}\n');
+	await settleManagerCommand();
+	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, discordSummary,
+		"render failure must retain the last-good Discord summary");
+	assert.match(managerSummarySession.notifications.at(-1)[0], /retry manually/);
+	managerSummarySession.setInjectionError(true);
+	assert.equal((await FakeGateway.instances[0].executePresentationControl({ ...discordRequest,
+		requestId: "manager-presentation-rejected", customId: `m:${"c".repeat(64)}:github-refresh-reconcile` })).ok, false,
+	"failed Pi command injection must be surfaced without changing the summary");
+	managerSummarySession.setInjectionError(false);
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, discordSummary);
 	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).filter((message) => message.botOwned).length, 1,
-		"presentation control rerendering must retain one manager summary message");
+		"all command outcomes must retain one manager summary message");
 	managerStatus = {
 		...managerStatus,
 		summary: { tasks: 1, pending_events: 0, ready_tasks: 0, orphan_events: 0 },
 		tasks: [{ ...managerStatus.tasks[0], status: "active", current_action: "implement", current_run: "implement-2" }],
 	};
 	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
-	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("b".repeat(64), "second opaque payload"))}\n`);
+	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("e".repeat(64), "second opaque payload"))}\n`);
 	await writeFile(join(managerFixture, "data", "tasks", "changed.md"), "changed\n");
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "second opaque payload",
-		"extension-produced manager presentation reconciliation");
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
-		"producer task change must edit the latest parent summary");
+	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, discordSummary,
+		"uncorrelated task changes must not replace the last-good manager summary");
 	await waitFor(() => FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "discord").length === 1,
 		"manager catalogue registration and live IPC refresh");
 	assert.deepEqual(FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "discord"), [{
