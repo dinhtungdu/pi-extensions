@@ -43,8 +43,9 @@ export function collidingProjectChannelName(cwd: string): string {
 	return `${prefix.slice(0, DISCORD_NAME_LIMIT - suffix.length - 1)}-${suffix}`;
 }
 
-export function sessionThreadName(_sessionId: string, sessionName?: string): string {
-	return slug(sessionName ?? "session", "session").slice(0, DISCORD_NAME_LIMIT);
+export function sessionThreadName(sessionId: string, sessionName?: string): string {
+	if (sessionName === undefined) return `pi-session-${slug(sessionId.slice(0, 8), "session")}`;
+	return slug(sessionName, "session").slice(0, DISCORD_NAME_LIMIT);
 }
 
 export function assistantText(message: {

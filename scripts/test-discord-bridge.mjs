@@ -3005,9 +3005,9 @@ try {
 	assert.equal(projectChannelName("/tmp/项目"), "project");
 	assert.match(collidingProjectChannelName("/tmp/另一个项目"), /^project-[a-f0-9]{8}$/);
 	assert.equal(projectChannelName("/tmp/Café déjà"), "cafe-deja");
-	assert.equal(sessionThreadName("12345678-abcd", "Fix Things"), "fix-things");
-	assert.equal(sessionThreadName("12345678-abcd", "strip-pi-prefix-from-thread"), "strip-pi-prefix-from-thread");
-	assert.equal(sessionThreadName("12345678-abcd"), "session");
+	assert.equal(sessionThreadName("12345678-abcd", "Fix Things"), "fix-things", "explicit Pi names must remain unchanged");
+	assert.equal(sessionThreadName("12345678-abcd", "Implement task title"), "implement-task-title", "task-derived names must remain unchanged");
+	assert.equal(sessionThreadName("12345678-abcd"), "pi-session-12345678", "generic names must include the short session ID");
 	assert.equal(sessionThreadName("aaaaaaaa-1111", "Shared task"), "shared-task");
 	assert.equal(sessionThreadName("bbbbbbbb-2222", "Shared task"), "shared-task");
 	assert.equal(sessionThreadName("aaaaaaaa-1111", "Shared task"), sessionThreadName("bbbbbbbb-2222", "Shared task"));
@@ -4484,12 +4484,12 @@ try {
 	assert.equal(taskNamedMapping.channelId, taskNamedSiblingMapping.channelId, "named sessions under one task must share its project channel");
 	assert.notEqual(taskNamedMapping.threadId, taskNamedSiblingMapping.threadId, "named sessions under one task must retain separate threads");
 	assert.ok(FakeGateway.instances[0].threadRequests.some(
-		(request) => request.name === sessionThreadName(taskFallbackSessionId, "Implement task-title thread naming"),
-	), "TASK.md must name a new thread when the Pi session has no display name");
+		(request) => request.name === "implement-task-title-thread-naming",
+	), "TASK.md must name a new thread without adding a session prefix or suffix");
 	assert.equal(taskFallbackMapping.channelId, taskNamedMapping.channelId, "TASK.md fallback must preserve worktree project routing");
 	assert.ok(FakeGateway.instances[0].threadRequests.some(
-		(request) => request.name === sessionThreadName(metadataAbsentSessionId),
-	), "absent Pi and task metadata must use the generic session fallback");
+		(request) => request.name === "pi-session-66666666",
+	), "absent Pi and task metadata must use the generic name with the short session ID");
 
 	const threadRequestCountBeforeRename = FakeGateway.instances[0].threadRequests.length;
 	taskNamed.setSessionName("Renamed Pi session");
