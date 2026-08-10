@@ -2,6 +2,7 @@
 export const PACKAGE_FOOTER_STATUS_PREFIX = "aa-pi-extensions";
 
 export const PACKAGE_FOOTER_STATUS_KEYS = {
+	codexFast: `${PACKAGE_FOOTER_STATUS_PREFIX}-codex-fast`,
 	discord: `${PACKAGE_FOOTER_STATUS_PREFIX}-discord`,
 	goal: `${PACKAGE_FOOTER_STATUS_PREFIX}-goal`,
 	toolVisibility: `${PACKAGE_FOOTER_STATUS_PREFIX}-tool-visibility`,

@@ -5,6 +5,7 @@ Pi extensions:
 - `auto-dark-mode` — macOS dark/light theme switching
 - `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 - `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
+- `codex-fast` — request OpenAI Codex Fast mode and show `⚡` while active
 - `discord` — automatic Discord project channels and Pi session threads with bidirectional text mirroring
 - `tool-visibility` — hide/show all tool execution rows without changing tools, messages, or session history
 - `voice` — local hands-free STT/TTS for Apple Silicon with streaming speech and deterministic keyboard interruption
@@ -24,7 +25,7 @@ Selected extensions only:
 	"packages": [
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
-			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/discord/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
+			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/codex-fast.ts", "extensions/discord/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
 			"skills": [],
 			"prompts": [],
 			"themes": []
@@ -41,6 +42,7 @@ Local development:
 pi -e ./extensions/auto-dark-mode.ts
 pi -e ./extensions/code-mode.ts
 pi -e ./extensions/goal.ts
+pi -e ./extensions/codex-fast.ts
 pi -e ./extensions/discord/index.ts
 pi -e ./extensions/tool-visibility/index.ts
 pi -e ./extensions/voice/index.ts
@@ -91,6 +93,10 @@ Notes:
 - Active goals auto-continue with hidden continuation messages until `update_goal({ status: "complete" })`, `/goal pause`, `/goal clear`, budget exhaustion, or a no-tool continuation.
 - Goal state is stored in the pi session branch via custom entries; it survives reload/resume/fork.
 - Objectives should include scope, success criteria, constraints, and verification commands.
+
+## OpenAI Codex fast mode
+
+For `openai-codex` models using the Codex Responses API, every request sets `service_tier: "priority"`. Other providers and APIs are unchanged. The footer shows `⚡` before the Discord status while Fast mode applies.
 
 ## Discord bridge
 
