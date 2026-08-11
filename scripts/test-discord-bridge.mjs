@@ -429,6 +429,7 @@ try {
 	} = await importBuilt("extensions/discord/inbound-images.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
+	const { managerWakeRegistration, wakeManagerSession } = await importBuilt("extensions/discord/manager-wake.js");
 	const {
 		MAX_MANAGER_PROJECT_CATALOGUE_ITEMS,
 		MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES,
@@ -493,6 +494,207 @@ try {
 	assert.equal(shouldSubscribeOwnerToMiddleManagerThread({}), false,
 		"ordinary sessions must not request owner subscription");
 
+	const wakeRoot = join(dataDir, "manager-wake-root");
+	const wakeSocket = join(wakeRoot, ".manager", "supervisor.sock");
+	await mkdir(join(wakeRoot, ".manager"), { recursive: true });
+	const broadCapability = "a".repeat(64);
+	const wakeCapability = "b".repeat(64);
+	const wakeDescriptor = {
+		schemaVersion: 1, provider: "the-manager", socketPath: wakeSocket,
+		taskId: "wake-task", generation: 3, capability: wakeCapability,
+	};
+	const wakeEnvironment = {
+		THE_MANAGER_ROLE: "middle-manager",
+		THE_MANAGER_ROOT: wakeRoot,
+		THE_MANAGER_TASK_ID: "wake-task",
+		THE_MANAGER_MIDDLE_MANAGER_GENERATION: "3",
+		THE_MANAGER_MIDDLE_MANAGER_CAPABILITY: broadCapability,
+		THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: JSON.stringify(wakeDescriptor),
+	};
+	assert.deepEqual(managerWakeRegistration(wakeEnvironment), wakeDescriptor,
+		"middle-manager wake descriptors must match protected Manager identity");
+	for (const environment of [
+		{ ...wakeEnvironment, THE_MANAGER_ROLE: "worker" },
+		{ ...wakeEnvironment, THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: "{" },
+		{ ...wakeEnvironment, THE_MANAGER_TASK_ID: "other-task" },
+		{ ...wakeEnvironment, THE_MANAGER_MIDDLE_MANAGER_GENERATION: "-3" },
+		{ ...wakeEnvironment, THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: JSON.stringify({ ...wakeDescriptor, capability: broadCapability }) },
+		{ ...wakeEnvironment, THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: JSON.stringify({ ...wakeDescriptor, command: "pi" }) },
+		{ ...wakeEnvironment, THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: JSON.stringify({ ...wakeDescriptor, socketPath: join(dataDir, "attacker.sock") }) },
+	]) {
+		const parsed = managerWakeRegistration(environment);
+		assert.equal(parsed, environment.THE_MANAGER_ROLE === "worker" ? undefined : null,
+			"invalid, broad, noncanonical, and non-manager wake descriptors must be rejected");
+	}
+
+	const wakeRequests = [];
+	let wakeQueueBeforeRequest = 0;
+	let wakeState;
+	const wakeServer = createServer((socket) => {
+		socket.setEncoding("utf8");
+		let input = "";
+		socket.on("data", async (chunk) => {
+			input += chunk;
+			const newline = input.indexOf("\n");
+			if (newline < 0) return;
+			const request = JSON.parse(input.slice(0, newline));
+			wakeRequests.push(request);
+			if (request.request_id === "wake-timeout") return;
+			if (request.request_id === "wake-oversized") {
+				socket.end(`${"x".repeat(4_097)}\n`);
+				return;
+			}
+			if (request.request_id === "wake-malformed") {
+				socket.end("{nope\n");
+				return;
+			}
+			if (request.request_id === "wake-negative") {
+				socket.end(`${JSON.stringify({ ok: false })}\n`);
+				return;
+			}
+			if (request.request_id === "wake-wrong-session") {
+				socket.end(`${JSON.stringify({
+					ok: true, type: request.type, schema_version: 1, request_id: request.request_id,
+					task_id: request.task_id, session_id: "wrong", generation: request.generation,
+				})}\n`);
+				return;
+			}
+			if (wakeState) wakeQueueBeforeRequest = (await wakeState.pendingMessages(request.session_id)).length;
+			socket.end(`${JSON.stringify({
+				ok: true, type: request.type, schema_version: request.schema_version, request_id: request.request_id,
+				task_id: request.task_id, session_id: request.session_id, generation: request.generation,
+			})}\n`);
+		});
+	});
+	await new Promise((resolveListen, rejectListen) => {
+		wakeServer.once("error", rejectListen);
+		wakeServer.listen(wakeSocket, resolveListen);
+	});
+
+	const wakeStateFile = join(dataDir, "manager-wake-state.json");
+	wakeState = new DiscordStateStore(wakeStateFile);
+	const wakeGateway = new FakeGateway();
+	const wakeCore = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, wakeState, wakeGateway);
+	await wakeCore.start();
+	const wakeRegistration = {
+		cwd: "/wake-manager", projectIdentityResolved: true, sessionId: "wake-session", managerWake: wakeDescriptor,
+	};
+	const wakePrepared = await wakeCore.prepareRegistration("wake-client", "wake-generation", wakeRegistration);
+	await wakeCore.activateRegistration("wake-client", "wake-generation", "wake-session", () => true);
+	wakeCore.unregisterClient("wake-client", "wake-generation");
+	await Promise.all([
+		wakeGateway.emit({ id: "wake-1", channelId: wakePrepared.threadId, content: "secret Discord body one", authorBot: false }),
+		wakeGateway.emit({ id: "wake-2", channelId: wakePrepared.threadId, content: "secret Discord body two", authorBot: false }),
+	]);
+	assert.equal(wakeQueueBeforeRequest, 1, "the first inbound message must be durable before wake IPC");
+	assert.equal(wakeRequests.length, 1, "concurrent offline messages must coalesce into one wake episode");
+	assert.deepEqual(Object.keys(wakeRequests[0]).sort(),
+		["capability", "generation", "request_id", "schema_version", "session_id", "task_id", "type"].sort());
+	assert.equal(JSON.stringify(wakeRequests[0]).includes("secret Discord body"), false);
+	for (const forbidden of ["socketPath", "path", "command", "argv", "threadId"]) {
+		assert.equal(Object.hasOwn(wakeRequests[0], forbidden), false, `wake request must exclude ${forbidden}`);
+	}
+	assert.deepEqual((await wakeState.pendingMessages("wake-session")).map((message) => message.id), ["wake-1", "wake-2"]);
+
+	await wakeCore.prepareRegistration("other-client", "other-generation", {
+		cwd: "/other", projectIdentityResolved: true, sessionId: "other-session",
+	});
+	await wakeCore.activateRegistration("other-client", "other-generation", "other-session", () => true);
+	await wakeGateway.emit({ id: "wake-3", channelId: wakePrepared.threadId, content: "third", authorBot: false });
+	assert.equal(wakeRequests.length, 1, "another session reconnect must not clear the target wake episode");
+	const wakeDeliveries = [];
+	await wakeCore.prepareRegistration("wake-client", "wake-generation-2", wakeRegistration);
+	await wakeCore.activateRegistration("wake-client", "wake-generation-2", "wake-session", (message) => {
+		wakeDeliveries.push(message.id);
+		return true;
+	});
+	assert.deepEqual(wakeDeliveries, ["wake-1", "wake-2", "wake-3"], "exact reconnect must drain in order");
+	for (const messageId of wakeDeliveries) await wakeCore.acknowledge("wake-client", "wake-generation-2", "wake-session", messageId);
+	await wakeGateway.emit({ id: "wake-online", channelId: wakePrepared.threadId, content: "online", authorBot: false });
+	assert.equal(wakeRequests.length, 1, "online Manager delivery must not wake");
+	await wakeCore.acknowledge("wake-client", "wake-generation-2", "wake-session", "wake-online");
+	wakeCore.unregisterClient("wake-client", "wake-generation-2");
+	await wakeGateway.emit({ id: "wake-after-reconnect", channelId: wakePrepared.threadId, content: "new episode", authorBot: false });
+	assert.equal(wakeRequests.length, 2, "exact reconnect must clear the prior wake episode");
+	const racePrepared = await wakeCore.prepareRegistration("race-client", "race-generation", {
+		cwd: "/wake-race", projectIdentityResolved: true, sessionId: "race-session", managerWake: wakeDescriptor,
+	});
+	await wakeCore.activateRegistration("race-client", "race-generation", "race-session", () => false);
+	await wakeGateway.emit({ id: "wake-disconnect-race", channelId: racePrepared.threadId, content: "race", authorBot: false });
+	assert.equal(wakeRequests.length, 2, "an online delivery backpressure race must not wake before disconnect");
+	wakeCore.unregisterClient("race-client", "race-generation");
+	await waitFor(() => wakeRequests.length === 3, "disconnect race Manager wake");
+	assert.equal((await wakeState.pendingMessages("race-session")).length, 1,
+		"disconnect race must retain the unacknowledged message");
+	await wakeCore.stop();
+	const restartWakeCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, new DiscordStateStore(wakeStateFile), new FakeGateway(),
+	);
+	await restartWakeCore.start();
+	assert.equal(wakeRequests.length, 3, "relay restart must not replay persisted Manager wakes");
+	await restartWakeCore.stop();
+
+	const genericState = new DiscordStateStore(join(dataDir, "generic-offline-state.json"));
+	const genericGateway = new FakeGateway();
+	const genericCore = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, genericState, genericGateway);
+	await genericCore.start();
+	const genericPrepared = await genericCore.prepareRegistration("generic-client", "generic-generation", {
+		cwd: "/generic", projectIdentityResolved: true, sessionId: "generic-session",
+	});
+	await genericCore.activateRegistration("generic-client", "generic-generation", "generic-session", () => true);
+	genericCore.unregisterClient("generic-client", "generic-generation");
+	await genericGateway.emit({ id: "generic-offline", channelId: genericPrepared.threadId, content: "generic", authorBot: false });
+	assert.equal((await genericState.pendingMessages("generic-session")).length, 1);
+	assert.equal(genericGateway.sent.length, 0, "generic offline behavior must remain queue-only");
+	await genericCore.stop();
+
+	const missingState = new DiscordStateStore(join(dataDir, "missing-wake-state.json"));
+	const missingGateway = new FakeGateway();
+	const missingCore = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, missingState, missingGateway);
+	await missingCore.start();
+	const missingPrepared = await missingCore.prepareRegistration("missing-client", "missing-generation", {
+		cwd: "/missing", projectIdentityResolved: true, sessionId: "missing-session", managerWake: null,
+	});
+	await missingCore.activateRegistration("missing-client", "missing-generation", "missing-session", () => true);
+	missingCore.unregisterClient("missing-client", "missing-generation");
+	await missingGateway.emit({ id: "missing-wake", channelId: missingPrepared.threadId, content: "queued", authorBot: false });
+	assert.equal((await missingState.pendingMessages("missing-session")).length, 1);
+	assert.match(missingGateway.sent[0].text, /Reconnect it manually/);
+	await missingState.resolveSessionThread("missing-session", "/missing", missingPrepared.channelId,
+		async () => missingPrepared.threadId, wakeDescriptor);
+	await missingState.resolveSessionThread("missing-session", "/missing", missingPrepared.channelId,
+		async () => missingPrepared.threadId, null);
+	assert.deepEqual((await missingState.getSession("missing-session")).managerWake, wakeDescriptor,
+		"malformed incoming updates must preserve the last-good descriptor");
+	for (const messageId of ["wake-negative", "wake-malformed", "wake-oversized", "wake-wrong-session", "wake-timeout"]) {
+		const sessionId = `session-${messageId}`;
+		const prepared = await missingCore.prepareRegistration(`client-${messageId}`, `generation-${messageId}`, {
+			cwd: `/failure/${messageId}`, projectIdentityResolved: true, sessionId, managerWake: wakeDescriptor,
+		});
+		await missingCore.activateRegistration(`client-${messageId}`, `generation-${messageId}`, sessionId, () => true);
+		missingCore.unregisterClient(`client-${messageId}`, `generation-${messageId}`);
+		await missingGateway.emit({ id: messageId, channelId: prepared.threadId, content: `body-${messageId}`, authorBot: false });
+		assert.equal((await missingState.pendingMessages(sessionId)).length, 1, `${messageId} must remain queued`);
+		assert.match(missingGateway.sent.at(-1).text, /Reconnect it manually/, `${messageId} must post a sanitized warning`);
+	}
+	await missingCore.stop();
+
+	await assert.rejects(() => wakeManagerSession({ ...wakeDescriptor, socketPath: join(dataDir, "missing.sock") },
+		"direct-session", "wake-refused"));
+	await new Promise((resolveClose) => wakeServer.close(resolveClose));
+
+	const malformedWakeStateFile = join(dataDir, "malformed-wake-state.json");
+	await writeFile(malformedWakeStateFile, JSON.stringify({
+		version: 1, projects: {}, recentMessageIds: [], sessions: {
+			bad: {
+				cwd: "/bad", channelId: "bad-channel", threadId: "bad-thread", pendingMessages: [],
+				managerWake: { ...wakeDescriptor, capability: "BAD" },
+			},
+		},
+	}));
+	await assert.rejects(() => new DiscordStateStore(malformedWakeStateFile).load(), /invalid session mapping/,
+		"malformed persisted wake state must fail visibly");
+
 	let explicitEnableLoads = 0;
 	const explicitRelayDirectory = join(dataDir, "explicit-enable-relay");
 	const explicitEnable = createExtensionHarness(createDiscordExtension({
@@ -523,7 +725,7 @@ try {
 	const middleManagerStateFile = join(middleManagerRelayDirectory, "state.json");
 	const middleManagerGateway = new FakeGateway();
 	const middleManager = createExtensionHarness(createDiscordExtension({
-		environment: { THE_MANAGER_ROLE: "middle-manager" },
+		environment: wakeEnvironment,
 		paths: relayPaths(middleManagerRelayDirectory),
 		loadConfig: async () => ({ token: "middle-manager-token", guildId: "12345", epoch: 1 }),
 		createStateStore: () => new DiscordStateStore(middleManagerStateFile),
@@ -536,6 +738,8 @@ try {
 	});
 	await middleManager.emit("session_start", { reason: "startup" });
 	const middleManagerMapping = await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager");
+	assert.deepEqual(middleManagerMapping.managerWake, wakeDescriptor,
+		"authenticated relay registration must bind the trusted descriptor to the exact Pi session");
 	assert.equal(middleManagerGateway.threadRequests[0].subscribeOwner, true,
 		"middle-manager metadata must request owner subscription");
 	await middleManager.runCommand("discord", "reconnect");

@@ -15,6 +15,7 @@ import {
 	type PiModelCatalogueEntry,
 	type PiSessionControlAction,
 } from "./controls.js";
+import { isManagerWakeDescriptor } from "./manager-wake.js";
 import {
 	isManagerPresentation,
 	isSupportedManagerPresentationControl,
@@ -114,6 +115,7 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(frame.sessionName === undefined || typeof frame.sessionName === "string") &&
 			(frame.inboundImages === undefined || frame.inboundImages === true) &&
 			(frame.managerTaskSummaryProducer === undefined || frame.managerTaskSummaryProducer === true) &&
+			(frame.managerWake === undefined || frame.managerWake === null || isManagerWakeDescriptor(frame.managerWake)) &&
 			(frame.subscribeOwnerToThread === undefined || frame.subscribeOwnerToThread === true) &&
 			(frame.managerPresentation === undefined || isManagerPresentationCapability(frame.managerPresentation)) &&
 			(frame.sessionControls === undefined || (

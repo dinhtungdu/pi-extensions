@@ -42,6 +42,7 @@ import {
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
 } from "./controls.js";
+import { wakeManagerSession, type ManagerWakeDescriptor } from "./manager-wake.js";
 import {
 	isSupportedManagerPresentationControl,
 	SUPPORTED_MANAGER_PRESENTATION_CONTROLS,
@@ -54,6 +55,7 @@ export interface RelaySessionRegistration {
 	sessionId: string;
 	sessionName?: string;
 	managerTaskSummaryProducer?: true;
+	managerWake?: ManagerWakeDescriptor | null;
 	subscribeOwnerToThread?: true;
 }
 
@@ -102,6 +104,7 @@ export const DISCORD_STATE_COMPACTION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 
 export interface DiscordRelayCoreDependencies {
 	scheduleStateCompaction(run: () => Promise<void>): () => void;
+	wakeManagerSession?(descriptor: ManagerWakeDescriptor, sessionId: string, messageId: string): Promise<void>;
 }
 
 function scheduleStateCompaction(run: () => Promise<void>): () => void {
@@ -174,6 +177,7 @@ export class DiscordRelayCore {
 	private readonly summaryOwners = new Map<string, ActiveSession>();
 	private readonly summaryOwnerRetirements = new Map<string, Promise<void>>();
 	private readonly recentlyDisconnectedSessions = new Set<string>();
+	private readonly wakeEpisodes = new Map<string, string>();
 	private nextSummaryProducerOrder = 0;
 	private cancelStateCompaction: (() => void) | undefined;
 	private stateCompaction: Promise<void> | undefined;
@@ -279,6 +283,7 @@ export class DiscordRelayCore {
 		this.reservedSessions.clear();
 		this.catchingUpSessions.clear();
 		this.recentlyDisconnectedSessions.clear();
+		this.wakeEpisodes.clear();
 		this.clientSessions.clear();
 		this.controlQueues.clear();
 		this.controlQueueDepths.clear();
@@ -347,6 +352,7 @@ export class DiscordRelayCore {
 					name: sessionThreadName(registration.sessionId, registration.sessionName),
 					...(registration.subscribeOwnerToThread ? { subscribeOwner: true as const } : {}),
 				}),
+				registration.managerWake,
 			);
 			const catchUp = this.inboundQueue.then(() => this.catchUp(registration.sessionId, mapping));
 			this.inboundQueue = catchUp.catch(() => {});
@@ -417,6 +423,7 @@ export class DiscordRelayCore {
 		if (replaced && this.activeThreadSessions.get(replaced.threadId) === sessionId) this.activeThreadSessions.delete(replaced.threadId);
 		this.activeSessions.set(sessionId, active);
 		this.activeThreadSessions.set(active.threadId, sessionId);
+		this.wakeEpisodes.delete(sessionId);
 		const sessions = this.clientSessions.get(clientId) ?? new Set<string>();
 		sessions.add(sessionId);
 		this.clientSessions.set(clientId, sessions);
@@ -450,6 +457,11 @@ export class DiscordRelayCore {
 				this.clearOutboundRetry(sessionId);
 				this.cancelInboundRetry(sessionId);
 				if (this.summaryOwners.get(active.cwd) === active) this.retireManagerTaskSummaryOwner(active.cwd, active);
+				this.inboundQueue = this.inboundQueue.then(async () => {
+					if (this.activeSessions.has(sessionId)) return;
+					const pending = await this.state.pendingMessages(sessionId);
+					if (pending[0]) await this.wakeOfflineManager(sessionId, pending[0].id);
+				}).catch((error) => this.onTerminalError(error instanceof Error ? error : new Error(String(error))));
 			}
 		}
 		if (![...this.activeSessions.values()].some((active) => active.clientId === clientId)) this.clientSessions.delete(clientId);
@@ -1171,6 +1183,7 @@ export class DiscordRelayCore {
 			if (result.queued && result.message && deliver) {
 				const active = this.activeSessions.get(sessionId);
 				if (active) this.deliverMessage(active, result.message);
+				else await this.wakeOfflineManager(sessionId, result.message.id);
 			}
 			return true;
 		} catch (error) {
@@ -1179,6 +1192,22 @@ export class DiscordRelayCore {
 			this.inboundCursorBlockedSessions.add(sessionId);
 			this.scheduleInboundRetry(sessionId);
 			return false;
+		}
+	}
+
+	private async wakeOfflineManager(sessionId: string, messageId: string): Promise<void> {
+		const mapping = await this.state.getSession(sessionId);
+		if (mapping?.managerWake === undefined || this.wakeEpisodes.has(sessionId)) return;
+		this.wakeEpisodes.set(sessionId, messageId);
+		try {
+			if (!mapping.managerWake) throw new Error("Manager wake descriptor is unavailable");
+			await (this.dependencies.wakeManagerSession ?? wakeManagerSession)(mapping.managerWake, sessionId, messageId);
+		} catch {
+			const warning = "⚠️ Message queued, but the mapped Manager session could not be woken automatically. Reconnect it manually; the queued message will deliver afterward.";
+			const nonce = `wake-${createHash("sha256").update(messageId).digest("hex").slice(0, 20)}`;
+			await this.transport.sendText(mapping.threadId, warning, nonce).catch((error) => {
+				this.onTerminalError(error instanceof Error ? error : new Error(String(error)));
+			});
 		}
 	}
 

@@ -6,6 +6,7 @@ import { collidingProjectChannelName, normalizeCwd, projectChannelName } from ".
 import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reactions.js";
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
 import { isManagerPresentation, type ManagerPresentation } from "./manager-presentation.js";
+import { isManagerWakeDescriptor, type ManagerWakeDescriptor } from "./manager-wake.js";
 
 const STATE_VERSION = 1;
 export const MAX_RECENT_MESSAGE_IDS = 2_000;
@@ -93,6 +94,7 @@ export interface SessionThreadMapping {
 	retainedImages: RetainedInboundImages[];
 	outboundMessages: OutboundMessage[];
 	lifecycleMessages: DiscordLifecycleMessage[];
+	managerWake?: ManagerWakeDescriptor | null;
 }
 
 export interface DiscordBridgeState {
@@ -273,7 +275,8 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 			typeof mapping.threadId !== "string" ||
 			(mapping.lastActiveAt !== undefined && (!Number.isSafeInteger(mapping.lastActiveAt) || Number(mapping.lastActiveAt) < 0)) ||
 			(mapping.lastMessageId !== undefined && typeof mapping.lastMessageId !== "string") ||
-			(mapping.threadCursors !== undefined && !isRecord(mapping.threadCursors))
+			(mapping.threadCursors !== undefined && !isRecord(mapping.threadCursors)) ||
+			(mapping.managerWake !== undefined && mapping.managerWake !== null && !isManagerWakeDescriptor(mapping.managerWake))
 		) {
 			throw new Error(`Discord bridge state ${file} has an invalid session mapping`);
 		}
@@ -297,6 +300,8 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 			retainedImages: parseRetainedImages(mapping.retainedImages, file),
 			outboundMessages: parseOutboundMessages(mapping.outboundMessages, file, mapping.threadId),
 			lifecycleMessages: parseLifecycleMessages(mapping.lifecycleMessages, file, fallbackActivityAt),
+			...(mapping.managerWake === null ? { managerWake: null } :
+				isManagerWakeDescriptor(mapping.managerWake) ? { managerWake: { ...mapping.managerWake } } : {}),
 		};
 	}
 
@@ -414,6 +419,7 @@ export class DiscordStateStore {
 		cwd: string,
 		channelId: string,
 		resolve: (existingThreadId: string | undefined) => Promise<string>,
+		managerWake?: ManagerWakeDescriptor | null,
 	): Promise<SessionThreadMapping> {
 		return this.mutate(async (state) => {
 			const existing = state.sessions[sessionId];
@@ -431,6 +437,9 @@ export class DiscordStateStore {
 				retainedImages: existing?.retainedImages ?? [],
 				outboundMessages,
 				lifecycleMessages: existing?.lifecycleMessages ?? [],
+				...(managerWake === null ? { managerWake: existing?.managerWake ?? null } :
+					managerWake ? { managerWake: { ...managerWake } } :
+						existing?.managerWake !== undefined ? { managerWake: existing.managerWake } : {}),
 			};
 			state.sessions[sessionId] = mapping;
 			return structuredClone(mapping);

@@ -23,6 +23,7 @@ import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
 import { ManagerPresentationProducer, type ManagerPresentation } from "./manager-presentation.js";
 import { ManagerControlExecutor } from "./manager-controls.js";
+import { managerWakeRegistration } from "./manager-wake.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
 	MAX_SESSION_CONTROL_TEXT_LENGTH,
@@ -221,6 +222,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 		async function sessionFrom(ctx: ExtensionContext): Promise<{ session: BridgeSession; checkoutRoot: string }> {
 			const project = await resolveProjectContext(ctx.cwd);
+			const managerWake = managerWakeRegistration(environment);
 			return {
 				checkoutRoot: project.checkoutRoot,
 				session: {
@@ -228,6 +230,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					projectIdentityResolved: true,
 					sessionId: ctx.sessionManager.getSessionId(),
 					sessionName: pi.getSessionName() ?? await discoverTaskTitle(project.checkoutRoot),
+					...(managerWake !== undefined ? { managerWake } : {}),
 					...(shouldSubscribeOwnerToMiddleManagerThread(environment) ? { subscribeOwnerToThread: true as const } : {}),
 				},
 			};

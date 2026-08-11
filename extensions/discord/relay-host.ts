@@ -275,6 +275,7 @@ export class LocalRelayHost {
 				projectIdentityResolved: parsed.projectIdentityResolved,
 				sessionId: parsed.sessionId,
 				sessionName: parsed.sessionName,
+				managerWake: parsed.managerWake,
 				subscribeOwnerToThread: parsed.subscribeOwnerToThread,
 			});
 			if (state.closed) {
