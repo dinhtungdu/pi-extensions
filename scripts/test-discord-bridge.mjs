@@ -350,7 +350,13 @@ function createExtensionHarness(extension, {
 		modelRegistry: {
 			getAvailable: () => models,
 			find: (provider, id) => models.find((model) => model.provider === provider && model.id === id),
-			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: { "x-test": "automatic-title" } }),
+			getApiKeyAndHeaders: async () => ({
+				ok: true,
+				apiKey: "test-key",
+				headers: { "x-test": "automatic-title" },
+				baseUrl: "https://title-model.example.test/v1",
+				env: { CLOUDFLARE_ACCOUNT_ID: "title-account", CLOUDFLARE_GATEWAY_ID: "title-gateway" },
+			}),
 			getProvider: (provider) => provider === currentModel?.provider ? {
 				stream(model, context, options) {
 					modelCompletions.push({ model, context, options });
@@ -4312,6 +4318,10 @@ try {
 		"automatic title generation must receive the completed conversation through the current Pi provider");
 	assert.equal(metadataAbsent.modelCompletions[0].options.apiKey, "test-key");
 	assert.deepEqual(metadataAbsent.modelCompletions[0].options.headers, { "x-test": "automatic-title" });
+	assert.equal(metadataAbsent.modelCompletions[0].options.baseUrl, "https://title-model.example.test/v1");
+	assert.deepEqual(metadataAbsent.modelCompletions[0].options.env,
+		{ CLOUDFLARE_ACCOUNT_ID: "title-account", CLOUDFLARE_GATEWAY_ID: "title-gateway" },
+		"automatic title generation must forward the complete auth-resolved request configuration");
 	assert.deepEqual(namingGateway.threadRenameRequests.at(-1), {
 		channelId: metadataAbsentMapping.channelId,
 		threadId: metadataAbsentMapping.threadId,
@@ -4325,6 +4335,11 @@ try {
 	);
 	assert.equal(metadataAbsentMapping.automaticThreadTitle, "rename-attempted",
 		"a successful rename must retain a durable one-attempt marker");
+	const automaticRenamesAfterTitle = namingGateway.threadRenameRequests.length;
+	await emitCompletedAssistantReply(metadataAbsent, "Fourth generic reply");
+	assert.equal(metadataAbsent.modelCompletions.length, 1, "resolved auth forwarding must not alter one-shot generation");
+	assert.equal(namingGateway.threadRenameRequests.length, automaticRenamesAfterTitle,
+		"resolved auth forwarding must not alter one-shot Discord rename behavior");
 
 	await emitCompletedAssistantReply(taskNamed, "First explicit reply");
 	await emitCompletedAssistantReply(taskNamed, "Second explicit reply");

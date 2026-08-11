@@ -143,6 +143,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		if (!ctx.model) throw new Error("no Pi model is selected");
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
 		if (!auth.ok) throw new Error(auth.error);
+		const { ok: _resolved, ...requestConfig } = auth;
 		const provider = ctx.modelRegistry.getProvider(ctx.model.provider);
 		if (!provider) throw new Error(`Pi model provider is unavailable: ${ctx.model.provider}`);
 		const response = await provider.stream(
@@ -156,8 +157,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				}],
 			},
 			{
-				...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
-				...(auth.headers ? { headers: auth.headers } : {}),
+				...requestConfig,
 				cacheRetention: "none",
 				sessionId: randomUUID(),
 				...(ctx.signal ? { signal: ctx.signal } : {}),
