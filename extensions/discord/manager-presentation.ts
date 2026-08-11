@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { watch, type FSWatcher } from "node:fs";
+import { unwatchFile, watch, watchFile, type FSWatcher } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 const RENDER_TIMEOUT_MS = 2_000, MAX_OUTPUT_BYTES = 1_048_576, REFRESH_DEBOUNCE_MS = 100;
@@ -19,6 +19,7 @@ export interface ManagerPresentation {
 	schemaVersion: 1; revision: string; content: string; controls: ManagerPresentationControl[]; degraded: boolean; warnings: string[]
 }
 export interface ManagerPresentationCallbacks { onPresentation(presentation: ManagerPresentation): void; onUnavailable(error: Error): void }
+interface WatchHandle { close(): void }
 export interface ManagerPresentationDependencies {
 	render?: (root: string) => Promise<unknown>; watchDirectory?: (path: string, listener: () => void) => FSWatcher
 }
@@ -70,7 +71,7 @@ async function pathHasType(path: string, type: "file" | "directory"): Promise<bo
 	return stat(path).then((entry) => type === "file" ? entry.isFile() : entry.isDirectory(), () => false);
 }
 export class ManagerPresentationProducer {
-	private readonly watchers: FSWatcher[] = [];
+	private readonly watchers: WatchHandle[] = [];
 	private timer: ReturnType<typeof setTimeout> | undefined;
 	private refreshing = false; private refreshRequested = false; private stopped = true;
 	private constructor(
@@ -91,11 +92,21 @@ export class ManagerPresentationProducer {
 		if (!this.stopped) return;
 		this.stopped = false;
 		for (const directory of [join(this.root, "data", "tasks"), join(this.root, "data")]) {
+			const listener = () => this.requestRefresh();
 			try {
-				const watcher = this.dependencies.watchDirectory(directory, () => this.requestRefresh());
+				const watcher = this.dependencies.watchDirectory(directory, listener);
 				watcher.on("error", (error) => this.callbacks.onUnavailable(error));
 				this.watchers.push(watcher);
-			} catch (error) { this.callbacks.onUnavailable(error instanceof Error ? error : new Error(String(error))); }
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOSPC") {
+					try {
+						watchFile(directory, { interval: 250, persistent: false }, listener);
+						this.watchers.push({ close: () => unwatchFile(directory, listener) });
+					} catch (pollError) {
+						this.callbacks.onUnavailable(pollError instanceof Error ? pollError : new Error(String(pollError)));
+					}
+				} else this.callbacks.onUnavailable(error instanceof Error ? error : new Error(String(error)));
+			}
 		}
 		this.requestRefresh(0);
 	}

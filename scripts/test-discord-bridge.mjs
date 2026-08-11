@@ -1351,6 +1351,31 @@ try {
 	await waitFor(() => presentationErrors.length === 1, "malformed presentation callback");
 	assert.equal(producedPresentations.length, 2, "malformed output must not replace the last valid presentation");
 	presentationProducer.stop();
+
+	const fallbackPresentations = [], fallbackErrors = [];
+	renderedEnvelope = validPresentationEnvelope;
+	const fallbackProducer = await ManagerPresentationProducer.create(managerFixture, {
+		onPresentation: (presentation) => fallbackPresentations.push(presentation),
+		onUnavailable: (error) => fallbackErrors.push(error),
+	}, {
+		render: async () => structuredClone(renderedEnvelope),
+		watchDirectory: () => {
+			const error = new Error("watch limit reached");
+			error.code = "ENOSPC";
+			throw error;
+		},
+	});
+	fallbackProducer.start();
+	await waitFor(() => fallbackPresentations.length === 1, "initial presentation after ENOSPC polling fallback");
+	assert.deepEqual(fallbackErrors, [], "successful ENOSPC polling fallback must not report presentation unavailability");
+	renderedEnvelope = { ...validPresentationEnvelope, revision: "7".repeat(64), content: "polled manager presentation" };
+	await writeFile(join(managerFixture, "data", "tasks", "polled-change.md"), "changed\n");
+	await waitFor(() => fallbackPresentations.length === 2, "polled manager presentation refresh");
+	assert.equal(fallbackPresentations[1].content, "polled manager presentation");
+	fallbackProducer.stop();
+	await rm(join(managerFixture, "data", "tasks", "polled-change.md"));
+	await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+	assert.equal(fallbackPresentations.length, 2, "stopping the producer must stop polling refreshes");
 	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
 	const managerPresentation = (revision, content, controls = [{
 		id: "github-refresh-reconcile", label: "Refresh & Reconcile", style: "secondary", command: "github-refresh-reconcile",
