@@ -67,6 +67,7 @@ class FakeGateway {
 	managerControlListeners = new Set();
 	managerAutocompleteListeners = new Set();
 	presentationControlListeners = new Set();
+	wakeWarningDismissListeners = new Set();
 	projectRequests = [];
 	threadRequests = [];
 	sent = [];
@@ -120,6 +121,16 @@ class FakeGateway {
 	onPresentationControl(listener) {
 		this.presentationControlListeners.add(listener);
 		return () => this.presentationControlListeners.delete(listener);
+	}
+
+	onWakeWarningDismiss(listener) {
+		this.wakeWarningDismissListeners.add(listener);
+		return () => this.wakeWarningDismissListeners.delete(listener);
+	}
+
+	async executeWakeWarningDismiss(request) {
+		const listener = this.wakeWarningDismissListeners.values().next().value;
+		return listener ? listener(request) : { ok: false, message: "wake warning controls unavailable" };
 	}
 
 	async executePresentationControl(request) {
@@ -209,6 +220,15 @@ class FakeGateway {
 		if (!messages[index].botOwned) throw new Error("summary message is not bot-owned");
 		messages.splice(index, 1);
 		FakeGateway.summaryEvents.push({ type: "delete", channelId, messageId });
+	}
+
+	async sendWakeWarning(channelId, text, nonce, customId) {
+		const messageId = await this.sendText(channelId, text, nonce);
+		const message = (FakeGateway.channelMessages.get(channelId) ?? []).find((candidate) => candidate.id === messageId);
+		if (message) message.customId = customId;
+		const sent = this.sent.find((candidate) => candidate.id === messageId);
+		if (sent) sent.customId = customId;
+		return messageId;
 	}
 
 	async sendPresentation(channelId, presentation, nonce) {
