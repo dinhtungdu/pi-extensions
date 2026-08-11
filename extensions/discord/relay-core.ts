@@ -76,6 +76,7 @@ interface ActiveSession {
 	summaryProducerOrder: number;
 	deliver(message: QueuedDiscordMessage): boolean;
 	deliveredIds: Set<string>;
+	acceptingInboundId?: string;
 	modelCatalogue: PiModelCatalogueEntry[];
 	executeControl?: (request: PiSessionControlRequest) => Promise<PiSessionControlResult>;
 	managerTaskCatalogue: ManagerTaskCatalogueEntry[];
@@ -720,7 +721,11 @@ export class DiscordRelayCore {
 
 	async acknowledge(clientId: string, generation: string, sessionId: string, messageId: string): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
+		const active = this.activeSessions.get(sessionId)!;
+		if (active.acceptingInboundId !== messageId) return;
 		await this.state.acknowledgeMessage(sessionId, messageId);
+		active.acceptingInboundId = undefined;
+		await this.resumeDelivery(sessionId);
 	}
 
 	async releaseInboundImages(clientId: string, generation: string, sessionId: string, messageId: string): Promise<void> {
@@ -1213,9 +1218,10 @@ export class DiscordRelayCore {
 
 	private deliverMessage(active: ActiveSession, message: QueuedDiscordMessage): boolean {
 		if (message.images?.length && !active.inboundImages) return false;
-		if (active.deliveredIds.has(message.id)) return true;
+		if (active.acceptingInboundId || active.deliveredIds.has(message.id)) return false;
 		if (!active.deliver(message)) return false;
 		active.deliveredIds.add(message.id);
+		active.acceptingInboundId = message.id;
 		return true;
 	}
 

@@ -265,6 +265,7 @@ function createExtensionHarness(extension, {
 		{ provider: "openai", id: "gpt-test", name: "GPT Test", input: ["text", "image"] },
 		{ provider: "anthropic", id: "claude-test", name: "Claude Test", input: ["text", "image"] },
 	],
+	trackConcurrentUserAcceptance = false,
 }) {
 	const events = new Map();
 	const commands = new Map();
@@ -282,6 +283,8 @@ function createExtensionHarness(extension, {
 	let appendError = false;
 	let appendCalls = 0;
 	let abortRequests = 0;
+	let pendingUserAcceptances = 0;
+	const processingErrors = [];
 	const pi = {
 		on(name, handler) {
 			const handlers = events.get(name) ?? [];
@@ -297,6 +300,10 @@ function createExtensionHarness(extension, {
 		},
 		sendUserMessage(text, options) {
 			if (injectionError) throw new Error("injected Pi acceptance failure");
+			if (trackConcurrentUserAcceptance) {
+				if (pendingUserAcceptances > 0) processingErrors.push(new Error("concurrent Pi user-message acceptance"));
+				pendingUserAcceptances++;
+			}
 			const message = { text, options };
 			userMessages.push(message);
 			userWaiters.shift()?.(message);
@@ -350,6 +357,7 @@ function createExtensionHarness(extension, {
 		statuses,
 		userMessages,
 		entries,
+		processingErrors,
 		setIdle(value) { idle = value; },
 		setPendingMessages(value) { pendingMessages = value; },
 		setAppendError(value) { appendError = value; },
@@ -365,6 +373,9 @@ function createExtensionHarness(extension, {
 		async emit(name, event = {}) {
 			let result;
 			for (const handler of events.get(name) ?? []) result = await handler(event, ctx);
+			if (trackConcurrentUserAcceptance && name === "message_end" && event.message?.role === "user") {
+				pendingUserAcceptances = Math.max(0, pendingUserAcceptances - 1);
+			}
 			return result;
 		},
 		async runCommand(name, args = "") {
@@ -608,8 +619,14 @@ try {
 		wakeDeliveries.push(message.id);
 		return true;
 	});
-	assert.deepEqual(wakeDeliveries, ["wake-1", "wake-2", "wake-3"], "exact reconnect must drain in order");
-	for (const messageId of wakeDeliveries) await wakeCore.acknowledge("wake-client", "wake-generation-2", "wake-session", messageId);
+	await wakeCore.acknowledge("wake-client", "wake-generation-2", "wake-session", "wake-3");
+	assert.deepEqual((await wakeState.pendingMessages("wake-session")).map((message) => message.id), ["wake-1", "wake-2", "wake-3"],
+		"an out-of-order acknowledgement must not remove or unlock a pending message");
+	for (const messageId of ["wake-1", "wake-2", "wake-3"]) {
+		assert.equal(wakeDeliveries.at(-1), messageId, "exact reconnect must expose only the ordered acceptance head");
+		await wakeCore.acknowledge("wake-client", "wake-generation-2", "wake-session", messageId);
+	}
+	assert.deepEqual(wakeDeliveries, ["wake-1", "wake-2", "wake-3"], "exact reconnect must drain in order after acceptance");
 	await wakeGateway.emit({ id: "wake-online", channelId: wakePrepared.threadId, content: "online", authorBot: false });
 	assert.equal(wakeRequests.length, 1, "online Manager delivery must not wake");
 	await wakeCore.acknowledge("wake-client", "wake-generation-2", "wake-session", "wake-online");
@@ -3684,9 +3701,10 @@ try {
 		false,
 	);
 	assert.equal(rejectedCatchUpFetches, 0);
-	assert.equal(rejectedCatchUpDeliveries.length, 2, "permanent rejection must not brick catch-up or rolling text clients");
+	assert.equal(rejectedCatchUpDeliveries.length, 1, "permanent rejection must expose the first ordered acceptance head");
 	assert.match(rejectedCatchUpDeliveries[0].content, /outside the Discord attachment CDN/);
 	assert.equal(rejectedCatchUpDeliveries[0].images, undefined);
+	await rejectedCatchUpCore.acknowledge("rejected-client", "rejected-generation", "rejected-catch-up-session", "93001");
 	assert.equal(rejectedCatchUpDeliveries[1].content, "after permanent catch-up rejection");
 	assert.equal((await rejectedCatchUpState.getSession("rejected-catch-up-session")).threadCursors["rejected-thread"], "93002");
 	await rejectedCatchUpCore.stop();
@@ -5347,6 +5365,66 @@ try {
 	assert.equal(stripInboundMarker(afterFailoverMessage.text), "after failover");
 	await second.emit("message_end", { message: { role: "user", content: [{ type: "text", text: afterFailoverMessage.text }] } });
 	await waitFor(() => second.entries.some((entry) => entry.data?.messageId === "20"), "post-failover Pi acceptance receipt");
+
+	const orderedOffline = createExtensionHarness(extension, {
+		cwd: "/work/ordered-offline",
+		sessionId: "session-ordered-offline",
+		sessionName: "Ordered offline",
+	});
+	await orderedOffline.emit("session_start", { reason: "startup" });
+	const orderedOfflineThread = (await new DiscordStateStore(stateFile).getSession("session-ordered-offline")).threadId;
+	await orderedOffline.emit("session_shutdown", { reason: "quit" });
+	const recoveredIds = Array.from({ length: 5 }, (_, index) => `offline-ordered-${index + 1}`);
+	for (const [index, id] of recoveredIds.entries()) {
+		await failoverGateway.emit({ id, channelId: orderedOfflineThread, content: `recovered ${index + 1}`, authorBot: false });
+	}
+	assert.deepEqual(
+		(await new DiscordStateStore(stateFile).getSession("session-ordered-offline")).pendingMessages.map((message) => message.id),
+		recoveredIds,
+		"four-plus offline messages must remain durably ordered before reconnect",
+	);
+	const orderedResume = createExtensionHarness(extension, {
+		cwd: "/work/ordered-offline",
+		sessionId: "session-ordered-offline",
+		sessionName: "Ordered offline",
+		trackConcurrentUserAcceptance: true,
+	});
+	const firstRecoveredDelivery = orderedResume.nextUserMessage();
+	await orderedResume.emit("session_start", { reason: "resume" });
+	const orderedDeliveries = [await firstRecoveredDelivery];
+	assert.equal(inboundMessageId(orderedDeliveries[0].text), recoveredIds[0]);
+	assert.equal(orderedDeliveries[0].options, undefined, "the idle queue head must start the recovered turn immediately");
+	assert.equal(orderedResume.userMessages.length, 1, "reconnect must wait for actual Pi acceptance before forwarding another head");
+	orderedResume.setIdle(false);
+	const secondRecoveredDelivery = orderedResume.nextUserMessage();
+	await orderedResume.emit("message_end", { message: { role: "user", content: orderedDeliveries[0].text } });
+	orderedDeliveries.push(await secondRecoveredDelivery);
+	const liveDuringRecoveryId = "offline-ordered-live";
+	await failoverGateway.emit({
+		id: liveDuringRecoveryId,
+		channelId: orderedOfflineThread,
+		content: "arrived during recovered turn",
+		authorBot: false,
+	});
+	assert.equal(orderedResume.userMessages.length, 2,
+		"a live arrival during recovery must remain behind the currently accepting durable head");
+	const expectedOrderedIds = [...recoveredIds, liveDuringRecoveryId];
+	while (orderedDeliveries.length < expectedOrderedIds.length) {
+		const nextDelivery = orderedResume.nextUserMessage();
+		const current = orderedDeliveries.at(-1);
+		await orderedResume.emit("message_end", { message: { role: "user", content: current.text } });
+		orderedDeliveries.push(await nextDelivery);
+	}
+	await orderedResume.emit("message_end", { message: { role: "user", content: orderedDeliveries.at(-1).text } });
+	await waitFor(async () => (await new DiscordStateStore(stateFile).getSession("session-ordered-offline")).pendingMessages.length === 0,
+		"ordered recovered Pi acceptance acknowledgements");
+	assert.deepEqual(orderedDeliveries.map((message) => inboundMessageId(
+		Array.isArray(message.text) ? message.text[0].text : message.text,
+	)), expectedOrderedIds, "offline recovery and the live arrival must preserve durable order without duplicates");
+	assert.ok(orderedDeliveries.slice(1).every((message) => message.options?.deliverAs === "followUp"),
+		"every message accepted during the recovered run must use Pi follow-up semantics");
+	assert.deepEqual(orderedResume.processingErrors, [], "ordered relay acceptance must not overlap Pi prompt processing");
+	await orderedResume.emit("session_shutdown", { reason: "quit" });
 
 	const inactive = createExtensionHarness(extension, {
 		cwd: "/work/inactive",
