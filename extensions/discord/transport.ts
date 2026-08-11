@@ -44,10 +44,6 @@ export interface DiscordPresentationControlRequest {
 	requestId: string; guildId?: string; channelId: string; messageId: string; customId: string;
 }
 
-export interface DiscordWakeWarningDismissRequest {
-	requestId: string; guildId?: string; channelId: string; messageId: string; customId: string;
-}
-
 export interface DiscordInboundMessage {
 	id: string;
 	channelId: string;
@@ -79,12 +75,10 @@ export interface DiscordTransport {
 	onManagerControl(listener: (request: DiscordManagerControlRequest) => Promise<PiSessionControlResult>): () => void;
 	onManagerAutocomplete(listener: (channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]): () => void;
 	onPresentationControl(listener: (request: DiscordPresentationControlRequest) => Promise<PiSessionControlResult>): () => void;
-	onWakeWarningDismiss(listener: (request: DiscordWakeWarningDismissRequest) => Promise<PiSessionControlResult>): () => void;
 	ensureProjectChannel(request: ProjectChannelRequest): Promise<string>;
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
 	sendText(channelId: string, text: string, nonce: string): Promise<string>;
-	sendWakeWarning(channelId: string, text: string, nonce: string, customId: string): Promise<string>;
 	sendPresentation(channelId: string, presentation: ManagerPresentation, nonce: string): Promise<string>;
 	latestMessageId(channelId: string): Promise<string | undefined>;
 	editOwnText(channelId: string, messageId: string, text: string): Promise<void>;
@@ -188,12 +182,6 @@ const PRESENTATION_BUTTON_STYLES: Record<ManagerPresentationStyle, ButtonStyle> 
 	primary: ButtonStyle.Primary, secondary: ButtonStyle.Secondary, success: ButtonStyle.Success, danger: ButtonStyle.Danger,
 };
 
-export function wakeWarningComponents(customId: string): ActionRowBuilder<ButtonBuilder>[] {
-	return [new ActionRowBuilder<ButtonBuilder>().addComponents(
-		new ButtonBuilder().setCustomId(customId).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-	)];
-}
-
 export function presentationComponents(presentation: ManagerPresentation): ActionRowBuilder<ButtonBuilder>[] {
 	const buttons = presentation.controls.map((control) => new ButtonBuilder()
 		.setCustomId(`m:${presentation.revision}:${control.id}`)
@@ -285,7 +273,6 @@ export class DiscordJsTransport implements DiscordTransport {
 	private readonly managerControlListeners = new Set<(request: DiscordManagerControlRequest) => Promise<PiSessionControlResult>>();
 	private readonly managerAutocompleteListeners = new Set<(channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]>();
 	private readonly presentationControlListeners = new Set<(request: DiscordPresentationControlRequest) => Promise<PiSessionControlResult>>();
-	private readonly wakeWarningDismissListeners = new Set<(request: DiscordWakeWarningDismissRequest) => Promise<PiSessionControlResult>>();
 	private readonly terminalListeners = new Set<(error: Error) => void>();
 
 	async connect(config: DiscordBridgeConfig): Promise<void> {
@@ -326,8 +313,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		client.on(Events.InteractionCreate, (interaction) => {
 			const channelId = interactionChannels.resolve(interaction);
 			if (interaction.isButton()) {
-				if (interaction.customId.startsWith("wq:")) void this.executeWakeWarningDismissInteraction(interaction, channelId);
-				else void this.executePresentationControlInteraction(interaction, channelId);
+				void this.executePresentationControlInteraction(interaction, channelId);
 				return;
 			}
 			if (interaction.isAutocomplete()) {
@@ -413,11 +399,6 @@ export class DiscordJsTransport implements DiscordTransport {
 		return () => this.presentationControlListeners.delete(listener);
 	}
 
-	onWakeWarningDismiss(listener: (request: DiscordWakeWarningDismissRequest) => Promise<PiSessionControlResult>): () => void {
-		this.wakeWarningDismissListeners.add(listener);
-		return () => this.wakeWarningDismissListeners.delete(listener);
-	}
-
 	async ensureProjectChannel(request: ProjectChannelRequest): Promise<string> {
 		const guild = await this.guild(request.guildId);
 		await this.validateCategory(guild, request.categoryId);
@@ -492,19 +473,6 @@ export class DiscordJsTransport implements DiscordTransport {
 		}
 		const message = await channel.send({
 			content: text,
-			nonce,
-			enforceNonce: true,
-			allowedMentions: { parse: [] },
-			flags: MessageFlags.SuppressEmbeds,
-		});
-		return message.id;
-	}
-
-	async sendWakeWarning(channelId: string, text: string, nonce: string, customId: string): Promise<string> {
-		const channel = await this.textChannel(channelId, "receive wake warnings");
-		const message = await channel.send({
-			content: text,
-			components: wakeWarningComponents(customId),
 			nonce,
 			enforceNonce: true,
 			allowedMentions: { parse: [] },
@@ -695,37 +663,6 @@ export class DiscordJsTransport implements DiscordTransport {
 		}
 		const bounded = boundedControlResult(result);
 		await command.editReply({
-			content: `${bounded.ok ? "✅" : "❌"} ${bounded.message}`,
-			allowedMentions: { parse: [] },
-			flags: MessageFlags.SuppressEmbeds,
-		}).catch(() => {});
-	}
-
-	private async executeWakeWarningDismissInteraction(
-		interaction: import("discord.js").ButtonInteraction,
-		channelId?: string,
-	): Promise<void> {
-		try {
-			await interaction.deferReply({ flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds });
-		} catch {
-			return;
-		}
-		let result: PiSessionControlResult;
-		try {
-			if (!channelId) throw new Error("Discord interaction did not identify its channel.");
-			const listener = this.wakeWarningDismissListeners.values().next().value;
-			result = listener ? await listener({
-				requestId: interaction.id,
-				...(interaction.guildId ? { guildId: interaction.guildId } : {}),
-				channelId,
-				messageId: interaction.message.id,
-				customId: interaction.customId,
-			}) : { ok: false, message: "Discord relay is not ready to dismiss wake warnings." };
-		} catch (error) {
-			result = { ok: false, message: error instanceof Error ? error.message : String(error) };
-		}
-		const bounded = boundedControlResult(result);
-		await interaction.editReply({
 			content: `${bounded.ok ? "✅" : "❌"} ${bounded.message}`,
 			allowedMentions: { parse: [] },
 			flags: MessageFlags.SuppressEmbeds,

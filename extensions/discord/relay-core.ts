@@ -14,7 +14,6 @@ import type {
 	DiscordInboundMessage,
 	DiscordPresentationControlRequest,
 	DiscordTransport,
-	DiscordWakeWarningDismissRequest,
 } from "./transport.js";
 import {
 	appendInboundImageContext,
@@ -146,7 +145,6 @@ export class DiscordRelayCore {
 	private unsubscribeManagerControls: (() => void) | undefined;
 	private unsubscribeManagerAutocomplete: (() => void) | undefined;
 	private unsubscribePresentationControls: (() => void) | undefined;
-	private unsubscribeWakeWarningDismiss: (() => void) | undefined;
 	private unsubscribeTerminal: (() => void) | undefined;
 	private readonly controlQueues = new Map<string, Promise<void>>();
 	private readonly controlQueueDepths = new Map<string, number>();
@@ -180,9 +178,6 @@ export class DiscordRelayCore {
 	private readonly summaryOwnerRetirements = new Map<string, Promise<void>>();
 	private readonly recentlyDisconnectedSessions = new Set<string>();
 	private readonly wakeEpisodes = new Map<string, string>();
-	private readonly wakeWarnings = new Map<string, {
-		sessionId: string; sourceMessageId: string; threadId: string; warningMessageId: string;
-	}>();
 	private nextSummaryProducerOrder = 0;
 	private cancelStateCompaction: (() => void) | undefined;
 	private stateCompaction: Promise<void> | undefined;
@@ -218,9 +213,6 @@ export class DiscordRelayCore {
 		});
 		this.unsubscribePresentationControls = this.transport.onPresentationControl((request) => {
 			return this.executeDiscordPresentationControl(request);
-		});
-		this.unsubscribeWakeWarningDismiss = this.transport.onWakeWarningDismiss((request) => {
-			return this.executeDiscordWakeWarningDismiss(request);
 		});
 		for (const { cwd, summary } of await this.state.projectSummaries()) {
 			this.summaryRevisions.set(cwd, summary.revision);
@@ -282,8 +274,6 @@ export class DiscordRelayCore {
 		this.unsubscribeManagerAutocomplete = undefined;
 		this.unsubscribePresentationControls?.();
 		this.unsubscribePresentationControls = undefined;
-		this.unsubscribeWakeWarningDismiss?.();
-		this.unsubscribeWakeWarningDismiss = undefined;
 		this.unsubscribeTerminal?.();
 		this.unsubscribeTerminal = undefined;
 		await this.inboundQueue;
@@ -294,7 +284,6 @@ export class DiscordRelayCore {
 		this.catchingUpSessions.clear();
 		this.recentlyDisconnectedSessions.clear();
 		this.wakeEpisodes.clear();
-		this.wakeWarnings.clear();
 		this.clientSessions.clear();
 		this.controlQueues.clear();
 		this.controlQueueDepths.clear();
@@ -435,9 +424,6 @@ export class DiscordRelayCore {
 		this.activeSessions.set(sessionId, active);
 		this.activeThreadSessions.set(active.threadId, sessionId);
 		this.wakeEpisodes.delete(sessionId);
-		for (const [customId, warning] of this.wakeWarnings) {
-			if (warning.sessionId === sessionId) this.wakeWarnings.delete(customId);
-		}
 		const sessions = this.clientSessions.get(clientId) ?? new Set<string>();
 		sessions.add(sessionId);
 		this.clientSessions.set(clientId, sessions);
@@ -654,32 +640,6 @@ export class DiscordRelayCore {
 			return result;
 		})();
 		return execution;
-	}
-
-	async executeDiscordWakeWarningDismiss(request: DiscordWakeWarningDismissRequest): Promise<PiSessionControlResult> {
-		if (request.guildId !== this.config.guildId) return { ok: false, message: "This wake warning control is not authorized." };
-		if (!/^wq:[a-f0-9]{20}$/.test(request.customId)) {
-			return { ok: false, message: "This wake warning control is malformed or unsupported." };
-		}
-		const warning = this.wakeWarnings.get(request.customId);
-		if (!warning || warning.threadId !== request.channelId || warning.warningMessageId !== request.messageId) {
-			return { ok: false, message: "This wake warning control is stale or no longer authorized." };
-		}
-		const mapping = await this.state.findSessionByThread(request.channelId);
-		const pending = mapping?.sessionId === warning.sessionId
-			? await this.state.pendingMessages(warning.sessionId)
-			: [];
-		if (this.wakeWarnings.get(request.customId) !== warning ||
-			!pending.some((message) => message.id === warning.sourceMessageId)) {
-			return { ok: false, message: "This wake warning control is stale or no longer authorized." };
-		}
-		try {
-			await this.transport.deleteOwnText(request.channelId, request.messageId);
-		} catch (error) {
-			return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
-		}
-		this.wakeWarnings.delete(request.customId);
-		return { ok: true, message: "Wake warning dismissed; the inbound message remains queued." };
 	}
 
 	async executeDiscordControl(request: DiscordSessionControlRequest): Promise<PiSessionControlResult> {
@@ -1244,17 +1204,10 @@ export class DiscordRelayCore {
 			await (this.dependencies.wakeManagerSession ?? wakeManagerSession)(mapping.managerWake, sessionId, messageId);
 		} catch {
 			const warning = "⚠️ Message queued, but the mapped Manager session could not be woken automatically. Reconnect it manually; the queued message will deliver afterward.";
-			const digest = createHash("sha256").update(messageId).digest("hex").slice(0, 20);
-			const nonce = `wake-${digest}`;
-			const customId = `wq:${digest}`;
-			try {
-				const warningMessageId = await this.transport.sendWakeWarning(mapping.threadId, warning, nonce, customId);
-				this.wakeWarnings.set(customId, {
-					sessionId, sourceMessageId: messageId, threadId: mapping.threadId, warningMessageId,
-				});
-			} catch (error) {
+			const nonce = `wake-${createHash("sha256").update(messageId).digest("hex").slice(0, 20)}`;
+			await this.transport.sendText(mapping.threadId, warning, nonce).catch((error) => {
 				this.onTerminalError(error instanceof Error ? error : new Error(String(error)));
-			}
+			});
 		}
 	}
 
