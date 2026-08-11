@@ -61,7 +61,6 @@ export interface PreparedRegistration {
 	channelId: string;
 	threadId: string;
 	cwd: string;
-	automaticThreadTitleEligible: boolean;
 }
 
 interface ActiveSession {
@@ -348,18 +347,12 @@ export class DiscordRelayCore {
 					name: sessionThreadName(registration.sessionId, registration.sessionName),
 					...(registration.subscribeOwnerToThread ? { subscribeOwner: true as const } : {}),
 				}),
-				registration.sessionName === undefined,
 			);
 			const catchUp = this.inboundQueue.then(() => this.catchUp(registration.sessionId, mapping));
 			this.inboundQueue = catchUp.catch(() => {});
 			await catchUp;
 			this.catchingUpSessions.delete(registration.sessionId);
-			return {
-				channelId,
-				threadId: mapping.threadId,
-				cwd: mapping.cwd,
-				automaticThreadTitleEligible: mapping.automaticThreadTitle === "eligible",
-			};
+			return { channelId, threadId: mapping.threadId, cwd: mapping.cwd };
 		} catch (error) {
 			this.catchingUpSessions.delete(registration.sessionId);
 			const reserved = this.reservedSessions.get(registration.sessionId);
@@ -460,31 +453,6 @@ export class DiscordRelayCore {
 			}
 		}
 		if (![...this.activeSessions.values()].some((active) => active.clientId === clientId)) this.clientSessions.delete(clientId);
-	}
-
-	async claimAutomaticThreadTitle(
-		clientId: string,
-		generation: string,
-		sessionId: string,
-	): Promise<boolean> {
-		this.assertClientSession(clientId, generation, sessionId);
-		return this.state.claimAutomaticThreadTitle(sessionId);
-	}
-
-	async renameAutomaticSessionThread(
-		clientId: string,
-		generation: string,
-		sessionId: string,
-		name: string,
-	): Promise<void> {
-		this.assertClientSession(clientId, generation, sessionId);
-		const mapping = await this.state.reserveAutomaticThreadRename(sessionId);
-		if (!mapping) throw new Error(`Pi session ${sessionId} has no reserved automatic Discord thread rename`);
-		await this.transport.renameSessionThread({
-			channelId: mapping.channelId,
-			threadId: mapping.threadId,
-			name,
-		});
 	}
 
 	modelAutocomplete(channelId: string, prefix: string): DiscordModelChoice[] {

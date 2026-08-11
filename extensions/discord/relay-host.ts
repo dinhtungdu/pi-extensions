@@ -300,7 +300,6 @@ export class LocalRelayHost {
 				managerControls: true,
 				...(managerPresentation ? { managerPresentation } : {}),
 				inboundImages: true,
-				...(prepared.automaticThreadTitleEligible ? { automaticThreadTitle: true as const } : {}),
 			})) throw new Error("Local Discord relay response queue is full");
 			await this.options.core.activateRegistration(
 				parsed.clientId,
@@ -374,24 +373,6 @@ export class LocalRelayHost {
 				return;
 			}
 			this.write(state, { type: "manager_catalogue_updated", requestId: parsed.requestId });
-			return;
-		}
-		if (parsed.type === "claim_thread_title") {
-			try {
-				const claimed = await this.options.core.claimAutomaticThreadTitle(clientId, generation, sessionId);
-				this.write(state, { type: "thread_title_claimed", requestId: parsed.requestId, claimed });
-			} catch (error) {
-				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
-			}
-			return;
-		}
-		if (parsed.type === "rename_session_thread") {
-			try {
-				await this.options.core.renameAutomaticSessionThread(clientId, generation, sessionId, parsed.name);
-				this.write(state, { type: "session_thread_renamed", requestId: parsed.requestId });
-			} catch (error) {
-				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
-			}
 			return;
 		}
 		if (parsed.type === "ack_inbound") {

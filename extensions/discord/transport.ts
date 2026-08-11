@@ -66,12 +66,6 @@ export interface SessionThreadRequest {
 	subscribeOwner?: true;
 }
 
-export interface RenameSessionThreadRequest {
-	channelId: string;
-	threadId: string;
-	name: string;
-}
-
 export interface DiscordTransport {
 	connect(config: DiscordBridgeConfig): Promise<void>;
 	disconnect(): Promise<void>;
@@ -83,7 +77,6 @@ export interface DiscordTransport {
 	onPresentationControl(listener: (request: DiscordPresentationControlRequest) => Promise<PiSessionControlResult>): () => void;
 	ensureProjectChannel(request: ProjectChannelRequest): Promise<string>;
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
-	renameSessionThread(request: RenameSessionThreadRequest): Promise<void>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
 	sendText(channelId: string, text: string, nonce: string): Promise<string>;
 	sendPresentation(channelId: string, presentation: ManagerPresentation, nonce: string): Promise<string>;
@@ -449,15 +442,6 @@ export class DiscordJsTransport implements DiscordTransport {
 		});
 		if (request.subscribeOwner) await subscribeThreadOwner(thread);
 		return thread.id;
-	}
-
-	async renameSessionThread(request: RenameSessionThreadRequest): Promise<void> {
-		const mapped = await this.readyClient().channels.fetch(request.threadId).catch(() => null);
-		const thread = mapped?.isThread() ? mapped : null;
-		if (!thread || thread.parentId !== request.channelId) {
-			throw new Error(`Discord session thread ${request.threadId} is missing or has the wrong parent`);
-		}
-		await thread.setName(request.name, "Pi session conversation title");
 	}
 
 	async fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]> {

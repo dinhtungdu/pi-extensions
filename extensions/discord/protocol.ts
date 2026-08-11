@@ -39,8 +39,6 @@ export type ClientFrame =
 		inboundImages?: true;
 	} & RelaySessionRegistration)
 	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
-	| { type: "claim_thread_title"; requestId: string }
-	| { type: "rename_session_thread"; requestId: string; name: string }
 	| { type: "project_summary"; requestId: string; text: string }
 	| { type: "manager_presentation"; requestId: string; presentation: ManagerPresentation }
 	| { type: "ack_inbound"; requestId: string; messageId: string }
@@ -66,7 +64,6 @@ export type ServerFrame =
 		managerControls?: true;
 		managerPresentation?: { schemaVersion: 1; controlIds: string[] };
 		inboundImages?: true;
-		automaticThreadTitle?: true;
 	}
 	| { type: "inbound"; messageId: string; text: string; images?: QueuedInboundImage[] }
 	| { type: "control"; requestId: string; action: PiSessionControlAction }
@@ -75,8 +72,6 @@ export type ServerFrame =
 	| { type: "inbound_acked"; requestId: string; messageId: string }
 	| { type: "inbound_images_released"; requestId: string; messageId: string }
 	| { type: "outbound_queued"; requestId: string; messageId: string }
-	| { type: "thread_title_claimed"; requestId: string; claimed: boolean }
-	| { type: "session_thread_renamed"; requestId: string }
 	| { type: "project_summary_queued"; requestId: string }
 	| { type: "manager_presentation_queued"; requestId: string }
 	| { type: "manager_catalogue_updated"; requestId: string }
@@ -97,10 +92,6 @@ export function encodeFrame(frame: ClientFrame | ServerFrame): string {
 export function parseFrame(line: string): unknown {
 	if (Buffer.byteLength(line) > MAX_IPC_FRAME_BYTES) throw new Error("Local Discord relay IPC frame is too large");
 	return JSON.parse(line) as unknown;
-}
-
-function isSessionThreadName(value: unknown): value is string {
-	return typeof value === "string" && value.length <= 100 && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value);
 }
 
 function isManagerPresentationCapability(value: unknown): boolean {
@@ -140,10 +131,6 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string" && typeof frame.text === "string" &&
 			(frame.kind === "user" || frame.kind === "assistant");
 	}
-	if (frame.type === "claim_thread_title") return typeof frame.requestId === "string";
-	if (frame.type === "rename_session_thread") {
-		return typeof frame.requestId === "string" && isSessionThreadName(frame.name);
-	}
 	if (frame.type === "ack_inbound" || frame.type === "release_inbound_images") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	}
@@ -180,8 +167,7 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 			(frame.sessionControls === undefined || frame.sessionControls === true) &&
 			(frame.managerControls === undefined || frame.managerControls === true) &&
 			(frame.managerPresentation === undefined || isManagerPresentationCapability(frame.managerPresentation)) &&
-			(frame.inboundImages === undefined || frame.inboundImages === true) &&
-			(frame.automaticThreadTitle === undefined || frame.automaticThreadTitle === true);
+			(frame.inboundImages === undefined || frame.inboundImages === true);
 	}
 	if (frame.type === "inbound") {
 		return typeof frame.messageId === "string" && typeof frame.text === "string" &&
@@ -197,13 +183,8 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	}
 	if (frame.type === "outbound_queued") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
-	if (frame.type === "thread_title_claimed") {
-		return typeof frame.requestId === "string" && typeof frame.claimed === "boolean";
-	}
-	if (frame.type === "session_thread_renamed" || frame.type === "project_summary_queued" ||
-		frame.type === "manager_presentation_queued" || frame.type === "manager_catalogue_updated") {
-		return typeof frame.requestId === "string";
-	}
+	if (frame.type === "project_summary_queued" || frame.type === "manager_presentation_queued" ||
+		frame.type === "manager_catalogue_updated") return typeof frame.requestId === "string";
 	if (frame.type === "error") {
 		return typeof frame.message === "string" && (frame.requestId === undefined || typeof frame.requestId === "string");
 	}
