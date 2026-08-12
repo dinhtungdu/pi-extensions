@@ -33,6 +33,20 @@ async function waitFor(predicate, description) {
 	throw new Error(`Timed out waiting for ${description}`);
 }
 
+async function promptly(promise, description) {
+	let timer;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise((_, reject) => {
+				timer = setTimeout(() => reject(new Error(`Timed out waiting promptly for ${description}`)), 200);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 function reactionSequence(messageId) {
 	return FakeGateway.lifecycleReactionEvents
 		.filter((event) => event.messageId === messageId)
@@ -687,6 +701,68 @@ try {
 	assert.equal(wakeRequests.length, 3, "relay restart must not replay persisted Manager wakes");
 	await restartWakeCore.stop();
 
+	const concurrentSnapshotState = new DiscordStateStore(join(dataDir, "concurrent-manager-task-snapshot-state.json"));
+	const concurrentSnapshotGateway = new FakeGateway();
+	concurrentSnapshotGateway.ensureProjectChannel = async () => "concurrent-snapshot-channel";
+	concurrentSnapshotGateway.ensureSessionThread = async () => "concurrent-snapshot-thread";
+	const sendSnapshotText = concurrentSnapshotGateway.sendText.bind(concurrentSnapshotGateway);
+	let releaseHeldSnapshotSend;
+	let heldSnapshotSendStarted = false;
+	concurrentSnapshotGateway.sendText = async (channelId, text, nonce) => {
+		if (!heldSnapshotSendStarted && text === taskSnapshot.content) {
+			heldSnapshotSendStarted = true;
+			await new Promise((resolveSend) => { releaseHeldSnapshotSend = resolveSend; });
+		}
+		return sendSnapshotText(channelId, text, nonce);
+	};
+	const concurrentSnapshotCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, concurrentSnapshotState, concurrentSnapshotGateway,
+	);
+	await concurrentSnapshotCore.start();
+	await concurrentSnapshotCore.prepareRegistration("concurrent-client", "concurrent-generation", {
+		cwd: "/concurrent-snapshot", projectIdentityResolved: true, sessionId: "concurrent-session",
+		managerTaskSnapshotTaskId: "wake-task",
+	});
+	await concurrentSnapshotCore.activateRegistration(
+		"concurrent-client", "concurrent-generation", "concurrent-session", () => true,
+		undefined, false, undefined, false, undefined, "wake-task",
+	);
+	await promptly(concurrentSnapshotCore.queueManagerTaskSnapshot(
+		"concurrent-client", "concurrent-generation", "concurrent-session", taskSnapshot,
+	), "first task snapshot acceptance");
+	await waitFor(() => heldSnapshotSendStarted, "held task snapshot Discord mutation");
+	const concurrentSecondSnapshot = {
+		...taskSnapshot, revision: "2".repeat(64), content: "second snapshot while first send is held",
+	};
+	const concurrentThirdSnapshot = {
+		...taskSnapshot, revision: "3".repeat(64), content: "latest rapid snapshot while first send is held",
+	};
+	await promptly(concurrentSnapshotCore.queueManagerTaskSnapshot(
+		"concurrent-client", "concurrent-generation", "concurrent-session", concurrentSecondSnapshot,
+	), "second task snapshot acceptance behind held Discord mutation");
+	await promptly(concurrentSnapshotCore.queueManagerTaskSnapshot(
+		"concurrent-client", "concurrent-generation", "concurrent-session", concurrentThirdSnapshot,
+	), "rapid latest task snapshot acceptance behind held Discord mutation");
+	await promptly(concurrentSnapshotGateway.emit({
+		id: "concurrent-inbound", channelId: "concurrent-snapshot-thread", content: "unrelated inbound", authorBot: false,
+	}), "unrelated inbound delivery behind held Discord mutation");
+	await promptly(concurrentSnapshotCore.acknowledge(
+		"concurrent-client", "concurrent-generation", "concurrent-session", "concurrent-inbound",
+	), "unrelated inbound acknowledgement behind held Discord mutation");
+	assert.equal((await concurrentSnapshotState.pendingMessages("concurrent-session")).length, 0,
+		"held snapshot transport must not block unrelated durable inbound acknowledgement");
+	releaseHeldSnapshotSend();
+	await waitFor(async () => (await concurrentSnapshotState.getSession("concurrent-session"))
+		?.managerTaskSnapshot?.delivery?.snapshot.revision === concurrentThirdSnapshot.revision,
+	"latest task snapshot convergence after held Discord mutation");
+	const concurrentDelivery = (await concurrentSnapshotState.getSession("concurrent-session")).managerTaskSnapshot.delivery;
+	assert.equal(concurrentDelivery.snapshot.content, concurrentThirdSnapshot.content);
+	assert.equal((FakeGateway.channelMessages.get("concurrent-snapshot-thread") ?? []).length, 1,
+		"held and rapid snapshot revisions must converge through one stable Discord message");
+	assert.equal(FakeGateway.channelMessages.get("concurrent-snapshot-thread")[0].id, concurrentDelivery.messageId);
+	assert.equal(FakeGateway.channelMessages.get("concurrent-snapshot-thread")[0].text, concurrentThirdSnapshot.content);
+	await concurrentSnapshotCore.stop();
+
 	const snapshotStateFile = join(dataDir, "manager-task-snapshot-state.json");
 	const snapshotState = new DiscordStateStore(snapshotStateFile);
 	const snapshotGateway = new FakeGateway();
@@ -709,13 +785,13 @@ try {
 		"snapshot-client", "snapshot-generation", "snapshot-session", taskSnapshot,
 	);
 	await waitFor(() => FakeGateway.sendAttempts.get(taskSnapshot.content) === 1, "failed task snapshot send");
+	await snapshotCore.stop();
 	let persistedSnapshot = (await snapshotState.getSession("snapshot-session")).managerTaskSnapshot;
 	assert.equal(persistedSnapshot.desired.content, taskSnapshot.content);
 	assert.equal(persistedSnapshot.delivery, undefined);
 	assert.equal(persistedSnapshot.pendingSend.snapshot.revision, taskSnapshot.revision,
 		"failed sends must retain durable desired and nonce-bound pending state");
 	const pendingSnapshotNonce = persistedSnapshot.pendingSend.nonce;
-	await snapshotCore.stop();
 
 	const restartedSnapshotGateway = new FakeGateway();
 	restartedSnapshotGateway.ensureProjectChannel = async () => "snapshot-channel";
@@ -770,6 +846,40 @@ try {
 		{ ...nextTaskSnapshot, revision: "3".repeat(64), taskId: "other-task" },
 	), /not registered for this manager task snapshot/, "cross-task relay frames must fail closed");
 	await restartedSnapshotCore.stop();
+
+	const remappedSnapshotGateway = new FakeGateway();
+	remappedSnapshotGateway.ensureProjectChannel = async () => "snapshot-channel";
+	remappedSnapshotGateway.ensureSessionThread = async () => "snapshot-thread-remapped";
+	const remappedSnapshotState = new DiscordStateStore(snapshotStateFile);
+	const remappedSnapshotCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, remappedSnapshotState, remappedSnapshotGateway,
+	);
+	await remappedSnapshotCore.start();
+	const remappedPrepared = await remappedSnapshotCore.prepareRegistration("snapshot-client-3", "snapshot-generation-3", {
+		cwd: "/snapshot", projectIdentityResolved: true, sessionId: "snapshot-session",
+		managerTaskSnapshotTaskId: "wake-task",
+	});
+	assert.equal(remappedPrepared.threadId, "snapshot-thread-remapped");
+	const invalidatedRemap = await remappedSnapshotState.getSession("snapshot-session");
+	assert.equal(invalidatedRemap.managerTaskSnapshot.delivery, undefined,
+		"thread remap must invalidate old thread-bound snapshot delivery");
+	assert.equal(invalidatedRemap.managerTaskSnapshot.pendingSend, undefined,
+		"thread remap must invalidate old thread-bound pending send nonce");
+	await remappedSnapshotCore.activateRegistration(
+		"snapshot-client-3", "snapshot-generation-3", "snapshot-session", () => true,
+		undefined, false, undefined, false, undefined, "wake-task",
+	);
+	await waitFor(async () => Boolean((await remappedSnapshotState.getSession("snapshot-session"))
+		?.managerTaskSnapshot?.delivery), "task snapshot delivery after thread remap");
+	const remappedDelivery = (await remappedSnapshotState.getSession("snapshot-session")).managerTaskSnapshot.delivery;
+	assert.notEqual(remappedDelivery.messageId, snapshotMessageId,
+		"thread remap must persist a new thread-local Discord message ID");
+	assert.equal(remappedDelivery.snapshot.revision, nextTaskSnapshot.revision);
+	assert.equal(remappedDelivery.snapshot.content, nextTaskSnapshot.content);
+	assert.deepEqual((FakeGateway.channelMessages.get("snapshot-thread-remapped") ?? []).map(({ id, text }) => ({ id, text })), [{
+		id: remappedDelivery.messageId, text: nextTaskSnapshot.content,
+	}], "thread remap must send exactly one latest snapshot to the new thread");
+	await remappedSnapshotCore.stop();
 
 	const malformedSnapshotStateFile = join(dataDir, "malformed-manager-task-snapshot-state.json");
 	const malformedSnapshotState = JSON.parse(await readFile(snapshotStateFile, "utf8"));

@@ -183,6 +183,7 @@ export class DiscordRelayCore {
 	private readonly summaryOwners = new Map<string, ActiveSession>();
 	private readonly summaryOwnerRetirements = new Map<string, Promise<void>>();
 	private readonly taskSnapshotReconciliations = new Map<string, Promise<void>>();
+	private readonly taskSnapshotReconcileRequested = new Set<string>();
 	private readonly taskSnapshotRevisions = new Map<string, string>();
 	private readonly taskSnapshotRetryAttempts = new Map<string, number>();
 	private readonly taskSnapshotRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -329,6 +330,7 @@ export class DiscordRelayCore {
 		for (const timer of this.taskSnapshotRetryTimers.values()) clearTimeout(timer);
 		this.taskSnapshotRetryTimers.clear();
 		this.taskSnapshotRetryAttempts.clear();
+		this.taskSnapshotReconcileRequested.clear();
 		this.taskSnapshotRevisions.clear();
 		await Promise.allSettled(this.taskSnapshotReconciliations.values());
 		this.taskSnapshotReconciliations.clear();
@@ -818,7 +820,6 @@ export class DiscordRelayCore {
 		if (!active.managerTaskSnapshotTaskId || active.managerTaskSnapshotTaskId !== snapshot.taskId) {
 			throw new Error("Local client is not registered for this manager task snapshot");
 		}
-		await this.taskSnapshotReconciliations.get(sessionId)?.catch(() => {});
 		const update = await this.state.setManagerTaskSnapshotDesired(sessionId, snapshot);
 		if (!update.accepted) return;
 		this.taskSnapshotRevisions.set(sessionId, snapshot.revision);
@@ -1031,14 +1032,19 @@ export class DiscordRelayCore {
 
 	private scheduleManagerTaskSnapshotReconciliation(sessionId: string): void {
 		const revision = this.taskSnapshotRevisions.get(sessionId);
-		if (!revision || this.taskSnapshotReconciliations.has(sessionId) ||
-			this.taskSnapshotRetryTimers.has(sessionId)) return;
+		if (!revision || this.taskSnapshotRetryTimers.has(sessionId)) return;
+		if (this.taskSnapshotReconciliations.has(sessionId)) {
+			this.taskSnapshotReconcileRequested.add(sessionId);
+			return;
+		}
 		let tracked: Promise<void>;
 		tracked = this.reconcileManagerTaskSnapshot(sessionId, revision)
 			.catch(() => this.scheduleManagerTaskSnapshotRetry(sessionId, revision))
 			.finally(() => {
-				if (this.taskSnapshotReconciliations.get(sessionId) === tracked) {
-					this.taskSnapshotReconciliations.delete(sessionId);
+				if (this.taskSnapshotReconciliations.get(sessionId) !== tracked) return;
+				this.taskSnapshotReconciliations.delete(sessionId);
+				if (this.taskSnapshotReconcileRequested.delete(sessionId)) {
+					this.scheduleManagerTaskSnapshotReconciliation(sessionId);
 				}
 			});
 		this.taskSnapshotReconciliations.set(sessionId, tracked);
@@ -1054,7 +1060,12 @@ export class DiscordRelayCore {
 				const pending = await this.state.prepareManagerTaskSnapshotSend(sessionId, revision);
 				if (!pending || this.taskSnapshotRevisions.get(sessionId) !== revision) return;
 				const messageId = await this.transport.sendText(mapping.threadId, pending.snapshot.content, pending.nonce);
-				await this.state.recordManagerTaskSnapshotSent(sessionId, pending.nonce, messageId, revision);
+				await this.state.recordManagerTaskSnapshotSent(
+					sessionId,
+					pending.nonce,
+					messageId,
+					pending.snapshot.revision,
+				);
 				continue;
 			}
 			if (!state.delivery) {

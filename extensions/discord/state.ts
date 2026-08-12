@@ -487,6 +487,7 @@ export class DiscordStateStore {
 			}
 			const sameParent = existing?.cwd === cwd && existing.channelId === channelId;
 			const threadId = await resolve(sameParent ? existing.threadId : undefined);
+			const threadChanged = existing !== undefined && existing.threadId !== threadId;
 			const outboundMessages = existing?.outboundMessages ?? [];
 			for (const message of outboundMessages) message.threadId = threadId;
 			const mapping: SessionThreadMapping = {
@@ -504,7 +505,11 @@ export class DiscordStateStore {
 						existing?.managerWake !== undefined ? { managerWake: existing.managerWake } : {}),
 				...(managerTaskSnapshotTaskId ? { managerTaskSnapshotTaskId } :
 					existing?.managerTaskSnapshotTaskId ? { managerTaskSnapshotTaskId: existing.managerTaskSnapshotTaskId } : {}),
-				...(existing?.managerTaskSnapshot ? { managerTaskSnapshot: existing.managerTaskSnapshot } : {}),
+				...(existing?.managerTaskSnapshot ? {
+					managerTaskSnapshot: threadChanged
+						? { desired: existing.managerTaskSnapshot.desired }
+						: existing.managerTaskSnapshot,
+				} : {}),
 			};
 			state.sessions[sessionId] = mapping;
 			return structuredClone(mapping);
@@ -670,7 +675,7 @@ export class DiscordStateStore {
 		await this.mutate(async (state) => {
 			const snapshot = state.sessions[sessionId]?.managerTaskSnapshot;
 			if (!snapshot?.pendingSend || snapshot.pendingSend.nonce !== nonce ||
-				snapshot.desired.revision !== expectedRevision) return;
+				snapshot.pendingSend.snapshot.revision !== expectedRevision) return;
 			snapshot.delivery = { messageId, snapshot: structuredClone(snapshot.pendingSend.snapshot) };
 			delete snapshot.pendingSend;
 		});
