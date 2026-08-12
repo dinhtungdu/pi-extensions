@@ -20,9 +20,11 @@ import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-
 import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
 import {
 	isManagerPresentation,
+	isManagerPresentationActionControl,
 	isSupportedManagerPresentationControl,
 	MANAGER_PRESENTATION_SCHEMA_VERSION,
 	type ManagerPresentation,
+	type ManagerPresentationActionControl,
 } from "./manager-presentation.js";
 
 export const MAX_IPC_FRAME_BYTES = 1_048_576;
@@ -74,7 +76,8 @@ export type ServerFrame =
 	| { type: "inbound"; messageId: string; text: string; images?: QueuedInboundImage[] }
 	| { type: "control"; requestId: string; action: PiSessionControlAction }
 	| ({ type: "manager_control" } & PiManagerControlRequest)
-	| { type: "manager_presentation_control"; requestId: string; revision: string; controlId: string; command: string }
+	| { type: "manager_presentation_control"; requestId: string; revision: string; controlId: string; command: string;
+		actionControl?: ManagerPresentationActionControl }
 	| { type: "inbound_acked"; requestId: string; messageId: string }
 	| { type: "inbound_images_released"; requestId: string; messageId: string }
 	| { type: "outbound_queued"; requestId: string; messageId: string }
@@ -107,7 +110,7 @@ function isManagerPresentationCapability(value: unknown): boolean {
 	const capability = value as Record<string, unknown>;
 	return capability.schemaVersion === MANAGER_PRESENTATION_SCHEMA_VERSION && Array.isArray(capability.controlIds) &&
 		capability.controlIds.length <= 25 && new Set(capability.controlIds).size === capability.controlIds.length && capability.controlIds.every((id) =>
-			typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,99}$/.test(id));
+			typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(id));
 }
 
 export function isClientFrame(value: unknown): value is ClientFrame {
@@ -193,8 +196,11 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 	if (frame.type === "control") return typeof frame.requestId === "string" && isPiSessionControlAction(frame.action);
 	if (frame.type === "manager_control") return isPiManagerControlRequest(frame);
 	if (frame.type === "manager_presentation_control") {
-		return typeof frame.requestId === "string" && typeof frame.revision === "string" && /^[a-f0-9]{64}$/.test(frame.revision) &&
-			isSupportedManagerPresentationControl(frame.controlId, frame.command);
+		if (typeof frame.requestId !== "string" || typeof frame.revision !== "string" || !/^[a-f0-9]{64}$/.test(frame.revision) ||
+			typeof frame.controlId !== "string") return false;
+		if (frame.actionControl === undefined) return isSupportedManagerPresentationControl(frame.controlId, frame.command);
+		return isManagerPresentationActionControl(frame.actionControl) && frame.actionControl.id === frame.controlId &&
+			frame.actionControl.command === frame.command;
 	}
 	if (frame.type === "inbound_acked" || frame.type === "inbound_images_released") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string";

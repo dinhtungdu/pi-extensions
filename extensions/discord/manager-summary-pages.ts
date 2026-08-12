@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ManagerPresentation } from "./manager-presentation.js";
+import type { ManagerPresentation, ManagerPresentationActionControl } from "./manager-presentation.js";
 
 export const DISCORD_MANAGER_SUMMARY_PAGE_LIMIT = 2_000;
 export const MANAGER_SUMMARY_PAGE_PAYLOAD_LIMIT = 1_900;
@@ -28,8 +28,10 @@ export function managerSummaryPageMetadata(content: string): ManagerSummaryPageM
 	return { revision: match[1]!, page, total };
 }
 
-function splitManagerSummaryContent(content: string): string[] {
-	const chunks: string[] = [];
+interface ContentChunk { start: number; end: number; content: string }
+
+function splitManagerSummaryContent(content: string): ContentChunk[] {
+	const chunks: ContentChunk[] = [];
 	let offset = 0;
 	while (content.length - offset > MANAGER_SUMMARY_PAGE_PAYLOAD_LIMIT) {
 		const maximum = offset + MANAGER_SUMMARY_PAGE_PAYLOAD_LIMIT;
@@ -42,11 +44,20 @@ function splitManagerSummaryContent(content: string): string[] {
 			else cut = maximum;
 		}
 		if (cut > offset && /[\uD800-\uDBFF]/.test(content[cut - 1]!) && /[\uDC00-\uDFFF]/.test(content[cut]!)) cut--;
-		chunks.push(content.slice(offset, cut));
+		chunks.push({ start: offset, end: cut, content: content.slice(offset, cut) });
 		offset = cut;
 	}
-	chunks.push(content.slice(offset));
+	chunks.push({ start: offset, end: content.length, content: content.slice(offset) });
 	return chunks;
+}
+
+function pageActionControls(
+	actions: readonly ManagerPresentationActionControl[],
+	chunk: ContentChunk,
+): ManagerPresentationActionControl[] {
+	return actions.flatMap((action) => action.after > chunk.start && action.after <= chunk.end
+		? [{ ...action, after: action.after - chunk.start }]
+		: []);
 }
 
 export function paginateManagerPresentation(presentation: ManagerPresentation): ManagerSummaryPage[] {
@@ -55,19 +66,22 @@ export function paginateManagerPresentation(presentation: ManagerPresentation): 
 	const batchRevision = createHash("sha256").update(JSON.stringify(presentation)).digest("hex");
 	return chunks.map((chunk, index) => {
 		const page = index + 1;
-		const marker = `${chunk.endsWith("\n") ? "" : "\n"}-# Manager summary · ${batchRevision} · ${page}/${chunks.length}`;
-		const content = `${chunk}${marker}`;
+		const marker = `${chunk.content.endsWith("\n") ? "" : "\n"}-# Manager summary · ${batchRevision} · ${page}/${chunks.length}`;
+		const content = `${chunk.content}${marker}`;
 		if (content.length > DISCORD_MANAGER_SUMMARY_PAGE_LIMIT) throw new Error("Discord manager summary page exceeds 2000 characters");
 		return {
 			revision: batchRevision,
 			page,
-			payload: chunk,
+			payload: chunk.content,
 			total: chunks.length,
 			content,
 			presentation: {
 				...presentation,
 				content,
 				controls: page === chunks.length ? presentation.controls.map((control) => ({ ...control })) : [],
+				...(presentation.actionControls !== undefined ? {
+					actionControls: pageActionControls(presentation.actionControls, chunk),
+				} : {}),
 				warnings: [...presentation.warnings],
 			},
 		};

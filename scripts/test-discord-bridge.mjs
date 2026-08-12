@@ -538,6 +538,8 @@ try {
 		managerCommandDefinition,
 		archiveSessionThread,
 		lockSessionThread,
+		managerPresentationComponents,
+		managerSummaryMessageContent,
 		presentationComponents,
 		replaceOwnLifecycleReaction,
 		reuseSessionThread,
@@ -1698,6 +1700,7 @@ try {
 		"",
 	].join("\n");
 	await writeFile(join(managerFixture, "bin", "manager.mjs"), managerFixtureScript);
+	await writeFile(join(managerFixture, "bin", "manager-supervisor-client.mjs"), managerFixtureScript);
 	await writeFile(join(managerFixture, "bin", "manager-runtime.mjs"), 'console.log(JSON.stringify({ valid: true }));\n');
 	await writeFile(join(managerFixture, "data", "PROJECTS.md"), "---\nprojects:\n  pi-extensions:\n    repository: /tmp/pi-extensions\n    base_ref: origin/main\n    landing_ref: main\n    checkout_mode: repository\n---\n");
 	const focusedManagerStatus = {
@@ -1805,6 +1808,70 @@ try {
 	}, "manager presentation creates must suppress embeds without changing content, controls, nonce, or mention safety");
 	assert.deepEqual(normalizePresentationPayload(presentationEditPayloads[0]), expectedPresentationPayload,
 		"manager presentation edits must retain embed suppression, content, controls, and mention safety");
+	const actionPresentationSendPayloads = [];
+	presentationTransport.textChannel = async () => ({
+		async send(payload) { actionPresentationSendPayloads.push(payload); return { id: "presentation-action-message" }; },
+	});
+	const transportActionContent = "Ready 😀 task\nPull-request task";
+	const transportActionPresentation = {
+		schemaVersion: 1, revision: "9".repeat(64), content: transportActionContent,
+		controls: transportPresentation.controls,
+		actionControls: [{
+			id: "merge-ready", label: "Merge & archive", style: "success", command: "task-merge-and-archive",
+			taskId: "ready-task", after: "Ready 😀 task\n".length,
+			confirmation: { title: "Merge ready-task?", body: "Land on main and push origin/main.", confirmLabel: "Merge now" },
+		}],
+		degraded: false, warnings: [],
+	};
+	assert.equal(await presentationTransport.sendPresentation(
+		"project-channel", transportActionPresentation, "presentation-action-nonce",
+	), "presentation-action-message");
+	const actionPayload = normalizePresentationPayload(actionPresentationSendPayloads[0]);
+	assert.equal(actionPayload.content, undefined, "Components V2 messages must not duplicate opaque content in legacy content field");
+	assert.equal(actionPayload.flags, MessageFlags.SuppressEmbeds | MessageFlags.IsComponentsV2);
+	assert.equal(actionPayload.components[0].type, 17);
+	assert.deepEqual(actionPayload.allowedMentions, { parse: [] });
+	const confirmationTransport = new DiscordJsTransport();
+	const confirmationRequests = [];
+	confirmationTransport.onPresentationControl(async (request) => {
+		confirmationRequests.push(request);
+		return request.confirmed
+			? { ok: true, message: "@ready-task merged, pushed, and archived." }
+			: { ok: true, message: "Confirmation required.", confirmation: {
+				title: "Merge ready-task?", body: "Land on main and push origin/main.", confirmLabel: "Merge now",
+			} };
+	});
+	const confirmationReplies = [];
+	let confirmationDeferredFlags;
+	let decisionDeferred = false;
+	const confirmationInteraction = {
+		id: "preview-interaction", guildId: "12345", user: { id: "owner" },
+		message: { id: "summary-message" }, customId: `m:${"9".repeat(64)}:merge-ready`,
+		async deferReply(options) { confirmationDeferredFlags = options.flags; },
+		async editReply(payload) {
+			confirmationReplies.push(payload);
+			return {
+				async awaitMessageComponent(options) {
+					const customId = payload.components[0].toJSON().components[0].custom_id;
+					const decision = { id: "confirm-interaction", customId, user: { id: "owner" },
+						async deferUpdate() { decisionDeferred = true; } };
+					assert.equal(options.filter(decision), true);
+					return decision;
+				},
+			};
+		},
+	};
+	await confirmationTransport.executePresentationControlInteraction(confirmationInteraction, "project-channel");
+	assert.equal(confirmationDeferredFlags, MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds,
+		"merge confirmation must remain ephemeral");
+	assert.equal(confirmationReplies[0].content, "**Merge ready-task?**\nLand on main and push origin/main.");
+	assert.equal(confirmationReplies[0].components[0].toJSON().components[0].label, "Merge now");
+	assert.equal(decisionDeferred, true);
+	assert.deepEqual(confirmationRequests.map(({ requestId, confirmed }) => ({ requestId, confirmed })), [
+		{ requestId: "preview-interaction", confirmed: undefined },
+		{ requestId: "confirm-interaction", confirmed: true },
+	], "only explicit confirmation advances manager action execution");
+	assert.equal(confirmationReplies.at(-1).content, "✅ @ready-task merged, pushed, and archived.");
 
 	const historyRevision = "a".repeat(64);
 	const historyMessages = Array.from({ length: 150 }, (_, index) => ({
@@ -2082,6 +2149,43 @@ try {
 		degraded: true, warnings: ["opaque warning"],
 	};
 	assert.equal(parseManagerPresentationEnvelope(validPresentationEnvelope).content, opaqueContent, "content must remain byte-for-byte opaque");
+	const directTaskContent = "**Direct 😀 ready task**\nReady to land.\n";
+	const pullRequestTaskContent = "**Pull-request task**\nWaiting for PR merge.";
+	const actionPresentationEnvelope = {
+		...validPresentationEnvelope,
+		revision: "6".repeat(64),
+		content: directTaskContent + pullRequestTaskContent,
+		action_controls: [{
+			id: "merge-ready-task", label: "Merge & archive", style: "success", command: "task-merge-and-archive",
+			task_id: "ready-task", after: directTaskContent.length,
+			confirmation: { title: "Merge ready-task?", body: "Land on main and push origin/main.", confirm_label: "Merge now" },
+		}],
+	};
+	const actionPresentation = parseManagerPresentationEnvelope(actionPresentationEnvelope);
+	assert.deepEqual(actionPresentation.actionControls, [{
+		id: "merge-ready-task", label: "Merge & archive", style: "success", command: "task-merge-and-archive",
+		taskId: "ready-task", after: directTaskContent.length,
+		confirmation: { title: "Merge ready-task?", body: "Land on main and push origin/main.", confirmLabel: "Merge now" },
+	}], "schema-v1 must consume exact manager-owned action_controls without interpreting content");
+	assert.equal(actionPresentation.actionControls.some((action) => action.taskId === "pull-request-task"), false,
+		"transport must not infer actions for tasks omitted by Manager");
+	assert.equal(parseManagerPresentationEnvelope(validPresentationEnvelope).actionControls, undefined,
+		"presentations without action_controls remain backward compatible");
+	const actionComponents = managerPresentationComponents(actionPresentation).map((component) => component.toJSON());
+	assert.equal(actionComponents[0].type, 17, "action_controls select Components V2 rendering");
+	assert.deepEqual(actionComponents[0].components.map((component) => component.type), [10, 1, 10, 1],
+		"action row must render at exact manager-owned UTF-16 offset despite surrogate pairs");
+	assert.equal(actionComponents[0].components[0].content, directTaskContent);
+	assert.equal(actionComponents[0].components[1].components[0].label, "Merge & archive");
+	assert.equal(actionComponents[0].components[2].content, pullRequestTaskContent);
+	assert.equal(actionComponents[0].components[3].components[0].label, "Manager label",
+		"Refresh & Reconcile remains after opaque summary content");
+	assert.equal(managerSummaryMessageContent({ content: "", components: actionComponents }), actionPresentation.content,
+		"Components V2 text remains discoverable for summary batch metadata");
+	assert.throws(() => parseManagerPresentationEnvelope({
+		...actionPresentationEnvelope,
+		action_controls: [{ ...actionPresentationEnvelope.action_controls[0], after: actionPresentationEnvelope.content.length + 1 }],
+	}), /invalid presentation/, "out-of-range manager-owned placement must fail closed");
 	for (const [name, mutation] of [
 		["unknown control", { controls: [{ id: "other", label: "Other", style: "secondary", command: "other" }] }],
 		["unsupported command", { controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "status" }] }],
@@ -2158,6 +2262,7 @@ try {
 	await mkdir(join(managerExecutorRoot, "bin"), { recursive: true });
 	await mkdir(join(managerExecutorRoot, "data", "tasks"), { recursive: true });
 	await writeFile(join(managerExecutorRoot, "bin", "manager.mjs"), "// fixture\n");
+	await writeFile(join(managerExecutorRoot, "bin", "manager-supervisor-client.mjs"), "// fixture\n");
 	await writeFile(join(managerExecutorRoot, "bin", "manager-runtime.mjs"), "// fixture\n");
 	const canonicalExecutorProjects = (ids) => `---\nprojects:\n${ids.map((id) => `  ${id}:\n    repository: /tmp/${id}`).join("\n")}\n---\n`;
 	await writeFile(join(managerExecutorRoot, "data", "PROJECTS.md"), canonicalExecutorProjects(["pi-extensions", "safe-task"]));
@@ -2221,7 +2326,8 @@ try {
 			? { ok: true, command, task_id: taskId, state: "direct", worker_session: "mgr-worker", replay: false }
 			: command === "handoff-return"
 				? { ok: true, command, task_id: taskId, state: "return-requested", worker_session: "mgr-worker", replay: false }
-				: { ok: true, command, task_id: taskId, archived: true, checkout_mode: "repository", slot_state: null, replay: false };
+				: { ok: true, command, task_id: taskId, archived: true, checkout_mode: "repository", slot_state: null,
+					pushed: command === "task-merge-and-archive" ? true : undefined, replay: false };
 		return { code: 0, stdout: `${JSON.stringify(output)}\n`, stderr: "" };
 	};
 	const validManagerEnvironment = {
@@ -2433,6 +2539,8 @@ try {
 	assert.ok(managerActionCalls[2].args.includes("--completion-authorized"), "archive must carry explicit non-merge completion authorization");
 	assert.equal(managerActionCalls[3].args.includes("--completion-authorized"), false,
 		"merge-and-archive must use only its dedicated canonical composite");
+	assert.equal(managerActionCalls[3].args[0], join(managerExecutorRoot, "bin", "manager-supervisor-client.mjs"),
+		"merge-and-archive must route through canonical Supervisor serialization");
 	assert.deepEqual(managerActionCalls[4].args, [join(managerExecutorRoot, "bin", "manager.mjs"), "task-reconcile-pr",
 		"--root", managerExecutorRoot, "--task", join(managerExecutorRoot, "data", "tasks", "safe-task.md")],
 	"single reconcile-pr must preserve exact canonical task routing");
@@ -3876,6 +3984,63 @@ try {
 	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.controls.length === 0, "final owner stripping");
 	await presentationCore.stop();
 
+	const actionState = new DiscordStateStore(join(dataDir, "presentation-action-state.json"));
+	const actionGateway = new FakeGateway();
+	const actionCore = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, actionState, actionGateway);
+	await actionCore.start();
+	await actionCore.prepareRegistration("presentation-action-client", "presentation-action-generation", {
+		cwd: "/presentation-action-manager", projectIdentityResolved: true, sessionId: "presentation-action-session",
+	});
+	const actionExecutions = [];
+	await actionCore.activateRegistration(
+		"presentation-action-client", "presentation-action-generation", "presentation-action-session", () => true,
+		undefined, false, undefined, true,
+		{
+			controlIds: ["github-refresh-reconcile"],
+			execute: async (request) => {
+				actionExecutions.push(structuredClone(request));
+				return { ok: true, message: `@${request.actionControl.taskId} merged, pushed, and archived.` };
+			},
+		},
+	);
+	await actionCore.queueManagerPresentation(
+		"presentation-action-client", "presentation-action-generation", "presentation-action-session", actionPresentation,
+	);
+	const actionMapping = await actionState.getSession("presentation-action-session");
+	await waitFor(async () => (await actionState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === actionPresentation.revision,
+		"action_controls presentation delivery");
+	const actionMessage = FakeGateway.channelMessages.get(actionMapping.channelId).at(-1);
+	const actionRequest = {
+		requestId: "action-merge-preview", guildId: "12345", channelId: actionMapping.channelId, messageId: actionMessage.id,
+		customId: `m:${actionPresentation.revision}:merge-ready-task`,
+	};
+	assert.deepEqual(await actionCore.executeDiscordPresentationControl(actionRequest), {
+		ok: true,
+		message: "Confirmation required.",
+		confirmation: { title: "Merge ready-task?", body: "Land on main and push origin/main.", confirmLabel: "Merge now" },
+	}, "ready direct-landing action must return manager-owned confirmation details before mutation");
+	assert.equal(actionExecutions.length, 0, "preview must not execute merge-and-archive");
+	assert.equal((await actionCore.executeDiscordPresentationControl({
+		...actionRequest, requestId: "action-wrong-message", messageId: "stale-message", confirmed: true,
+	})).ok, false, "task action from wrong summary message must fail stale");
+	assert.deepEqual(await actionCore.executeDiscordPresentationControl({
+		...actionRequest, requestId: "action-merge-confirmed", confirmed: true,
+	}), { ok: true, message: "@ready-task merged, pushed, and archived." });
+	assert.equal(actionExecutions.length, 1, "confirmed action executes exactly once");
+	assert.deepEqual(actionExecutions[0].actionControl, actionPresentation.actionControls[0],
+		"relay forwards exact manager-owned action descriptor instead of parsing summary Markdown");
+	const replacedActionPresentation = { ...actionPresentation, revision: "7".repeat(64), content: `${actionPresentation.content}\nUpdated.` };
+	await actionCore.queueManagerPresentation(
+		"presentation-action-client", "presentation-action-generation", "presentation-action-session", replacedActionPresentation,
+	);
+	await waitFor(async () => (await actionState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === replacedActionPresentation.revision,
+		"action_controls replacement delivery");
+	assert.equal((await actionCore.executeDiscordPresentationControl({
+		...actionRequest, requestId: "action-stale-revision", confirmed: true,
+	})).ok, false, "replaced action_controls must fail stale revision and message authorization");
+	assert.equal(actionExecutions.length, 1);
+	await actionCore.stop();
+
 	assert.equal(projectChannelName("/one/My Project"), "my-project");
 	assert.equal(projectChannelName("/one/project"), projectChannelName("/two/project"));
 	assert.equal(projectChannelName(`/tmp/${"a".repeat(150)}`).length, 100);
@@ -4450,6 +4615,8 @@ try {
 		controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "github-refresh-reconcile" }],
 	};
 	assert.equal(isClientFrame({ type: "manager_presentation", requestId: "presentation-request", presentation: ipcPresentation }), true);
+	assert.equal(isClientFrame({ type: "manager_presentation", requestId: "presentation-action-request", presentation: actionPresentation }), true,
+		"schema-v1 manager-owned action_controls cross authenticated relay IPC");
 	assert.equal(isClientFrame({ type: "manager_presentation", requestId: "long-presentation", presentation: {
 		...ipcPresentation, content: "x".repeat(10_000),
 	} }), true, "complete bounded Manager presentations must cross relay IPC before Discord pagination");
@@ -4464,12 +4631,22 @@ try {
 		controlId: "github-refresh-reconcile", command: "github-refresh-reconcile",
 	}), true);
 	assert.equal(isServerFrame({
+		type: "manager_presentation_control", requestId: "task-action-interaction", revision: actionPresentation.revision,
+		controlId: actionPresentation.actionControls[0].id, command: "task-merge-and-archive",
+		actionControl: actionPresentation.actionControls[0],
+	}), true, "validated task action descriptors cross relay IPC only after confirmation");
+	assert.equal(isServerFrame({
+		type: "manager_presentation_control", requestId: "mismatched-task-action", revision: actionPresentation.revision,
+		controlId: "wrong-action", command: "task-merge-and-archive", actionControl: actionPresentation.actionControls[0],
+	}), false);
+	assert.equal(isServerFrame({
 		type: "manager_presentation_control", requestId: "mismatched-interaction", revision: "4".repeat(64),
 		controlId: "github-refresh-reconcile", command: "task-reconcile-pr",
 	}), false, "presentation control frames require the exact allowlisted ID/command pair");
 	assert.equal(isClientFrame({ type: "register", token: "token", clientId: "client", generation: "generation",
 		configFingerprint: "fingerprint", configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: true,
-		managerPresentation: { schemaVersion: 1, controlIds: ["github-refresh-reconcile", "future-control"] } }), true, "additive controls accepted");
+		managerPresentation: { schemaVersion: 1, controlIds: ["github-refresh-reconcile", "future-control"] },
+	}), true, "existing schema-v1 capability remains unchanged");
 	assert.equal(isClientFrame({
 		type: "register", token: "token", clientId: "client", generation: "generation", configFingerprint: "fingerprint",
 		configEpoch: 1, cwd: "/the-manager", sessionId: "manager", managerTaskSummaryProducer: false,

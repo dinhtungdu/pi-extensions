@@ -25,6 +25,7 @@ import {
 	MANAGER_PRESENTATION_SCHEMA_VERSION,
 	SUPPORTED_MANAGER_PRESENTATION_CONTROLS,
 	type ManagerPresentation,
+	type ManagerPresentationActionControl,
 } from "./manager-presentation.js";
 import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 import type { ManagerTaskTerminal } from "./manager-task-terminal.js";
@@ -61,7 +62,7 @@ export interface RelayClientCallbacks {
 	managerProjectCatalogue?(): ManagerProjectCatalogueEntry[];
 	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 	onManagerPresentationControl?(
-		request: { requestId: string; revision: string; controlId: string; command: string },
+		request: { requestId: string; revision: string; controlId: string; command: string; actionControl?: ManagerPresentationActionControl },
 		signal: AbortSignal,
 	): Promise<PiSessionControlResult>;
 }
@@ -537,6 +538,7 @@ export class LocalRelayClient {
 						revision: frame.revision,
 						controlId: frame.controlId,
 						command: frame.command,
+						...(frame.actionControl ? { actionControl: structuredClone(frame.actionControl) } : {}),
 					}, abort.signal))
 					: { ok: false, message: "This Pi client does not support manager presentation controls." };
 			} catch (error) {

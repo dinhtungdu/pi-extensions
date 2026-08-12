@@ -45,6 +45,7 @@ export interface ProjectSummaryState {
 	revision: number;
 	delivery?: {
 		messageId: string;
+		messageIds?: string[];
 		content: string;
 		presentation?: ManagerPresentation;
 	};
@@ -261,7 +262,12 @@ function parseProjectSummary(value: unknown, file: string): ProjectSummaryState 
 	}
 	let delivery: ProjectSummaryState["delivery"];
 	if (value.delivery !== undefined) {
-		if (!isRecord(value.delivery) || typeof value.delivery.messageId !== "string" || typeof value.delivery.content !== "string") {
+		if (!isRecord(value.delivery) || typeof value.delivery.messageId !== "string" || typeof value.delivery.content !== "string" ||
+			(value.delivery.messageIds !== undefined && (!Array.isArray(value.delivery.messageIds) ||
+				value.delivery.messageIds.length < 1 || value.delivery.messageIds.length > 99 ||
+				!value.delivery.messageIds.every((id) => typeof id === "string") ||
+				new Set(value.delivery.messageIds).size !== value.delivery.messageIds.length ||
+				!value.delivery.messageIds.includes(value.delivery.messageId)))) {
 			throw new Error(`Discord bridge state ${file} has an invalid project summary delivery`);
 		}
 		if (value.delivery.presentation !== undefined && !isManagerPresentation(value.delivery.presentation)) {
@@ -269,6 +275,7 @@ function parseProjectSummary(value: unknown, file: string): ProjectSummaryState 
 		}
 		delivery = {
 			messageId: value.delivery.messageId,
+			...(Array.isArray(value.delivery.messageIds) ? { messageIds: [...value.delivery.messageIds] as string[] } : {}),
 			content: value.delivery.content,
 			...(value.delivery.presentation ? { presentation: structuredClone(value.delivery.presentation as ManagerPresentation) } : {}),
 		};
@@ -623,12 +630,17 @@ export class DiscordStateStore {
 		});
 	}
 
-	async recordProjectSummaryBatchSent(cwd: string, messageId: string, expectedRevision: number): Promise<void> {
+	async recordProjectSummaryBatchSent(cwd: string, messageIds: readonly string[] | string, expectedRevision: number): Promise<void> {
+		const batchIds = typeof messageIds === "string" ? [messageIds] : [...messageIds];
+		if (batchIds.length < 1 || batchIds.length > 99 || new Set(batchIds).size !== batchIds.length) {
+			throw new Error("Discord manager summary batch message IDs are invalid");
+		}
 		await this.mutate(async (state) => {
 			const summary = state.projects[cwd]?.summary;
 			if (!summary?.desiredPresentation || summary.pendingSend || summary.revision !== expectedRevision) return;
 			summary.delivery = {
-				messageId,
+				messageId: batchIds.at(-1)!,
+				messageIds: batchIds,
 				content: summary.desiredText,
 				presentation: structuredClone(summary.desiredPresentation),
 			};

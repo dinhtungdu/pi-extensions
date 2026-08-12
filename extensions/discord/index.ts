@@ -464,7 +464,28 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 						},
 					} : {}),
 					...(managerPresentationProducer ? {
-						onManagerPresentationControl: async () => {
+						onManagerPresentationControl: async (request) => {
+							if (request.command === "task-merge-and-archive" && request.actionControl) {
+								if (!managerExecutor) return { ok: false, message: "Manager lifecycle controls are unavailable." };
+								const result = boundedControlResult(await managerExecutor.execute({
+									requestId: request.requestId,
+									action: "merge-and-archive",
+									taskId: request.actionControl.taskId,
+								}, managerTaskCatalogue, managerProjectCatalogue));
+								try {
+									pi.appendEntry<ManagerControlResultEntryData>(MANAGER_CONTROL_RESULT_ENTRY, {
+										action: "merge-and-archive", taskId: request.actionControl.taskId, ...result,
+									});
+								} catch {
+									// Session history is best-effort and must not alter the Discord result.
+								}
+								managerProducer?.requestRefresh(0);
+								managerPresentationProducer.requestRefresh(0);
+								return result;
+							}
+							if (request.command !== "github-refresh-reconcile") {
+								return { ok: false, message: "Manager presentation control is unsupported." };
+							}
 							if (managerSummaryTurn || !ctx.isIdle()) {
 								return { ok: false, message: "Refresh & Reconcile is already running; retry when the manager is idle." };
 							}

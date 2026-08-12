@@ -459,7 +459,7 @@ export class LocalRelayHost {
 
 	private requestPresentationControl(
 		state: SocketState,
-		request: { requestId: string; revision: string; controlId: string; command: string },
+		request: Omit<Extract<ServerFrame, { type: "manager_presentation_control" }>, "type">,
 	): Promise<PiSessionControlResult> {
 		return this.requestClientControl(state, { type: "manager_presentation_control", ...request }, MANAGER_CONTROL_IPC_TIMEOUT_MS);
 	}

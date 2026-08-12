@@ -14,6 +14,7 @@ import { normalizeCwd, sessionThreadName, splitDiscordText } from "./text.js";
 import type {
 	DiscordInboundMessage,
 	DiscordPresentationControlRequest,
+	DiscordPresentationControlResult,
 	DiscordTransport,
 } from "./transport.js";
 import {
@@ -47,9 +48,10 @@ import { wakeManagerSession, type ManagerWakeDescriptor } from "./manager-wake.j
 import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
 import {
+	isManagerPresentationActionControl,
 	isSupportedManagerPresentationControl,
-	SUPPORTED_MANAGER_PRESENTATION_CONTROLS,
 	type ManagerPresentation,
+	type ManagerPresentationActionControl,
 } from "./manager-presentation.js";
 import { paginateManagerPresentation } from "./manager-summary-pages.js";
 
@@ -79,7 +81,8 @@ interface ActiveSession {
 	managerTaskSummaryProducer: boolean;
 	managerTaskTerminalProducer: boolean;
 	managerTaskSnapshotTaskId?: string;
-	managerPresentationControlIds: string[]; managerPresentation?: ManagerPresentation;
+	managerPresentationControlIds: string[];
+	managerPresentation?: ManagerPresentation;
 	summaryProducerOrder: number;
 	deliver(message: QueuedDiscordMessage): boolean;
 	deliveredIds: Set<string>;
@@ -90,7 +93,8 @@ interface ActiveSession {
 	managerProjectCatalogue: ManagerProjectCatalogueEntry[];
 	managerAsk: boolean;
 	executeManagerControl?: (request: PiManagerControlRequest) => Promise<PiSessionControlResult>;
-	executePresentationControl?: (request: { requestId: string; revision: string; controlId: string; command: string }) => Promise<PiSessionControlResult>;
+	executePresentationControl?: (request: { requestId: string; revision: string; controlId: string; command: string;
+		actionControl?: ManagerPresentationActionControl }) => Promise<PiSessionControlResult>;
 	inboundImages: boolean;
 }
 
@@ -166,8 +170,8 @@ export class DiscordRelayCore {
 	private readonly managerControlQueueDepths = new Map<string, number>();
 	private readonly inFlightManagerControls = new Map<string, Promise<PiSessionControlResult>>();
 	private readonly completedManagerControls = new Map<string, PiSessionControlResult>();
-	private readonly inFlightPresentationControls = new Map<string, { requestId: string; result: Promise<PiSessionControlResult> }>();
-	private readonly completedPresentationControls = new Map<string, PiSessionControlResult>();
+	private readonly inFlightPresentationControls = new Map<string, { requestId: string; result: Promise<DiscordPresentationControlResult> }>();
+	private readonly completedPresentationControls = new Map<string, DiscordPresentationControlResult>();
 	private inboundQueue: Promise<void> = Promise.resolve();
 	private drainingOutbound = false;
 	private outboundDrainRequested = false;
@@ -429,7 +433,8 @@ export class DiscordRelayCore {
 		managerTaskSummaryProducer = false,
 		managerPresentation?: {
 			controlIds: string[];
-			execute(request: { requestId: string; revision: string; controlId: string; command: string }): Promise<PiSessionControlResult>;
+			execute(request: { requestId: string; revision: string; controlId: string; command: string;
+				actionControl?: ManagerPresentationActionControl }): Promise<PiSessionControlResult>;
 		},
 		managerTaskSnapshotTaskId?: string,
 		managerTaskTerminalProducer = false,
@@ -627,7 +632,7 @@ export class DiscordRelayCore {
 		});
 	}
 
-	executeDiscordPresentationControl(request: DiscordPresentationControlRequest): Promise<PiSessionControlResult> {
+	executeDiscordPresentationControl(request: DiscordPresentationControlRequest): Promise<DiscordPresentationControlResult> {
 		const completed = this.completedPresentationControls.get(request.requestId);
 		if (completed) return Promise.resolve({ ...completed });
 		const interactionKey = `interaction:${request.requestId}`;
@@ -637,9 +642,9 @@ export class DiscordRelayCore {
 		if (this.inFlightPresentationControls.has(channelKey)) {
 			return Promise.resolve({ ok: false, message: "A manager presentation control is already running; retry later." });
 		}
-		let resolveResult!: (result: PiSessionControlResult) => void;
+		let resolveResult!: (result: DiscordPresentationControlResult) => void;
 		let rejectResult!: (error: unknown) => void;
-		const result = new Promise<PiSessionControlResult>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
+		const result = new Promise<DiscordPresentationControlResult>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
 		const reservation = { requestId: request.requestId, result };
 		this.inFlightPresentationControls.set(interactionKey, reservation);
 		this.inFlightPresentationControls.set(channelKey, reservation);
@@ -655,12 +660,10 @@ export class DiscordRelayCore {
 		return result;
 	}
 
-	private async executeCurrentPresentationControl(request: DiscordPresentationControlRequest): Promise<PiSessionControlResult> {
+	private async executeCurrentPresentationControl(request: DiscordPresentationControlRequest): Promise<DiscordPresentationControlResult> {
 		if (request.guildId !== this.config.guildId) return { ok: false, message: "This manager control is not authorized." };
-		const custom = /^m:([a-f0-9]{64}):([a-z0-9-]+)$/.exec(request.customId);
-		if (!custom || !SUPPORTED_MANAGER_PRESENTATION_CONTROLS.includes(custom[2]!)) {
-			return { ok: false, message: "This manager control is malformed or unsupported." };
-		}
+		const custom = /^m:([a-f0-9]{64}):([a-z0-9][a-z0-9-]{0,31})$/.exec(request.customId);
+		if (!custom) return { ok: false, message: "This manager control is malformed or unsupported." };
 		const project = await this.state.projectSummaryByChannel(request.channelId);
 		if (!project) return { ok: false, message: "This manager control is not mapped to a current project summary." };
 		const owner = this.summaryOwners.get(project.cwd);
@@ -668,20 +671,36 @@ export class DiscordRelayCore {
 		const desired = project.summary.desiredPresentation;
 		const delivered = project.summary.delivery?.presentation;
 		const control = desired?.controls.find((candidate) => candidate.id === custom[2]);
+		const actionControl = desired?.actionControls?.find((candidate) => candidate.id === custom[2]);
+		const deliveredControl = delivered?.controls.find((candidate) => candidate.id === custom[2]);
+		const deliveredActionControl = delivered?.actionControls?.find((candidate) => candidate.id === custom[2]);
+		const deliveredMessageIds = project.summary.delivery?.messageIds ??
+			(project.summary.delivery ? [project.summary.delivery.messageId] : []);
+		const descriptorMatches = control
+			? isSupportedManagerPresentationControl(control.id, control.command) && JSON.stringify(control) === JSON.stringify(deliveredControl)
+			: actionControl
+				? isManagerPresentationActionControl(actionControl, desired?.content.length) &&
+					JSON.stringify(actionControl) === JSON.stringify(deliveredActionControl)
+				: false;
 		if (!owner?.executePresentationControl || this.activeSessions.get(owner.sessionId) !== owner ||
 			!authorization || authorization.owner !== owner || authorization.revision !== project.summary.revision ||
-			project.summary.delivery?.messageId !== request.messageId || desired?.revision !== custom[1] ||
-			delivered?.revision !== custom[1] || !control || !isSupportedManagerPresentationControl(control.id, control.command)) {
+			!deliveredMessageIds.includes(request.messageId) || desired?.revision !== custom[1] || delivered?.revision !== custom[1] ||
+			!descriptorMatches) {
 			return { ok: false, message: "This manager control is stale or no longer authorized." };
 		}
+		if (actionControl && request.confirmed !== true) {
+			return { ok: true, message: "Confirmation required.", confirmation: structuredClone(actionControl.confirmation) };
+		}
+		const selected = actionControl ?? control!;
 		const execution = (async () => {
 			let result: PiSessionControlResult;
 			try {
 				result = boundedControlResult(await owner.executePresentationControl!({
 					requestId: request.requestId,
 					revision: custom[1]!,
-					controlId: control.id,
-					command: control.command,
+					controlId: selected.id,
+					command: selected.command,
+					...(actionControl ? { actionControl: structuredClone(actionControl) } : {}),
 				}));
 			} catch (error) {
 				result = boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
@@ -949,10 +968,10 @@ export class DiscordRelayCore {
 			if (this.summaryOwners.get(cwd) !== owner) return;
 			const project = (await this.state.projectSummaries()).find((candidate) => candidate.cwd === cwd);
 			const desired = project?.summary.desiredPresentation;
-			if (project && desired?.controls.length) {
+			if (project && (desired?.controls.length || desired?.actionControls?.length)) {
 				const revision = Math.max(this.summaryRevisions.get(cwd) ?? 0, project.summary.revision) + 1;
 				this.summaryRevisions.set(cwd, revision);
-				const stripped: ManagerPresentation = { ...desired, controls: [] };
+				const stripped: ManagerPresentation = { ...desired, controls: [], actionControls: [] };
 				const update = await this.state.setProjectSummaryDesired(owner.sessionId, stripped.content, revision, stripped);
 				if (update.accepted) {
 					const strippedAuthorization = { owner, revision };
@@ -1106,13 +1125,15 @@ export class DiscordRelayCore {
 		}
 		const retained = new Set(newMessageIds);
 		const stale = new Set(discovered.filter((message) => !retained.has(message.id)).map((message) => message.id));
-		if (summary.delivery && !retained.has(summary.delivery.messageId)) stale.add(summary.delivery.messageId);
+		for (const messageId of summary.delivery?.messageIds ?? (summary.delivery ? [summary.delivery.messageId] : [])) {
+			if (!retained.has(messageId)) stale.add(messageId);
+		}
 		for (const messageId of stale) {
 			if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
 			await this.transport.deleteOwnText(channelId, messageId);
 		}
 		if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
-		await this.state.recordProjectSummaryBatchSent(cwd, newMessageIds.at(-1)!, authorization.revision);
+		await this.state.recordProjectSummaryBatchSent(cwd, newMessageIds, authorization.revision);
 	}
 
 	private scheduleProjectSummaryRetry(cwd: string): void {

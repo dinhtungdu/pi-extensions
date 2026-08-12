@@ -14,7 +14,7 @@ import {
 	type NativeInboundImage,
 	type QueuedInboundImage,
 } from "./inbound-images.js";
-import type { ManagerPresentation } from "./manager-presentation.js";
+import type { ManagerPresentation, ManagerPresentationActionControl } from "./manager-presentation.js";
 import type { ManagerWakeDescriptor } from "./manager-wake.js";
 import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 import type { ManagerTaskTerminal } from "./manager-task-terminal.js";
@@ -46,7 +46,8 @@ export interface BridgeCallbacks {
 	managerProjectCatalogue?(): ManagerProjectCatalogueEntry[];
 	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 	onManagerPresentationControl?(
-		request: { requestId: string; revision: string; controlId: string; command: string },
+		request: { requestId: string; revision: string; controlId: string; command: string;
+			actionControl?: ManagerPresentationActionControl },
 		signal: AbortSignal,
 	): Promise<PiSessionControlResult>;
 }

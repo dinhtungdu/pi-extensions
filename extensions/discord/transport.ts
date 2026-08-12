@@ -5,9 +5,12 @@ import {
 	ButtonStyle,
 	ChannelType,
 	Client,
+	ComponentType,
+	ContainerBuilder,
 	Events,
 	GatewayIntentBits,
 	MessageFlags,
+	TextDisplayBuilder,
 	ThreadAutoArchiveDuration,
 	type ChatInputApplicationCommandData,
 	type ChatInputCommandInteraction,
@@ -31,7 +34,11 @@ import {
 	type DiscordSessionControlRequest,
 	type PiSessionControlResult,
 } from "./controls.js";
-import type { ManagerPresentation, ManagerPresentationStyle } from "./manager-presentation.js";
+import type {
+	ManagerPresentation,
+	ManagerPresentationStyle,
+	ManagerPresentationActionControl,
+} from "./manager-presentation.js";
 import { managerSummaryPageMetadata, type ManagerSummaryPageMetadata } from "./manager-summary-pages.js";
 
 const READY_TIMEOUT_MS = 30_000;
@@ -42,8 +49,18 @@ const MANAGER_COMMAND_NAME = "m";
 const LEGACY_MANAGER_COMMAND_NAME = "manager";
 
 export interface DiscordPresentationControlRequest {
-	requestId: string; guildId?: string; channelId: string; messageId: string; customId: string;
+	requestId: string; guildId?: string; channelId: string; messageId: string; customId: string; confirmed?: true;
 }
+
+export interface DiscordPresentationControlConfirmation {
+	title: string;
+	body: string;
+	confirmLabel: string;
+}
+
+export type DiscordPresentationControlResult = PiSessionControlResult & {
+	confirmation?: DiscordPresentationControlConfirmation;
+};
 
 export interface DiscordInboundMessage {
 	id: string;
@@ -77,7 +94,7 @@ export interface DiscordTransport {
 	onModelAutocomplete(listener: (channelId: string, prefix: string) => DiscordModelChoice[]): () => void;
 	onManagerControl(listener: (request: DiscordManagerControlRequest) => Promise<PiSessionControlResult>): () => void;
 	onManagerAutocomplete(listener: (channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]): () => void;
-	onPresentationControl(listener: (request: DiscordPresentationControlRequest) => Promise<PiSessionControlResult>): () => void;
+	onPresentationControl(listener: (request: DiscordPresentationControlRequest) => Promise<DiscordPresentationControlResult>): () => void;
 	ensureProjectChannel(request: ProjectChannelRequest): Promise<string>;
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
@@ -179,6 +196,23 @@ function compareIds(left: string, right: string): number {
 	}
 }
 
+function componentText(value: unknown): string {
+	if (!value || typeof value !== "object") return "";
+	const component = value as { content?: unknown; components?: unknown };
+	const own = typeof component.content === "string" ? component.content : "";
+	if (!component.components) return own;
+	const children = Array.isArray(component.components)
+		? component.components
+		: typeof (component.components as { values?: unknown }).values === "function"
+			? [...(component.components as { values(): Iterable<unknown> }).values()]
+			: [];
+	return own + children.map(componentText).join("");
+}
+
+export function managerSummaryMessageContent(message: { content: string; components?: readonly unknown[] }): string {
+	return message.content || (message.components ?? []).map(componentText).join("");
+}
+
 export async function collectChronologicalMessages(
 	fetchPage: (options: { after?: string; before?: string; limit: 100 }) => Promise<DiscordInboundMessage[]>,
 	afterId?: string,
@@ -202,11 +236,18 @@ const PRESENTATION_BUTTON_STYLES: Record<ManagerPresentationStyle, ButtonStyle> 
 	primary: ButtonStyle.Primary, secondary: ButtonStyle.Secondary, success: ButtonStyle.Success, danger: ButtonStyle.Danger,
 };
 
-export function presentationComponents(presentation: ManagerPresentation): ActionRowBuilder<ButtonBuilder>[] {
-	const buttons = presentation.controls.map((control) => new ButtonBuilder()
+function presentationButton(
+	presentation: ManagerPresentation,
+	control: ManagerPresentation["controls"][number] | ManagerPresentationActionControl,
+): ButtonBuilder {
+	return new ButtonBuilder()
 		.setCustomId(`m:${presentation.revision}:${control.id}`)
 		.setLabel(control.label)
-		.setStyle(PRESENTATION_BUTTON_STYLES[control.style]));
+		.setStyle(PRESENTATION_BUTTON_STYLES[control.style]);
+}
+
+export function presentationComponents(presentation: ManagerPresentation): ActionRowBuilder<ButtonBuilder>[] {
+	const buttons = presentation.controls.map((control) => presentationButton(presentation, control));
 	const rows: ActionRowBuilder<ButtonBuilder>[] = [];
 	for (let index = 0; index < buttons.length; index += 5) {
 		rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons.slice(index, index + 5)));
@@ -214,12 +255,28 @@ export function presentationComponents(presentation: ManagerPresentation): Actio
 	return rows;
 }
 
+export function managerPresentationComponents(presentation: ManagerPresentation): ContainerBuilder[] | ActionRowBuilder<ButtonBuilder>[] {
+	if (presentation.actionControls === undefined) return presentationComponents(presentation);
+	const container = new ContainerBuilder();
+	let after = 0;
+	for (const action of presentation.actionControls) {
+		const content = presentation.content.slice(after, action.after);
+		if (content) container.addTextDisplayComponents(new TextDisplayBuilder().setContent(content));
+		container.addActionRowComponents(new ActionRowBuilder<ButtonBuilder>().addComponents(presentationButton(presentation, action)));
+		after = action.after;
+	}
+	const remaining = presentation.content.slice(after);
+	if (remaining) container.addTextDisplayComponents(new TextDisplayBuilder().setContent(remaining));
+	for (const row of presentationComponents(presentation)) container.addActionRowComponents(row);
+	return [container];
+}
+
 export function managerCommandDefinition(): ChatInputApplicationCommandData {
 	const descriptions = {
 		handoff: "Work directly in a retained task worker",
 		takeback: "Request a worker summary and resume manager supervision",
 		archive: "Archive a task without merging",
-		"merge-and-archive": "Fast-forward locally into the landing branch, then archive",
+		"merge-and-archive": "Merge, push the configured landing branch, then archive",
 		"reconcile-pr": "Check the task pull request and archive it if merged",
 	} as const;
 	return {
@@ -292,7 +349,7 @@ export class DiscordJsTransport implements DiscordTransport {
 	private readonly autocompleteListeners = new Set<(channelId: string, prefix: string) => DiscordModelChoice[]>();
 	private readonly managerControlListeners = new Set<(request: DiscordManagerControlRequest) => Promise<PiSessionControlResult>>();
 	private readonly managerAutocompleteListeners = new Set<(channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]>();
-	private readonly presentationControlListeners = new Set<(request: DiscordPresentationControlRequest) => Promise<PiSessionControlResult>>();
+	private readonly presentationControlListeners = new Set<(request: DiscordPresentationControlRequest) => Promise<DiscordPresentationControlResult>>();
 	private readonly terminalListeners = new Set<(error: Error) => void>();
 
 	async connect(config: DiscordBridgeConfig): Promise<void> {
@@ -414,7 +471,7 @@ export class DiscordJsTransport implements DiscordTransport {
 		return () => this.managerAutocompleteListeners.delete(listener);
 	}
 
-	onPresentationControl(listener: (request: DiscordPresentationControlRequest) => Promise<PiSessionControlResult>): () => void {
+	onPresentationControl(listener: (request: DiscordPresentationControlRequest) => Promise<DiscordPresentationControlResult>): () => void {
 		this.presentationControlListeners.add(listener);
 		return () => this.presentationControlListeners.delete(listener);
 	}
@@ -504,12 +561,13 @@ export class DiscordJsTransport implements DiscordTransport {
 	async sendPresentation(channelId: string, presentation: ManagerPresentation, nonce: string): Promise<string> {
 		const channel = await this.textChannel(channelId, "receive presentations");
 		const message = await channel.send({
-			content: presentation.content,
-			components: presentationComponents(presentation),
+			...(presentation.actionControls === undefined ? { content: presentation.content } : {}),
+			components: managerPresentationComponents(presentation),
 			nonce,
 			enforceNonce: true,
 			allowedMentions: { parse: [] },
-			flags: MessageFlags.SuppressEmbeds,
+			flags: presentation.actionControls === undefined ? MessageFlags.SuppressEmbeds
+				: MessageFlags.SuppressEmbeds | MessageFlags.IsComponentsV2,
 		});
 		return message.id;
 	}
@@ -540,7 +598,9 @@ export class DiscordJsTransport implements DiscordTransport {
 		for (let request = 0; request < 11; request++) {
 			const messages = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
 			const page = [...messages.values()].map((message) => ({
-				id: message.id, content: message.content, authorId: message.author.id,
+				id: message.id,
+				content: managerSummaryMessageContent(message),
+				authorId: message.author.id,
 			})).sort((left, right) => compareIds(right.id, left.id));
 			if (page.length === 0) {
 				return discovered.flatMap((message) => {
@@ -579,10 +639,11 @@ export class DiscordJsTransport implements DiscordTransport {
 		const message = await channel.messages.fetch(messageId);
 		if (message.author.id !== client.user.id) throw new Error(`Discord message ${messageId} is not owned by this bot`);
 		await message.edit({
-			content: presentation.content,
-			components: presentationComponents(presentation),
+			...(presentation.actionControls === undefined ? { content: presentation.content } : {}),
+			components: managerPresentationComponents(presentation),
 			allowedMentions: { parse: [] },
-			flags: MessageFlags.SuppressEmbeds,
+			flags: presentation.actionControls === undefined ? MessageFlags.SuppressEmbeds
+				: MessageFlags.SuppressEmbeds | MessageFlags.IsComponentsV2,
 		});
 	}
 
@@ -740,15 +801,10 @@ export class DiscordJsTransport implements DiscordTransport {
 		} catch {
 			return;
 		}
-		await interaction.editReply({
-			content: "Running manager control…",
-			allowedMentions: { parse: [] },
-			flags: MessageFlags.SuppressEmbeds,
-		}).catch(() => {});
-		let result: PiSessionControlResult;
+		let result: DiscordPresentationControlResult;
+		const listener = this.presentationControlListeners.values().next().value;
 		try {
 			if (!channelId) throw new Error("Discord interaction did not identify its channel.");
-			const listener = this.presentationControlListeners.values().next().value;
 			result = listener ? await listener({
 				requestId: interaction.id,
 				...(interaction.guildId ? { guildId: interaction.guildId } : {}),
@@ -756,12 +812,53 @@ export class DiscordJsTransport implements DiscordTransport {
 				messageId: interaction.message.id,
 				customId: interaction.customId,
 			}) : { ok: false, message: "Discord relay is not ready for manager presentation controls." };
+			if (result.confirmation) {
+				const confirmation = result.confirmation;
+				const confirmId = `mc:${interaction.id}:yes`;
+				const cancelId = `mc:${interaction.id}:no`;
+				const reply = await interaction.editReply({
+					content: `**${confirmation.title}**\n${confirmation.body}`,
+					components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+						new ButtonBuilder().setCustomId(confirmId).setLabel(confirmation.confirmLabel).setStyle(ButtonStyle.Danger),
+						new ButtonBuilder().setCustomId(cancelId).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+					)],
+					allowedMentions: { parse: [] },
+					flags: MessageFlags.SuppressEmbeds,
+				});
+				let decision: import("discord.js").ButtonInteraction;
+				try {
+					decision = await reply.awaitMessageComponent({
+						componentType: ComponentType.Button,
+						filter: (candidate) => candidate.user.id === interaction.user.id &&
+							(candidate.customId === confirmId || candidate.customId === cancelId),
+						time: 60_000,
+					});
+				} catch {
+					await interaction.editReply({ content: "❌ Merge confirmation expired.", components: [] }).catch(() => {});
+					return;
+				}
+				await decision.deferUpdate().catch(() => {});
+				if (decision.customId === cancelId) {
+					await interaction.editReply({ content: "Merge canceled.", components: [] }).catch(() => {});
+					return;
+				}
+				await interaction.editReply({ content: "Running manager control…", components: [] }).catch(() => {});
+				result = await listener!({
+					requestId: decision.id,
+					...(interaction.guildId ? { guildId: interaction.guildId } : {}),
+					channelId,
+					messageId: interaction.message.id,
+					customId: interaction.customId,
+					confirmed: true,
+				});
+			}
 		} catch (error) {
 			result = { ok: false, message: error instanceof Error ? error.message : String(error) };
 		}
 		const bounded = boundedControlResult(result);
 		await interaction.editReply({
 			content: `${bounded.ok ? "✅" : "❌"} ${bounded.message}`,
+			components: [],
 			allowedMentions: { parse: [] },
 			flags: MessageFlags.SuppressEmbeds,
 		}).catch(() => {});

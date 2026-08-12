@@ -243,8 +243,10 @@ export class ManagerControlExecutor {
 		if (!isProtectedManagerEnvironment(dependencies.environment ?? process.env)) return undefined;
 		const canonicalRoot = resolve(root);
 		const manager = join(canonicalRoot, "bin", "manager.mjs");
+		const supervisorClient = join(canonicalRoot, "bin", "manager-supervisor-client.mjs");
 		const runtime = join(canonicalRoot, "bin", "manager-runtime.mjs");
-		if (!await isFile(manager) || !await isFile(runtime) || !await isFile(join(canonicalRoot, "data", "PROJECTS.md"))) {
+		if (!await isFile(manager) || !await isFile(supervisorClient) || !await isFile(runtime) ||
+			!await isFile(join(canonicalRoot, "data", "PROJECTS.md"))) {
 			return undefined;
 		}
 		const executor = new ManagerControlExecutor(canonicalRoot, dependencies.run ?? defaultRun);
@@ -267,6 +269,7 @@ export class ManagerControlExecutor {
 		try {
 			await this.validateRuntime();
 			const manager = join(this.root, "bin", "manager.mjs");
+			const supervisorClient = join(this.root, "bin", "manager-supervisor-client.mjs");
 			const taskPath = task ? join(this.root, "data", "tasks", `${task.taskId}.md`) : undefined;
 			let args: string[];
 			if (request.action === "reconcile-pr") {
@@ -278,8 +281,8 @@ export class ManagerControlExecutor {
 						"--evidence", `User explicitly archived ${task.project} task ${task.taskId} without merging via Discord /m command.`,
 						"--completion-authorized", "yes"]
 					: request.action === "merge-and-archive"
-						? [manager, "task-merge-and-archive", "--root", this.root, "--task", taskPath, "--activity-clear", "yes",
-							"--evidence", `User explicitly merged ${task.project} task ${task.taskId} locally and archived it via Discord /m command.`]
+						? [supervisorClient, "task-merge-and-archive", "--root", this.root, "--task", taskPath, "--activity-clear", "yes",
+							"--evidence", `User explicitly confirmed merge, push, and archive for ${task.project} task ${task.taskId} via Discord.`]
 						: [manager, request.action === "handoff" ? "handoff-start" : "handoff-return",
 							"--root", this.root, "--task", taskPath];
 			}
@@ -315,7 +318,8 @@ export class ManagerControlExecutor {
 			const validState = request.action === "handoff" ? output.state === "direct" && typeof output.worker_session === "string"
 				: request.action === "takeback" ? output.state === "return-requested" && typeof output.worker_session === "string"
 					: output.archived === true && typeof output.checkout_mode === "string" &&
-						(output.slot_state === null || typeof output.slot_state === "string");
+						(output.slot_state === null || typeof output.slot_state === "string") &&
+						(request.action !== "merge-and-archive" || output.pushed === true);
 			if (output.ok !== true || output.command !== expectedCommand || output.task_id !== task.taskId ||
 				typeof output.replay !== "boolean" || !validState) {
 				return { ok: false, message: `${request.action} returned conflicting manager output.` };
@@ -323,7 +327,7 @@ export class ManagerControlExecutor {
 			const message = request.action === "handoff" ? `Direct handoff started for @${task.taskId}.`
 				: request.action === "takeback" ? `Return summary requested from @${task.taskId}.`
 					: request.action === "archive" ? `@${task.taskId} archived without merging.`
-						: `@${task.taskId} merged locally and archived.`;
+						: `@${task.taskId} merged, pushed, and archived.`;
 			return { ok: true, message };
 		} catch (error) {
 			return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });

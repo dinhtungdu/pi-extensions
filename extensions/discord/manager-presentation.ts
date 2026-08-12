@@ -15,8 +15,21 @@ export function isSupportedManagerPresentationControl(id: unknown, command: unkn
 export const MANAGER_PRESENTATION_STYLES = ["primary", "secondary", "success", "danger"] as const;
 export type ManagerPresentationStyle = typeof MANAGER_PRESENTATION_STYLES[number];
 export interface ManagerPresentationControl { id: string; label: string; style: ManagerPresentationStyle; command: string }
+export interface ManagerPresentationActionConfirmation { title: string; body: string; confirmLabel: string }
+export interface ManagerPresentationActionControl extends ManagerPresentationControl {
+	command: "task-merge-and-archive";
+	taskId: string;
+	after: number;
+	confirmation: ManagerPresentationActionConfirmation;
+}
 export interface ManagerPresentation {
-	schemaVersion: 1; revision: string; content: string; controls: ManagerPresentationControl[]; degraded: boolean; warnings: string[]
+	schemaVersion: 1;
+	revision: string;
+	content: string;
+	controls: ManagerPresentationControl[];
+	actionControls?: ManagerPresentationActionControl[];
+	degraded: boolean;
+	warnings: string[];
 }
 export interface ManagerPresentationCallbacks { onPresentation(presentation: ManagerPresentation): void; onUnavailable(error: Error): void }
 interface WatchHandle { close(): void }
@@ -26,29 +39,90 @@ export interface ManagerPresentationDependencies {
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	const actual = Object.keys(value);
+	return actual.length === keys.length && actual.every((key) => keys.includes(key));
+}
+function isControlShape(value: unknown): value is ManagerPresentationControl {
+	return isRecord(value) && typeof value.id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(value.id) &&
+		typeof value.label === "string" && value.label.length >= 1 && value.label.length <= 80 &&
+		typeof value.style === "string" && (MANAGER_PRESENTATION_STYLES as readonly string[]).includes(value.style);
+}
+function isConfirmationText(value: unknown, maximum: number): value is string {
+	return typeof value === "string" && value.length >= 1 && value.length <= maximum && !value.includes("\0");
+}
+export function isManagerPresentationActionControl(value: unknown, contentLength?: number): value is ManagerPresentationActionControl {
+	if (!isControlShape(value)) return false;
+	const action = value as unknown as Record<string, unknown>;
+	if (!hasExactKeys(action, ["id", "label", "style", "command", "taskId", "after", "confirmation"]) ||
+		!isRecord(action.confirmation) || !hasExactKeys(action.confirmation, ["title", "body", "confirmLabel"])) return false;
+	return action.command === "task-merge-and-archive" &&
+		typeof action.taskId === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(action.taskId) &&
+		Number.isSafeInteger(action.after) && Number(action.after) > 0 &&
+		(contentLength === undefined || Number(action.after) <= contentLength) &&
+		isConfirmationText(action.confirmation.title, 100) && isConfirmationText(action.confirmation.body, 1_500) &&
+		isConfirmationText(action.confirmation.confirmLabel, 80);
+}
 export function isManagerPresentation(value: unknown): value is ManagerPresentation {
 	if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.revision !== "string" || !/^[a-f0-9]{64}$/.test(value.revision) ||
 		typeof value.content !== "string" || value.content.length < 1 || value.content.length > MAX_MANAGER_PRESENTATION_CONTENT ||
-		!Array.isArray(value.controls) || value.controls.length > 25 || typeof value.degraded !== "boolean" ||
+		!Array.isArray(value.controls) || value.controls.length > 25 ||
+		(value.actionControls !== undefined && !Array.isArray(value.actionControls)) ||
+		(Array.isArray(value.actionControls) && value.actionControls.length > 9) || typeof value.degraded !== "boolean" ||
 		!Array.isArray(value.warnings) || value.warnings.length > 20 ||
 		!value.warnings.every((warning) => typeof warning === "string" && warning.length <= 500)) return false;
 	const ids = new Set<string>();
-	return value.controls.every((control) => {
-		if (!isRecord(control) || typeof control.id !== "string" || typeof control.command !== "string" ||
-			!isSupportedManagerPresentationControl(control.id, control.command) || typeof control.label !== "string" ||
-			control.label.length < 1 || control.label.length > 80 || typeof control.style !== "string" ||
-			!(MANAGER_PRESENTATION_STYLES as readonly string[]).includes(control.style) || ids.has(control.id)) return false;
+	for (const control of value.controls) {
+		if (!isControlShape(control) || !isSupportedManagerPresentationControl(control.id, control.command) || ids.has(control.id)) return false;
 		ids.add(control.id);
-		return true;
-	});
+	}
+	let previousAfter = 0;
+	const taskIds = new Set<string>();
+	for (const action of value.actionControls ?? []) {
+		if (!isManagerPresentationActionControl(action, value.content.length) || ids.has(action.id) || taskIds.has(action.taskId) ||
+			action.after <= previousAfter) return false;
+		ids.add(action.id);
+		taskIds.add(action.taskId);
+		previousAfter = action.after;
+	}
+	return true;
+}
+function parseActionControl(value: unknown): ManagerPresentationActionControl | undefined {
+	if (!isRecord(value) || !hasExactKeys(value, ["id", "label", "style", "command", "task_id", "after", "confirmation"]) ||
+		!isRecord(value.confirmation) || !hasExactKeys(value.confirmation, ["title", "body", "confirm_label"])) return undefined;
+	const action: ManagerPresentationActionControl = {
+		id: value.id as string,
+		label: value.label as string,
+		style: value.style as ManagerPresentationStyle,
+		command: value.command as "task-merge-and-archive",
+		taskId: value.task_id as string,
+		after: value.after as number,
+		confirmation: {
+			title: value.confirmation.title as string,
+			body: value.confirmation.body as string,
+			confirmLabel: value.confirmation.confirm_label as string,
+		},
+	};
+	return isManagerPresentationActionControl(action) ? action : undefined;
 }
 export function parseManagerPresentationEnvelope(value: unknown): ManagerPresentation {
 	if (!isRecord(value) || value.ok !== true || value.command !== "summary-render" || value.schema_version !== 1) {
 		throw new Error("the-manager summary-render returned an unsupported response");
 	}
-	const presentation = {
-		schemaVersion: 1 as const, revision: value.revision, content: value.content, controls: value.controls,
-		degraded: value.degraded, warnings: value.warnings,
+	const rawActions = value.action_controls ?? [];
+	if (!Array.isArray(rawActions)) throw new Error("the-manager summary-render returned an invalid presentation");
+	const actionControls = rawActions.map(parseActionControl);
+	if (actionControls.some((action) => action === undefined)) {
+		throw new Error("the-manager summary-render returned an invalid presentation");
+	}
+	const presentation: ManagerPresentation = {
+		schemaVersion: 1,
+		revision: value.revision as string,
+		content: value.content as string,
+		controls: value.controls as ManagerPresentationControl[],
+		...(value.action_controls !== undefined ? { actionControls: actionControls as ManagerPresentationActionControl[] } : {}),
+		degraded: value.degraded as boolean,
+		warnings: value.warnings as string[],
 	};
 	if (!isManagerPresentation(presentation)) throw new Error("the-manager summary-render returned an invalid presentation");
 	return structuredClone(presentation);
