@@ -17,6 +17,7 @@ import {
 } from "./controls.js";
 import { isManagerWakeDescriptor } from "./manager-wake.js";
 import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
+import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
 import {
 	isManagerPresentation,
 	isSupportedManagerPresentationControl,
@@ -45,6 +46,7 @@ export type ClientFrame =
 	| { type: "project_summary"; requestId: string; text: string }
 	| { type: "manager_presentation"; requestId: string; presentation: ManagerPresentation }
 	| { type: "manager_task_snapshot"; requestId: string; snapshot: ManagerTaskSnapshot }
+	| { type: "manager_task_terminal"; requestId: string; terminal: ManagerTaskTerminal }
 	| { type: "ack_inbound"; requestId: string; messageId: string }
 	| { type: "release_inbound_images"; requestId: string; messageId: string }
 	| { type: "lifecycle"; messageId: string; status: DiscordLifecycleStatus }
@@ -79,6 +81,7 @@ export type ServerFrame =
 	| { type: "project_summary_queued"; requestId: string }
 	| { type: "manager_presentation_queued"; requestId: string }
 	| { type: "manager_task_snapshot_queued"; requestId: string }
+	| { type: "manager_task_terminal_queued"; requestId: string }
 	| { type: "manager_catalogue_updated"; requestId: string }
 	| { type: "pong" }
 	| { type: "replacing"; configEpoch: number }
@@ -151,6 +154,9 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 	if (frame.type === "manager_task_snapshot") {
 		return typeof frame.requestId === "string" && isManagerTaskSnapshot(frame.snapshot);
 	}
+	if (frame.type === "manager_task_terminal") {
+		return typeof frame.requestId === "string" && isManagerTaskTerminal(frame.terminal);
+	}
 	if (frame.type === "lifecycle") {
 		return typeof frame.messageId === "string" &&
 			(frame.status === "accepted" || frame.status === "thinking" || frame.status === "tool" ||
@@ -195,7 +201,8 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 	}
 	if (frame.type === "outbound_queued") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	if (frame.type === "project_summary_queued" || frame.type === "manager_presentation_queued" ||
-		frame.type === "manager_task_snapshot_queued" || frame.type === "manager_catalogue_updated") {
+		frame.type === "manager_task_snapshot_queued" || frame.type === "manager_task_terminal_queued" ||
+		frame.type === "manager_catalogue_updated") {
 		return typeof frame.requestId === "string";
 	}
 	if (frame.type === "error") {

@@ -25,6 +25,7 @@ import { ManagerPresentationProducer, type ManagerPresentation } from "./manager
 import { ManagerControlExecutor } from "./manager-controls.js";
 import { managerWakeRegistration } from "./manager-wake.js";
 import { acceptedManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
+import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
 	MAX_SESSION_CONTROL_TEXT_LENGTH,
@@ -161,6 +162,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		let desiredTaskSnapshot: ManagerTaskSnapshot | undefined;
 		let publishingTaskSnapshot: Promise<void> | undefined;
 		let taskSnapshotPublishRequested = false;
+		const pendingTaskTerminals = new Map<string, ManagerTaskTerminal>();
+		let publishingTaskTerminals: Promise<void> | undefined;
 		let currentCtx: ExtensionContext | undefined;
 		let operation: Promise<void> = Promise.resolve();
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -170,6 +173,12 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			if (!snapshot || desiredTaskSnapshot?.revision === snapshot.revision) return;
 			desiredTaskSnapshot = snapshot;
 			if (currentCtx) publishTaskSnapshot(currentCtx);
+		});
+		const unsubscribeTaskTerminals = pi.events.on("manager:task-terminal", (value) => {
+			if (!isManagerTaskTerminal(value) ||
+				(currentCtx && !shouldPublishManagerTaskSummary(currentCtx.cwd)) || pendingTaskTerminals.has(value.revision)) return;
+			pendingTaskTerminals.set(value.revision, structuredClone(value));
+			if (currentCtx) publishTaskTerminals(currentCtx);
 		});
 
 		function modelCatalogue(ctx: ExtensionContext): PiModelCatalogueEntry[] {
@@ -300,6 +309,27 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			});
 		}
 
+		function publishTaskTerminals(ctx: ExtensionContext): void {
+			if (!bridge?.status().connected || publishingTaskTerminals || !shouldPublishManagerTaskSummary(ctx.cwd)) return;
+			publishingTaskTerminals = (async () => {
+				while (bridge?.status().connected && pendingTaskTerminals.size > 0) {
+					const [revision, terminal] = pendingTaskTerminals.entries().next().value!;
+					try {
+						const accepted = await bridge.publishManagerTaskTerminal(terminal);
+						if (!accepted) {
+							ctx.ui.notify(`Discord manager task-terminal rejected by relay for task ${terminal.taskId}`, "warning");
+						}
+					} catch (error) {
+						ctx.ui.notify(`Discord manager task-terminal delivery deferred: ${errorMessage(error)}`, "warning");
+						return;
+					}
+					if (pendingTaskTerminals.get(revision)?.revision === terminal.revision) pendingTaskTerminals.delete(revision);
+				}
+			})().finally(() => {
+				publishingTaskTerminals = undefined;
+			});
+		}
+
 		function setConnectedStatus(ctx: ExtensionContext): void {
 			const status = bridge?.status();
 			ctx.ui.setStatus(
@@ -348,6 +378,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				ctx.ui.notify(`Discord manager controls disabled: ${errorMessage(error)}`, "warning");
 			}
 			const publishManagerTaskSummary = shouldPublishManagerTaskSummary(checkoutRoot);
+			if (!publishManagerTaskSummary) pendingTaskTerminals.clear();
 			const managerProducer = await ManagerTaskSummaryProducer.create(checkoutRoot, {
 				onCatalogues(tasks, projects) {
 					managerTaskCatalogue = tasks;
@@ -393,6 +424,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 							taskSummaryProducer?.requestRefresh(0);
 							presentationProducer?.requestRefresh(0);
 							publishTaskSnapshot(ctx);
+							publishTaskTerminals(ctx);
 						}
 					},
 					supportsImageInput: () => ctx.model?.input?.includes("image") === true,
@@ -469,6 +501,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				await candidate.start();
 				setConnectedStatus(ctx);
 				publishTaskSnapshot(ctx);
+				publishTaskTerminals(ctx);
 				taskSummaryProducer = managerProducer;
 				presentationProducer = managerPresentationProducer;
 				taskSummaryProducer?.start();
@@ -544,6 +577,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 		pi.on("session_shutdown", async (_event, ctx) => {
 			unsubscribeTaskSnapshots();
+			unsubscribeTaskTerminals();
 			for (const timer of inboundAcceptanceTimers) clearTimeout(timer);
 			inboundAcceptanceTimers.clear();
 			await serialize(() => stopBridge(ctx));

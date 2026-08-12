@@ -44,6 +44,7 @@ import {
 } from "./controls.js";
 import { wakeManagerSession, type ManagerWakeDescriptor } from "./manager-wake.js";
 import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
+import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
 import {
 	isSupportedManagerPresentationControl,
 	SUPPORTED_MANAGER_PRESENTATION_CONTROLS,
@@ -74,6 +75,7 @@ interface ActiveSession {
 	cwd: string;
 	threadId: string;
 	managerTaskSummaryProducer: boolean;
+	managerTaskTerminalProducer: boolean;
 	managerTaskSnapshotTaskId?: string;
 	managerPresentationControlIds: string[]; managerPresentation?: ManagerPresentation;
 	summaryProducerOrder: number;
@@ -104,6 +106,8 @@ const SUMMARY_RETRY_MIN_MS = 250;
 const SUMMARY_RETRY_MAX_MS = 30_000;
 const TASK_SNAPSHOT_RETRY_MIN_MS = 250;
 const TASK_SNAPSHOT_RETRY_MAX_MS = 30_000;
+const TASK_TERMINAL_RETRY_MIN_MS = 250;
+const TASK_TERMINAL_RETRY_MAX_MS = 30_000;
 const INBOUND_RETRY_MIN_MS = 1_000;
 const INBOUND_RETRY_MAX_MS = 30_000;
 export const DISCORD_STATE_COMPACTION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
@@ -187,6 +191,11 @@ export class DiscordRelayCore {
 	private readonly taskSnapshotRevisions = new Map<string, string>();
 	private readonly taskSnapshotRetryAttempts = new Map<string, number>();
 	private readonly taskSnapshotRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly taskTerminalReconciliations = new Map<string, Promise<void>>();
+	private readonly taskTerminalReconcileRequested = new Set<string>();
+	private readonly taskTerminalRevisions = new Map<string, string>();
+	private readonly taskTerminalRetryAttempts = new Map<string, number>();
+	private readonly taskTerminalRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly recentlyDisconnectedSessions = new Set<string>();
 	private readonly wakeEpisodes = new Map<string, string>();
 	private nextSummaryProducerOrder = 0;
@@ -228,7 +237,14 @@ export class DiscordRelayCore {
 		for (const { cwd, summary } of await this.state.projectSummaries()) {
 			this.summaryRevisions.set(cwd, summary.revision);
 		}
+		for (const { sessionId, terminal } of await this.state.managerTaskTerminals()) {
+			if (!terminal.archived) this.taskTerminalRevisions.set(sessionId, terminal.desired.revision);
+		}
 		this.started = true;
+		if (this.taskTerminalRevisions.size > 0) {
+			void this.drainOutbound().catch(this.onTerminalError);
+			for (const sessionId of this.taskTerminalRevisions.keys()) this.scheduleManagerTaskTerminalReconciliation(sessionId);
+		}
 		this.cancelStateCompaction = this.dependencies.scheduleStateCompaction(() => this.compactInactiveState().catch((error) => {
 			this.onTerminalError(error instanceof Error ? error : new Error(String(error)));
 		}));
@@ -334,6 +350,13 @@ export class DiscordRelayCore {
 		this.taskSnapshotRevisions.clear();
 		await Promise.allSettled(this.taskSnapshotReconciliations.values());
 		this.taskSnapshotReconciliations.clear();
+		for (const timer of this.taskTerminalRetryTimers.values()) clearTimeout(timer);
+		this.taskTerminalRetryTimers.clear();
+		this.taskTerminalRetryAttempts.clear();
+		this.taskTerminalReconcileRequested.clear();
+		this.taskTerminalRevisions.clear();
+		await Promise.allSettled(this.taskTerminalReconciliations.values());
+		this.taskTerminalReconciliations.clear();
 		await this.transport.disconnect();
 		if (compactionError) throw compactionError;
 	}
@@ -407,6 +430,7 @@ export class DiscordRelayCore {
 			execute(request: { requestId: string; revision: string; controlId: string; command: string }): Promise<PiSessionControlResult>;
 		},
 		managerTaskSnapshotTaskId?: string,
+		managerTaskTerminalProducer = false,
 	): Promise<void> {
 		const reserved = this.reservedSessions.get(sessionId);
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
@@ -426,6 +450,7 @@ export class DiscordRelayCore {
 			cwd: mapping!.cwd,
 			threadId: mapping!.threadId,
 			managerTaskSummaryProducer,
+			managerTaskTerminalProducer,
 			...(managerTaskSnapshotTaskId ? { managerTaskSnapshotTaskId } : {}),
 			managerPresentationControlIds: managerPresentation?.controlIds.slice() ?? [],
 			summaryProducerOrder: this.nextSummaryProducerOrder++,
@@ -737,7 +762,7 @@ export class DiscordRelayCore {
 
 	async resumeDelivery(sessionId: string): Promise<void> {
 		const active = this.activeSessions.get(sessionId);
-		if (!active) return;
+		if (!active || (await this.state.getSession(sessionId))?.managerTaskTerminal) return;
 		for (const message of await this.state.pendingMessages(sessionId)) {
 			if (!this.deliverMessage(active, message)) break;
 		}
@@ -825,6 +850,33 @@ export class DiscordRelayCore {
 		this.taskSnapshotRevisions.set(sessionId, snapshot.revision);
 		this.clearManagerTaskSnapshotRetry(sessionId);
 		this.scheduleManagerTaskSnapshotReconciliation(sessionId);
+	}
+
+	async queueManagerTaskTerminal(
+		clientId: string,
+		generation: string,
+		sessionId: string,
+		terminal: ManagerTaskTerminal,
+	): Promise<void> {
+		this.assertClientSession(clientId, generation, sessionId);
+		if (!isManagerTaskTerminal(terminal)) throw new Error("Discord manager task terminal is invalid");
+		const producer = this.activeSessions.get(sessionId)!;
+		if (!producer.managerTaskTerminalProducer) {
+			throw new Error("Local client is not registered as a manager task-terminal producer");
+		}
+		const update = await this.state.setManagerTaskTerminalDesired(terminal);
+		this.taskTerminalRevisions.set(update.sessionId, update.revision);
+		const target = this.activeSessions.get(update.sessionId);
+		if (target && this.activeThreadSessions.get(target.threadId) === update.sessionId) {
+			this.activeThreadSessions.delete(target.threadId);
+		}
+		this.wakeEpisodes.delete(update.sessionId);
+		this.cancelInboundRetry(update.sessionId);
+		this.taskSnapshotRevisions.delete(update.sessionId);
+		this.clearManagerTaskSnapshotRetry(update.sessionId);
+		this.clearManagerTaskTerminalRetry(update.sessionId);
+		void this.drainOutbound().catch(this.onTerminalError);
+		this.scheduleManagerTaskTerminalReconciliation(update.sessionId);
 	}
 
 	private async queueSummary(active: ActiveSession, text: string, presentation?: ManagerPresentation): Promise<void> {
@@ -1110,6 +1162,88 @@ export class DiscordRelayCore {
 		this.taskSnapshotRetryAttempts.delete(sessionId);
 	}
 
+	private scheduleManagerTaskTerminalReconciliation(sessionId: string): void {
+		const revision = this.taskTerminalRevisions.get(sessionId);
+		if (!revision || this.taskTerminalRetryTimers.has(sessionId)) return;
+		if (this.taskTerminalReconciliations.has(sessionId)) {
+			this.taskTerminalReconcileRequested.add(sessionId);
+			return;
+		}
+		let tracked: Promise<void>;
+		tracked = this.reconcileManagerTaskTerminal(sessionId, revision)
+			.catch(() => this.scheduleManagerTaskTerminalRetry(sessionId, revision))
+			.finally(() => {
+				if (this.taskTerminalReconciliations.get(sessionId) !== tracked) return;
+				this.taskTerminalReconciliations.delete(sessionId);
+				if (this.taskTerminalReconcileRequested.delete(sessionId)) {
+					this.scheduleManagerTaskTerminalReconciliation(sessionId);
+				}
+			});
+		this.taskTerminalReconciliations.set(sessionId, tracked);
+	}
+
+	private async reconcileManagerTaskTerminal(sessionId: string, revision: string): Promise<void> {
+		await this.taskSnapshotReconciliations.get(sessionId)?.catch(() => {});
+		for (let step = 0; step < 8 && this.started && this.taskTerminalRevisions.get(sessionId) === revision; step++) {
+			const mapping = await this.state.getSession(sessionId);
+			const terminal = mapping?.managerTaskTerminal;
+			if (!mapping || !terminal || terminal.desired.revision !== revision) return;
+			if (mapping.outboundMessages.length > 0) {
+				await this.drainOutbound();
+				this.scheduleManagerTaskTerminalRetry(sessionId, revision);
+				return;
+			}
+			if (terminal.pendingSend) {
+				const pending = await this.state.prepareManagerTaskTerminalSend(sessionId, revision);
+				if (!pending || this.taskTerminalRevisions.get(sessionId) !== revision) return;
+				const messageId = await this.transport.sendText(mapping.threadId, pending.terminal.content, pending.nonce);
+				await this.state.recordManagerTaskTerminalSent(sessionId, pending.nonce, messageId, revision);
+				continue;
+			}
+			if (!terminal.delivery) {
+				await this.state.prepareManagerTaskTerminalSend(sessionId, revision);
+				continue;
+			}
+			if (!terminal.locked) {
+				await this.transport.lockThread(mapping.threadId);
+				await this.state.recordManagerTaskTerminalLocked(sessionId, revision);
+				continue;
+			}
+			if (!terminal.archived) {
+				await this.transport.archiveThread(mapping.threadId);
+				await this.state.recordManagerTaskTerminalArchived(sessionId, revision);
+				continue;
+			}
+			this.clearManagerTaskTerminalRetry(sessionId);
+			this.taskTerminalRevisions.delete(sessionId);
+			return;
+		}
+		if (this.started && this.taskTerminalRevisions.get(sessionId) === revision) {
+			this.scheduleManagerTaskTerminalRetry(sessionId, revision);
+		}
+	}
+
+	private scheduleManagerTaskTerminalRetry(sessionId: string, revision: string): void {
+		if (!this.started || this.taskTerminalRevisions.get(sessionId) !== revision ||
+			this.taskTerminalRetryTimers.has(sessionId)) return;
+		const attempt = (this.taskTerminalRetryAttempts.get(sessionId) ?? 0) + 1;
+		this.taskTerminalRetryAttempts.set(sessionId, attempt);
+		const delay = Math.min(TASK_TERMINAL_RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 7), TASK_TERMINAL_RETRY_MAX_MS);
+		const timer = setTimeout(() => {
+			this.taskTerminalRetryTimers.delete(sessionId);
+			this.scheduleManagerTaskTerminalReconciliation(sessionId);
+		}, delay);
+		timer.unref();
+		this.taskTerminalRetryTimers.set(sessionId, timer);
+	}
+
+	private clearManagerTaskTerminalRetry(sessionId: string): void {
+		const timer = this.taskTerminalRetryTimers.get(sessionId);
+		if (timer) clearTimeout(timer);
+		this.taskTerminalRetryTimers.delete(sessionId);
+		this.taskTerminalRetryAttempts.delete(sessionId);
+	}
+
 	private async drainLifecycleUpdates(): Promise<void> {
 		if (this.drainingLifecycleUpdates || !this.started) return;
 		this.drainingLifecycleUpdates = true;
@@ -1175,7 +1309,8 @@ export class DiscordRelayCore {
 		try {
 			const blockedSessions = new Set(this.outboundRetryTimers.keys());
 			for (;;) {
-				const next = await this.state.nextOutbound(new Set(this.activeSessions.keys()), blockedSessions);
+				const eligibleSessions = new Set([...this.activeSessions.keys(), ...this.taskTerminalRevisions.keys()]);
+				const next = await this.state.nextOutbound(eligibleSessions, blockedSessions);
 				if (!next) return;
 				let deliveryFailed = false;
 				for (const chunk of next.message.chunks) {
@@ -1194,6 +1329,9 @@ export class DiscordRelayCore {
 				if (!deliveryFailed) {
 					await this.state.completeOutbound(next.sessionId, next.message.id);
 					this.clearOutboundRetry(next.sessionId);
+					if (this.taskTerminalRevisions.has(next.sessionId)) {
+						this.scheduleManagerTaskTerminalReconciliation(next.sessionId);
+					}
 				}
 			}
 		} finally {
@@ -1206,13 +1344,16 @@ export class DiscordRelayCore {
 	}
 
 	private scheduleOutboundRetry(sessionId: string): void {
-		if (this.outboundRetryTimers.has(sessionId) || !this.activeSessions.has(sessionId)) return;
+		if (this.outboundRetryTimers.has(sessionId) ||
+			!this.activeSessions.has(sessionId) && !this.taskTerminalRevisions.has(sessionId)) return;
 		const attempt = (this.outboundRetryAttempts.get(sessionId) ?? 0) + 1;
 		this.outboundRetryAttempts.set(sessionId, attempt);
 		const delay = Math.min(OUTBOUND_RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 6), OUTBOUND_RETRY_MAX_MS);
 		const timer = setTimeout(() => {
 			this.outboundRetryTimers.delete(sessionId);
-			if (this.started && this.activeSessions.has(sessionId)) void this.drainOutbound().catch(this.onTerminalError);
+			if (this.started && (this.activeSessions.has(sessionId) || this.taskTerminalRevisions.has(sessionId))) {
+				void this.drainOutbound().catch(this.onTerminalError);
+			}
 		}, delay);
 		timer.unref();
 		this.outboundRetryTimers.set(sessionId, timer);

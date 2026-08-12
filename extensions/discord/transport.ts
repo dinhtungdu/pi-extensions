@@ -80,6 +80,8 @@ export interface DiscordTransport {
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
 	sendText(channelId: string, text: string, nonce: string): Promise<string>;
 	sendPresentation(channelId: string, presentation: ManagerPresentation, nonce: string): Promise<string>;
+	lockThread(channelId: string): Promise<void>;
+	archiveThread(channelId: string): Promise<void>;
 	latestMessageId(channelId: string): Promise<string | undefined>;
 	editOwnText(channelId: string, messageId: string, text: string): Promise<void>;
 	editOwnPresentation(channelId: string, messageId: string, presentation: ManagerPresentation): Promise<void>;
@@ -149,6 +151,20 @@ export async function subscribeThreadOwner(thread: {
 	members: { add(userId: string): Promise<unknown> };
 }): Promise<void> {
 	await thread.members.add(thread.guild.ownerId);
+}
+
+export async function lockSessionThread(thread: {
+	locked: boolean | null;
+	setLocked(locked: boolean, reason?: string): Promise<unknown>;
+}): Promise<void> {
+	if (!thread.locked) await thread.setLocked(true, "Manager task finished");
+}
+
+export async function archiveSessionThread(thread: {
+	archived: boolean | null;
+	setArchived(archived: boolean, reason?: string): Promise<unknown>;
+}): Promise<void> {
+	if (!thread.archived) await thread.setArchived(true, "Manager task finished");
 }
 
 function compareIds(left: string, right: string): number {
@@ -492,6 +508,18 @@ export class DiscordJsTransport implements DiscordTransport {
 			flags: MessageFlags.SuppressEmbeds,
 		});
 		return message.id;
+	}
+
+	async lockThread(channelId: string): Promise<void> {
+		const channel = await this.readyClient().channels.fetch(channelId).catch(() => null);
+		if (!channel?.isThread()) throw new Error(`Discord thread ${channelId} is missing or cannot be locked`);
+		await lockSessionThread(channel);
+	}
+
+	async archiveThread(channelId: string): Promise<void> {
+		const channel = await this.readyClient().channels.fetch(channelId).catch(() => null);
+		if (!channel?.isThread()) throw new Error(`Discord thread ${channelId} is missing or cannot be archived`);
+		await archiveSessionThread(channel);
 	}
 
 	async latestMessageId(channelId: string): Promise<string | undefined> {

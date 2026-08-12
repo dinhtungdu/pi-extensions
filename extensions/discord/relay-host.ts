@@ -31,6 +31,7 @@ interface SocketState {
 	registered: boolean;
 	managerControls: boolean;
 	managerPresentation: boolean;
+	managerTaskTerminalProducer: boolean;
 	buffer: string;
 	queue: Promise<void>;
 	queuedInputFrames: number;
@@ -177,6 +178,7 @@ export class LocalRelayHost {
 			registered: false,
 			managerControls: false,
 			managerPresentation: false,
+			managerTaskTerminalProducer: false,
 			buffer: "",
 			queue: Promise.resolve(),
 			queuedInputFrames: 0,
@@ -288,6 +290,7 @@ export class LocalRelayHost {
 			state.sessionId = parsed.sessionId;
 			state.managerControls = parsed.managerControls !== undefined;
 			const managerTaskSummaryProducer = isEligibleManagerTaskSummaryProducer(prepared.cwd, parsed);
+			state.managerTaskTerminalProducer = managerTaskSummaryProducer;
 			const managerPresentation = negotiatedManagerPresentation(prepared.cwd, parsed);
 			state.managerPresentation = managerPresentation !== undefined;
 			if (!this.write(state, {
@@ -329,6 +332,7 @@ export class LocalRelayHost {
 					execute: (request) => this.requestPresentationControl(state, request),
 				} : undefined,
 				parsed.managerTaskSnapshotTaskId,
+				state.managerTaskTerminalProducer,
 			);
 			if (state.closed) {
 				this.options.core.unregisterClient(parsed.clientId, parsed.generation);
@@ -369,6 +373,20 @@ export class LocalRelayHost {
 				return;
 			}
 			this.write(state, { type: "manager_task_snapshot_queued", requestId: parsed.requestId });
+			return;
+		}
+		if (parsed.type === "manager_task_terminal") {
+			if (!state.managerTaskTerminalProducer) {
+				this.fail(socket, state, "Local client is not registered as a manager task-terminal producer", false, parsed.requestId);
+				return;
+			}
+			try {
+				await this.options.core.queueManagerTaskTerminal(clientId, generation, sessionId, parsed.terminal);
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
+				return;
+			}
+			this.write(state, { type: "manager_task_terminal_queued", requestId: parsed.requestId });
 			return;
 		}
 		if (parsed.type === "manager_catalogue") {

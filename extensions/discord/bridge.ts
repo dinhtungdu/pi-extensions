@@ -17,6 +17,7 @@ import {
 import type { ManagerPresentation } from "./manager-presentation.js";
 import type { ManagerWakeDescriptor } from "./manager-wake.js";
 import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
+import type { ManagerTaskTerminal } from "./manager-task-terminal.js";
 
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
@@ -172,6 +173,10 @@ export class DiscordBridge {
 
 	async publishManagerTaskSnapshot(snapshot: ManagerTaskSnapshot): Promise<void> {
 		await this.relay.publishManagerTaskSnapshot(snapshot);
+	}
+
+	publishManagerTaskTerminal(terminal: ManagerTaskTerminal): Promise<boolean> {
+		return this.relay.publishManagerTaskTerminal(terminal);
 	}
 
 	async updateManagerCatalogues(

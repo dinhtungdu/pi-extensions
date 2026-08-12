@@ -72,6 +72,11 @@ class FakeGateway {
 	static summaryEvents = [];
 	static failDeleteOnce = new Set();
 	static failEditOnce = new Set();
+	static failLockOnce = new Set();
+	static failArchiveOnce = new Set();
+	static lockedThreads = new Set();
+	static archivedThreads = new Set();
+	static threadEvents = [];
 	static nextThreadId = 0;
 
 	connected = false;
@@ -223,6 +228,23 @@ class FakeGateway {
 		if (!messages[index].botOwned) throw new Error("summary message is not bot-owned");
 		messages.splice(index, 1);
 		FakeGateway.summaryEvents.push({ type: "delete", channelId, messageId });
+	}
+
+	async lockThread(channelId) {
+		if (FakeGateway.failLockOnce.delete(channelId)) throw new Error("injected Discord lock failure");
+		if (FakeGateway.lockedThreads.has(channelId)) return;
+		FakeGateway.lockedThreads.add(channelId);
+		FakeGateway.threadEvents.push({ type: "lock", channelId });
+		FakeGateway.summaryEvents.push({ type: "lock", channelId });
+	}
+
+	async archiveThread(channelId) {
+		if (FakeGateway.failArchiveOnce.delete(channelId)) throw new Error("injected Discord archive failure");
+		if (!FakeGateway.lockedThreads.has(channelId)) throw new Error("thread archived before lock");
+		if (FakeGateway.archivedThreads.has(channelId)) return;
+		FakeGateway.archivedThreads.add(channelId);
+		FakeGateway.threadEvents.push({ type: "archive", channelId });
+		FakeGateway.summaryEvents.push({ type: "archive", channelId });
 	}
 
 	async sendPresentation(channelId, presentation, nonce) {
@@ -470,6 +492,10 @@ try {
 		MAX_MANAGER_TASK_SNAPSHOT_CONTENT,
 	} = await importBuilt("extensions/discord/manager-task-snapshot.js");
 	const {
+		isManagerTaskTerminal,
+		MAX_MANAGER_TASK_TERMINAL_CONTENT,
+	} = await importBuilt("extensions/discord/manager-task-terminal.js");
+	const {
 		MAX_MANAGER_PROJECT_CATALOGUE_ITEMS,
 		MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES,
 		MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES,
@@ -497,6 +523,8 @@ try {
 		DiscordJsTransport,
 		MANAGER_CONTROL_INTERACTION_TIMEOUT_MS,
 		managerCommandDefinition,
+		archiveSessionThread,
+		lockSessionThread,
 		presentationComponents,
 		replaceOwnLifecycleReaction,
 		reuseSessionThread,
@@ -554,6 +582,24 @@ try {
 		{ ...taskSnapshot, content: "x".repeat(MAX_MANAGER_TASK_SNAPSHOT_CONTENT + 1) },
 		{ ...taskSnapshot, extra: true },
 	]) assert.equal(isManagerTaskSnapshot(malformed), false, "malformed task snapshots must fail closed");
+
+	const taskTerminal = {
+		schemaVersion: 1,
+		revision: "a".repeat(64),
+		taskId: "wake-task",
+		content: "exact terminal content @everyone\nsecond line",
+		closeThread: true,
+	};
+	assert.equal(isManagerTaskTerminal(taskTerminal), true);
+	for (const malformed of [
+		{ ...taskTerminal, schemaVersion: 2 },
+		{ ...taskTerminal, revision: "A".repeat(64) },
+		{ ...taskTerminal, taskId: "../hostile" },
+		{ ...taskTerminal, content: "" },
+		{ ...taskTerminal, content: "x".repeat(MAX_MANAGER_TASK_TERMINAL_CONTENT + 1) },
+		{ ...taskTerminal, closeThread: false },
+		{ ...taskTerminal, extra: true },
+	]) assert.equal(isManagerTaskTerminal(malformed), false, "malformed task terminals must fail closed");
 
 	const wakeRoot = join(dataDir, "manager-wake-root");
 	const wakeSocket = join(wakeRoot, ".manager", "supervisor.sock");
@@ -888,6 +934,159 @@ try {
 	await assert.rejects(() => new DiscordStateStore(malformedSnapshotStateFile).load(), /invalid manager task snapshot/,
 		"malformed persisted task snapshots must fail visibly");
 
+	const terminalStateFile = join(dataDir, "manager-task-terminal-state.json");
+	const terminalState = new DiscordStateStore(terminalStateFile);
+	const terminalGateway = new FakeGateway();
+	terminalGateway.ensureProjectChannel = async () => "terminal-channel";
+	terminalGateway.ensureSessionThread = async () => "terminal-thread";
+	const terminalCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, terminalState, terminalGateway,
+	);
+	await terminalCore.start();
+	await terminalCore.prepareRegistration("terminal-target-client", "terminal-target-generation", {
+		cwd: "/terminal-target", projectIdentityResolved: true, sessionId: "terminal-target-session",
+		managerTaskSnapshotTaskId: taskTerminal.taskId, managerWake: wakeDescriptor,
+	});
+	let terminalInboundDeliveries = 0;
+	await terminalCore.activateRegistration(
+		"terminal-target-client", "terminal-target-generation", "terminal-target-session",
+		() => { terminalInboundDeliveries++; return true; },
+		undefined, false, undefined, false, undefined, taskTerminal.taskId,
+	);
+	await terminalCore.prepareRegistration("terminal-producer-client", "terminal-producer-generation", {
+		cwd: "/terminal-producer", projectIdentityResolved: true, sessionId: "terminal-producer-session",
+	});
+	await terminalCore.activateRegistration(
+		"terminal-producer-client", "terminal-producer-generation", "terminal-producer-session", () => true,
+		undefined, false, undefined, false, undefined, undefined, true,
+	);
+	FakeGateway.failOnceTexts.add("prior durable assistant output");
+	await terminalCore.queueOutbound(
+		"terminal-target-client", "terminal-target-generation", "terminal-target-session",
+		"prior-terminal-output", "assistant", "prior durable assistant output",
+	);
+	await waitFor(() => FakeGateway.sendAttempts.get("prior durable assistant output") === 1, "pre-terminal outbound failure");
+	FakeGateway.failOnceTexts.add(taskTerminal.content);
+	FakeGateway.failLockOnce.add("terminal-thread");
+	FakeGateway.failArchiveOnce.add("terminal-thread");
+	await terminalCore.queueManagerTaskTerminal(
+		"terminal-producer-client", "terminal-producer-generation", "terminal-producer-session", taskTerminal,
+	);
+	let persistedTerminal = (await terminalState.getSession("terminal-target-session")).managerTaskTerminal;
+	assert.equal(persistedTerminal.desired.content, taskTerminal.content,
+		"terminal desired state must be durable before Discord side effects settle");
+	await waitFor(async () => (await terminalState.getSession("terminal-target-session"))?.managerTaskTerminal?.archived,
+		"terminal send, lock, and archive retries");
+	persistedTerminal = (await terminalState.getSession("terminal-target-session")).managerTaskTerminal;
+	assert.equal(persistedTerminal.delivery.terminal.content, taskTerminal.content);
+	assert.equal(persistedTerminal.locked, true);
+	assert.equal(persistedTerminal.archived, true);
+	assert.deepEqual(
+		FakeGateway.summaryEvents.filter((event) => event.channelId === "terminal-thread").map((event) => event.type),
+		["send", "send", "lock", "archive"],
+		"queued output must precede exact terminal send, lock, and archive",
+	);
+	assert.deepEqual(
+		(FakeGateway.channelMessages.get("terminal-thread") ?? []).map((message) => message.text),
+		["prior durable assistant output", taskTerminal.content],
+	);
+	const terminalEventCount = FakeGateway.summaryEvents.length;
+	await terminalCore.queueManagerTaskTerminal(
+		"terminal-producer-client", "terminal-producer-generation", "terminal-producer-session", structuredClone(taskTerminal),
+	);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+	assert.equal(FakeGateway.summaryEvents.length, terminalEventCount, "duplicate terminal revisions must be no-ops");
+	await assert.rejects(() => terminalCore.queueManagerTaskTerminal(
+		"terminal-producer-client", "terminal-producer-generation", "terminal-producer-session",
+		{ ...taskTerminal, content: "conflicting same revision" },
+	), /conflicting terminal state/);
+	await terminalGateway.emit({
+		id: "terminal-inbound", channelId: "terminal-thread", content: "must reject", authorBot: false,
+	});
+	assert.equal(terminalInboundDeliveries, 0, "terminal mappings must reject inbound delivery");
+	assert.deepEqual((await terminalState.getSession("terminal-target-session")).pendingMessages, [],
+		"terminal mappings must not queue inbound wake work");
+	terminalCore.unregisterClient("terminal-target-client", "terminal-target-generation");
+	await assert.rejects(() => terminalCore.prepareRegistration("terminal-reconnect", "terminal-reconnect-generation", {
+		cwd: "/terminal-target", projectIdentityResolved: true, sessionId: "terminal-target-session",
+		managerTaskSnapshotTaskId: taskTerminal.taskId,
+	}), /terminal and cannot resume/, "terminal mappings must reject reconnect and unarchive");
+	await assert.rejects(() => terminalCore.queueManagerTaskTerminal(
+		"terminal-producer-client", "terminal-producer-generation", "terminal-producer-session",
+		{ ...taskTerminal, revision: "b".repeat(64), taskId: "unmapped-task" },
+	), /no Discord session mapping/, "unmapped and cross-task terminal events must fail closed");
+	await terminalCore.stop();
+
+	const ambiguousState = new DiscordStateStore(join(dataDir, "ambiguous-terminal-state.json"));
+	await ambiguousState.resolveProjectChannel("/ambiguous", async () => "ambiguous-channel");
+	for (const sessionId of ["ambiguous-one", "ambiguous-two"]) {
+		await ambiguousState.resolveSessionThread(sessionId, "/ambiguous", "ambiguous-channel",
+			async () => `${sessionId}-thread`, undefined, "ambiguous-task");
+	}
+	await assert.rejects(() => ambiguousState.setManagerTaskTerminalDesired({
+		...taskTerminal, revision: "c".repeat(64), taskId: "ambiguous-task",
+	}), /ambiguous Discord session mappings/, "ambiguous terminal task mappings must fail closed");
+
+	async function verifyTerminalCrashRecovery(label, recordMethod, reachedBoundary) {
+		const taskId = `crash-${label}`;
+		const sessionId = `crash-session-${label}`;
+		const threadId = `crash-thread-${label}`;
+		const file = join(dataDir, `terminal-crash-${label}.json`);
+		const state = new DiscordStateStore(file);
+		const gateway = new FakeGateway();
+		gateway.ensureProjectChannel = async () => `crash-channel-${label}`;
+		gateway.ensureSessionThread = async () => threadId;
+		const core = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, state, gateway);
+		await core.start();
+		await core.prepareRegistration(`crash-target-client-${label}`, `crash-target-generation-${label}`, {
+			cwd: `/crash/${label}`, projectIdentityResolved: true, sessionId, managerTaskSnapshotTaskId: taskId,
+		});
+		await core.activateRegistration(
+			`crash-target-client-${label}`, `crash-target-generation-${label}`, sessionId, () => true,
+			undefined, false, undefined, false, undefined, taskId,
+		);
+		await core.prepareRegistration(`crash-producer-client-${label}`, `crash-producer-generation-${label}`, {
+			cwd: `/crash-producer/${label}`, projectIdentityResolved: true, sessionId: `crash-producer-${label}`,
+		});
+		await core.activateRegistration(
+			`crash-producer-client-${label}`, `crash-producer-generation-${label}`, `crash-producer-${label}`, () => true,
+			undefined, false, undefined, false, undefined, undefined, true,
+		);
+		state[recordMethod] = async () => { throw new Error(`injected crash at ${label} record boundary`); };
+		const terminal = { ...taskTerminal, taskId, revision: label.repeat(64).slice(0, 64), content: `terminal crash ${label}` };
+		await core.queueManagerTaskTerminal(
+			`crash-producer-client-${label}`, `crash-producer-generation-${label}`, `crash-producer-${label}`, terminal,
+		);
+		await waitFor(() => reachedBoundary(threadId, terminal), `terminal ${label} side effect before record`);
+		await core.stop();
+		const restartedState = new DiscordStateStore(file);
+		const restartedCore = new DiscordRelayCore(
+			{ token: "token", guildId: "12345", epoch: 1 }, restartedState, new FakeGateway(),
+		);
+		await restartedCore.start();
+		await waitFor(async () => (await restartedState.getSession(sessionId))?.managerTaskTerminal?.archived,
+			`terminal ${label} restart convergence`);
+		assert.equal((FakeGateway.channelMessages.get(threadId) ?? []).filter((message) => message.text === terminal.content).length, 1,
+			`terminal ${label} restart must not duplicate exact receipt`);
+		assert.deepEqual(FakeGateway.threadEvents.filter((event) => event.channelId === threadId).map((event) => event.type),
+			["lock", "archive"], `terminal ${label} restart must converge idempotently`);
+		await restartedCore.stop();
+	}
+	await verifyTerminalCrashRecovery("d", "recordManagerTaskTerminalSent",
+		(threadId, terminal) => (FakeGateway.channelMessages.get(threadId) ?? []).some((message) => message.text === terminal.content));
+	await verifyTerminalCrashRecovery("e", "recordManagerTaskTerminalLocked",
+		(threadId) => FakeGateway.lockedThreads.has(threadId));
+	await verifyTerminalCrashRecovery("f", "recordManagerTaskTerminalArchived",
+		(threadId) => FakeGateway.archivedThreads.has(threadId));
+
+	const malformedTerminalStateFile = join(dataDir, "malformed-manager-task-terminal-state.json");
+	const malformedTerminalState = JSON.parse(await readFile(terminalStateFile, "utf8"));
+	malformedTerminalState.sessions["terminal-target-session"].managerTaskTerminal.archived = true;
+	malformedTerminalState.sessions["terminal-target-session"].managerTaskTerminal.locked = false;
+	await writeFile(malformedTerminalStateFile, JSON.stringify(malformedTerminalState));
+	await assert.rejects(() => new DiscordStateStore(malformedTerminalStateFile).load(), /inconsistent manager task terminal state/,
+		"malformed persisted terminal ordering must fail visibly");
+
 	const genericState = new DiscordStateStore(join(dataDir, "generic-offline-state.json"));
 	const genericGateway = new FakeGateway();
 	const genericCore = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, genericState, genericGateway);
@@ -1147,6 +1346,21 @@ try {
 		async setArchived(value) { reopened = value === false; },
 	}, "channel-1"), "thread-1");
 	assert.equal(reopened, true);
+	const terminalThreadMutations = [];
+	const terminalThread = {
+		locked: false,
+		archived: false,
+		async setLocked(value, reason) { this.locked = value; terminalThreadMutations.push(["lock", value, reason]); },
+		async setArchived(value, reason) { this.archived = value; terminalThreadMutations.push(["archive", value, reason]); },
+	};
+	await lockSessionThread(terminalThread);
+	await lockSessionThread(terminalThread);
+	await archiveSessionThread(terminalThread);
+	await archiveSessionThread(terminalThread);
+	assert.deepEqual(terminalThreadMutations, [
+		["lock", true, "Manager task finished"],
+		["archive", true, "Manager task finished"],
+	], "transport terminal mutations must be idempotent and ordered by caller");
 	const subscribedOwners = new Set();
 	const ownerSubscriptionCalls = [];
 	const ownerThread = {
@@ -4069,6 +4283,11 @@ try {
 		type: "manager_task_snapshot", requestId: "task-snapshot-request", snapshot: { ...taskSnapshot, content: "" },
 	}), false);
 	assert.equal(isServerFrame({ type: "manager_task_snapshot_queued", requestId: "task-snapshot-request" }), true);
+	assert.equal(isClientFrame({ type: "manager_task_terminal", requestId: "task-terminal-request", terminal: taskTerminal }), true);
+	assert.equal(isClientFrame({
+		type: "manager_task_terminal", requestId: "task-terminal-request", terminal: { ...taskTerminal, closeThread: false },
+	}), false);
+	assert.equal(isServerFrame({ type: "manager_task_terminal_queued", requestId: "task-terminal-request" }), true);
 	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, managerTaskSnapshotTaskId: "wake-task" }), true);
 	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, managerTaskSnapshotTaskId: "" }), false);
 	const ipcPresentation = {
@@ -4127,7 +4346,7 @@ try {
 		async prepareRegistration() {
 			return { channelId: "old-client-channel", threadId: "old-client-thread", cwd: "/workspace/the-manager" };
 		},
-		async activateRegistration(...args) { oldClientActivatedAsProducer = args.at(-3); },
+		async activateRegistration(...args) { oldClientActivatedAsProducer = args.at(-4); },
 		unregisterClient() {},
 		async resumeDelivery() {},
 		updateManagerCatalogues() {},
@@ -4678,6 +4897,11 @@ try {
 	FakeGateway.hangLifecycleFor.clear();
 	FakeGateway.channelMessages.clear();
 	FakeGateway.summaryEvents.length = 0;
+	FakeGateway.failLockOnce.clear();
+	FakeGateway.failArchiveOnce.clear();
+	FakeGateway.lockedThreads.clear();
+	FakeGateway.archivedThreads.clear();
+	FakeGateway.threadEvents.length = 0;
 
 	const relayDirectory = join(dataDir, "shared-relay");
 	const paths = relayPaths(relayDirectory);
@@ -4743,11 +4967,28 @@ try {
 		sessionName: undefined,
 	});
 	await metadataAbsent.emit("session_start", { reason: "startup" });
+	const extensionTerminal = {
+		...taskTerminal,
+		revision: "9".repeat(64),
+		taskId: "extension-terminal-task",
+		content: "exact extension terminal content @everyone",
+	};
+	const sharedState = new DiscordStateStore(stateFile);
+	await sharedState.resolveProjectChannel("/extension-terminal", async () => "extension-terminal-channel");
+	await sharedState.resolveSessionThread(
+		"extension-terminal-session", "/extension-terminal", "extension-terminal-channel",
+		async () => "extension-terminal-thread", undefined, extensionTerminal.taskId,
+	);
 	const managerSummarySession = createExtensionHarness(extension, {
 		cwd: managerFixture,
 		sessionId: "manager-summary-session",
 		sessionName: "Manager",
 	});
+	managerSummarySession.emitBus("manager:task-terminal", {
+		...extensionTerminal, revision: "8".repeat(64), taskId: "extension-unmapped-task",
+	});
+	managerSummarySession.emitBus("manager:task-terminal", extensionTerminal);
+	managerSummarySession.emitBus("manager:task-terminal", { ...extensionTerminal, content: "" });
 	const managerEnvironmentKeys = Object.keys(validManagerEnvironment);
 	const inheritedManagerEnvironment = Object.fromEntries(managerEnvironmentKeys.map((key) => [key, process.env[key]]));
 	Object.assign(process.env, validManagerEnvironment);
@@ -4760,6 +5001,22 @@ try {
 		}
 	}
 	const managerSummaryMapping = await new DiscordStateStore(stateFile).getSession("manager-summary-session");
+	await waitFor(async () => (await sharedState.getSession("extension-terminal-session"))?.managerTaskTerminal?.archived,
+		"pre-registration manager terminal event delivery");
+	assert.deepEqual((FakeGateway.channelMessages.get("extension-terminal-thread") ?? []).map((message) => message.text),
+		[extensionTerminal.content], "extension must transport exact Manager terminal content once");
+	assert.ok(managerSummarySession.notifications.some(([message]) =>
+		message.includes("manager task-terminal rejected by relay for task extension-unmapped-task")),
+	"rejected unmapped events must remain visible without blocking mapped receipts");
+	assert.deepEqual(FakeGateway.threadEvents.filter((event) => event.channelId === "extension-terminal-thread").map((event) => event.type),
+		["lock", "archive"], "extension terminal delivery must lock then archive mapped task thread");
+	const extensionTerminalEventCount = FakeGateway.summaryEvents.filter((event) =>
+		event.channelId === "extension-terminal-thread").length;
+	managerSummarySession.emitBus("manager:task-terminal", structuredClone(extensionTerminal));
+	await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+	assert.equal(FakeGateway.summaryEvents.filter((event) =>
+		event.channelId === "extension-terminal-thread").length, extensionTerminalEventCount,
+		"replayed extension terminal events must be durable no-ops");
 	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "opaque manager payload @everyone",
 		"automatic initial manager presentation");
 	const canonicalSummaryCommand = "/github-refresh-reconcile";

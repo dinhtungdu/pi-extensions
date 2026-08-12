@@ -27,6 +27,7 @@ import {
 	type ManagerPresentation,
 } from "./manager-presentation.js";
 import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
+import type { ManagerTaskTerminal } from "./manager-task-terminal.js";
 
 const CONNECT_RETRY_MIN_MS = 25;
 const CONNECT_RETRY_MAX_MS = 500;
@@ -229,6 +230,25 @@ export class LocalRelayClient {
 				return;
 			} catch (error) {
 				if (this.stopped || error instanceof RelayRequestError) throw error;
+				await this.ensureConnected();
+				await delay(CONNECT_RETRY_MIN_MS);
+			}
+		}
+	}
+
+	async publishManagerTaskTerminal(terminal: ManagerTaskTerminal): Promise<boolean> {
+		for (;;) {
+			if (this.stopped) throw new Error("Local Discord relay client is stopped");
+			try {
+				await this.sendRequest({
+					type: "manager_task_terminal",
+					requestId: randomUUID(),
+					terminal: structuredClone(terminal),
+				}, REQUEST_TIMEOUT_MS);
+				return true;
+			} catch (error) {
+				if (error instanceof RelayRequestError) return false;
+				if (this.stopped) throw error;
 				await this.ensureConnected();
 				await delay(CONNECT_RETRY_MIN_MS);
 			}
@@ -560,7 +580,7 @@ export class LocalRelayClient {
 		if (frame.type === "inbound_acked" || frame.type === "inbound_images_released" ||
 			frame.type === "outbound_queued" || frame.type === "project_summary_queued" ||
 			frame.type === "manager_presentation_queued" || frame.type === "manager_task_snapshot_queued" ||
-			frame.type === "manager_catalogue_updated") {
+			frame.type === "manager_task_terminal_queued" || frame.type === "manager_catalogue_updated") {
 			const pending = this.pendingRequests.get(frame.requestId);
 			if (pending) {
 				clearTimeout(pending.timer);
