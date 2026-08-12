@@ -9,6 +9,15 @@ import { isManagerPresentation, type ManagerPresentation } from "./manager-prese
 import { isManagerWakeDescriptor, type ManagerWakeDescriptor } from "./manager-wake.js";
 import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
+import {
+	parseManagerTaskTerminalState,
+	prepareManagerTaskTerminalSend,
+	recordManagerTaskTerminalArchived,
+	recordManagerTaskTerminalLocked,
+	recordManagerTaskTerminalSent,
+	setManagerTaskTerminalDesired as applyManagerTaskTerminalDesired,
+	type ManagerTaskTerminalState,
+} from "./manager-task-terminal-state.js";
 
 const STATE_VERSION = 1;
 export const MAX_RECENT_MESSAGE_IDS = 2_000;
@@ -96,20 +105,6 @@ export interface ManagerTaskSnapshotState {
 		nonce: string;
 		snapshot: ManagerTaskSnapshot;
 	};
-}
-
-export interface ManagerTaskTerminalState {
-	desired: ManagerTaskTerminal;
-	pendingSend?: {
-		nonce: string;
-		terminal: ManagerTaskTerminal;
-	};
-	delivery?: {
-		messageId: string;
-		terminal: ManagerTaskTerminal;
-	};
-	locked: boolean;
-	archived: boolean;
 }
 
 export interface SessionThreadMapping {
@@ -238,43 +233,6 @@ function parseManagerTaskSnapshotState(value: unknown, file: string): ManagerTas
 		desired: structuredClone(value.desired),
 		...(delivery ? { delivery } : {}),
 		...(pendingSend ? { pendingSend } : {}),
-	};
-}
-
-function parseManagerTaskTerminalState(value: unknown, file: string): ManagerTaskTerminalState | undefined {
-	if (value === undefined) return undefined;
-	if (!isRecord(value) || !isManagerTaskTerminal(value.desired) || typeof value.locked !== "boolean" ||
-		typeof value.archived !== "boolean") {
-		throw new Error(`Discord bridge state ${file} has an invalid manager task terminal`);
-	}
-	let pendingSend: ManagerTaskTerminalState["pendingSend"];
-	if (value.pendingSend !== undefined) {
-		if (!isRecord(value.pendingSend) || typeof value.pendingSend.nonce !== "string" ||
-			!isManagerTaskTerminal(value.pendingSend.terminal)) {
-			throw new Error(`Discord bridge state ${file} has an invalid pending manager task terminal`);
-		}
-		pendingSend = { nonce: value.pendingSend.nonce, terminal: structuredClone(value.pendingSend.terminal) };
-	}
-	let delivery: ManagerTaskTerminalState["delivery"];
-	if (value.delivery !== undefined) {
-		if (!isRecord(value.delivery) || typeof value.delivery.messageId !== "string" ||
-			!isManagerTaskTerminal(value.delivery.terminal)) {
-			throw new Error(`Discord bridge state ${file} has an invalid delivered manager task terminal`);
-		}
-		delivery = { messageId: value.delivery.messageId, terminal: structuredClone(value.delivery.terminal) };
-	}
-	const desiredJson = JSON.stringify(value.desired);
-	if (pendingSend && JSON.stringify(pendingSend.terminal) !== desiredJson ||
-		delivery && JSON.stringify(delivery.terminal) !== desiredJson ||
-		pendingSend && delivery || value.locked && !delivery || value.archived && !value.locked) {
-		throw new Error(`Discord bridge state ${file} has inconsistent manager task terminal state`);
-	}
-	return {
-		desired: structuredClone(value.desired),
-		...(pendingSend ? { pendingSend } : {}),
-		...(delivery ? { delivery } : {}),
-		locked: value.locked,
-		archived: value.archived,
 	};
 }
 
@@ -770,44 +728,19 @@ export class DiscordStateStore {
 		terminal: ManagerTaskTerminal,
 	): Promise<{ accepted: boolean; sessionId: string; revision: string }> {
 		if (!isManagerTaskTerminal(terminal)) throw new Error("Discord manager task terminal is invalid");
-		return this.mutate(async (state) => {
-			const matches = Object.entries(state.sessions)
-				.filter(([, mapping]) => mapping.managerTaskSnapshotTaskId === terminal.taskId);
-			if (matches.length === 0) throw new Error(`Manager task ${terminal.taskId} has no Discord session mapping`);
-			if (matches.length !== 1) throw new Error(`Manager task ${terminal.taskId} has ambiguous Discord session mappings`);
-			const [sessionId, session] = matches[0]!;
-			const existing = session.managerTaskTerminal;
-			if (existing) {
-				if (existing.desired.revision !== terminal.revision ||
-					JSON.stringify(existing.desired) !== JSON.stringify(terminal)) {
-					throw new Error(`Manager task ${terminal.taskId} has conflicting terminal state`);
-				}
-				return { accepted: false, sessionId, revision: terminal.revision };
-			}
-			session.lastActiveAt = this.now();
-			session.managerTaskTerminal = {
-				desired: structuredClone(terminal),
-				locked: false,
-				archived: false,
-			};
-			return { accepted: true, sessionId, revision: terminal.revision };
-		});
+		return this.mutate(async (state) => applyManagerTaskTerminalDesired(state.sessions, terminal, this.now()));
 	}
 
 	async prepareManagerTaskTerminalSend(
 		sessionId: string,
 		expectedRevision: string,
 	): Promise<ManagerTaskTerminalState["pendingSend"] | undefined> {
-		return this.mutate(async (state) => {
-			const terminal = state.sessions[sessionId]?.managerTaskTerminal;
-			if (!terminal || terminal.desired.revision !== expectedRevision || terminal.delivery) return undefined;
-			if (!terminal.pendingSend) terminal.pendingSend = {
-				nonce: projectSummaryNonce(),
-				terminal: structuredClone(terminal.desired),
-			};
-			else if (!isValidDiscordNonce(terminal.pendingSend.nonce)) terminal.pendingSend.nonce = projectSummaryNonce();
-			return structuredClone(terminal.pendingSend);
-		});
+		return this.mutate(async (state) => prepareManagerTaskTerminalSend(
+			state.sessions[sessionId]?.managerTaskTerminal,
+			expectedRevision,
+			projectSummaryNonce,
+			isValidDiscordNonce,
+		));
 	}
 
 	async recordManagerTaskTerminalSent(
@@ -816,27 +749,26 @@ export class DiscordStateStore {
 		messageId: string,
 		expectedRevision: string,
 	): Promise<void> {
-		await this.mutate(async (state) => {
-			const terminal = state.sessions[sessionId]?.managerTaskTerminal;
-			if (!terminal?.pendingSend || terminal.pendingSend.nonce !== nonce ||
-				terminal.pendingSend.terminal.revision !== expectedRevision) return;
-			terminal.delivery = { messageId, terminal: structuredClone(terminal.pendingSend.terminal) };
-			delete terminal.pendingSend;
-		});
+		await this.mutate(async (state) => recordManagerTaskTerminalSent(
+			state.sessions[sessionId]?.managerTaskTerminal,
+			nonce,
+			messageId,
+			expectedRevision,
+		));
 	}
 
 	async recordManagerTaskTerminalLocked(sessionId: string, expectedRevision: string): Promise<void> {
-		await this.mutate(async (state) => {
-			const terminal = state.sessions[sessionId]?.managerTaskTerminal;
-			if (terminal?.delivery?.terminal.revision === expectedRevision) terminal.locked = true;
-		});
+		await this.mutate(async (state) => recordManagerTaskTerminalLocked(
+			state.sessions[sessionId]?.managerTaskTerminal,
+			expectedRevision,
+		));
 	}
 
 	async recordManagerTaskTerminalArchived(sessionId: string, expectedRevision: string): Promise<void> {
-		await this.mutate(async (state) => {
-			const terminal = state.sessions[sessionId]?.managerTaskTerminal;
-			if (terminal?.locked && terminal.delivery?.terminal.revision === expectedRevision) terminal.archived = true;
-		});
+		await this.mutate(async (state) => recordManagerTaskTerminalArchived(
+			state.sessions[sessionId]?.managerTaskTerminal,
+			expectedRevision,
+		));
 	}
 
 	async findSessionByThread(threadId: string): Promise<{ sessionId: string; mapping: SessionThreadMapping } | undefined> {

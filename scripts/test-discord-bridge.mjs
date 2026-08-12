@@ -992,7 +992,14 @@ try {
 	);
 	const terminalEventCount = FakeGateway.summaryEvents.length;
 	await terminalCore.queueManagerTaskTerminal(
-		"terminal-producer-client", "terminal-producer-generation", "terminal-producer-session", structuredClone(taskTerminal),
+		"terminal-producer-client", "terminal-producer-generation", "terminal-producer-session",
+		{
+			closeThread: taskTerminal.closeThread,
+			content: taskTerminal.content,
+			revision: taskTerminal.revision,
+			schemaVersion: taskTerminal.schemaVersion,
+			taskId: taskTerminal.taskId,
+		},
 	);
 	await new Promise((resolveWait) => setTimeout(resolveWait, 20));
 	assert.equal(FakeGateway.summaryEvents.length, terminalEventCount, "duplicate terminal revisions must be no-ops");
@@ -1060,14 +1067,23 @@ try {
 		await waitFor(() => reachedBoundary(threadId, terminal), `terminal ${label} side effect before record`);
 		await core.stop();
 		const restartedState = new DiscordStateStore(file);
+		if (label === "d") {
+			const pendingNonce = (await restartedState.getSession(sessionId))?.managerTaskTerminal?.pendingSend?.nonce;
+			assert.ok(pendingNonce, "send-record crash must retain durable pending nonce");
+			FakeGateway.nonceResults.set(pendingNonce, undefined);
+		}
 		const restartedCore = new DiscordRelayCore(
 			{ token: "token", guildId: "12345", epoch: 1 }, restartedState, new FakeGateway(),
 		);
 		await restartedCore.start();
 		await waitFor(async () => (await restartedState.getSession(sessionId))?.managerTaskTerminal?.archived,
 			`terminal ${label} restart convergence`);
-		assert.equal((FakeGateway.channelMessages.get(threadId) ?? []).filter((message) => message.text === terminal.content).length, 1,
-			`terminal ${label} restart must not duplicate exact receipt`);
+		const receiptCount = (FakeGateway.channelMessages.get(threadId) ?? [])
+			.filter((message) => message.text === terminal.content).length;
+		assert.equal(receiptCount, label === "d" ? 2 : 1,
+			label === "d"
+				? "accepted send before durable sent record may duplicate after Discord nonce deduplication expires"
+				: `terminal ${label} restart must resume after the durable sent record without another receipt`);
 		assert.deepEqual(FakeGateway.threadEvents.filter((event) => event.channelId === threadId).map((event) => event.type),
 			["lock", "archive"], `terminal ${label} restart must converge idempotently`);
 		await restartedCore.stop();
