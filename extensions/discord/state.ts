@@ -626,13 +626,12 @@ export class DiscordStateStore {
 	async recordProjectSummaryBatchSent(cwd: string, messageId: string, expectedRevision: number): Promise<void> {
 		await this.mutate(async (state) => {
 			const summary = state.projects[cwd]?.summary;
-			if (!summary?.desiredPresentation || summary.revision !== expectedRevision) return;
+			if (!summary?.desiredPresentation || summary.pendingSend || summary.revision !== expectedRevision) return;
 			summary.delivery = {
 				messageId,
 				content: summary.desiredText,
 				presentation: structuredClone(summary.desiredPresentation),
 			};
-			delete summary.pendingSend;
 		});
 	}
 

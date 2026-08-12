@@ -1020,11 +1020,6 @@ export class DiscordRelayCore {
 			if (!project || project.summary.revision !== authorization.revision ||
 				!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
 			const { mapping, summary } = project;
-			if (summary.desiredPresentation) {
-				await this.replaceManagerSummaryBatch(cwd, mapping.channelId, summary, authorization);
-				this.clearProjectSummaryRetry(cwd);
-				return;
-			}
 			if (summary.pendingSend) {
 				const pending = await this.state.prepareProjectSummarySend(cwd, authorization.revision);
 				if (!pending || !this.isCurrentSummaryAuthorization(cwd, authorization)) return;
@@ -1033,6 +1028,11 @@ export class DiscordRelayCore {
 					: await this.transport.sendText(mapping.channelId, pending.content, pending.nonce);
 				await this.state.recordProjectSummarySent(cwd, pending.nonce, messageId, authorization.revision);
 				continue;
+			}
+			if (summary.desiredPresentation) {
+				await this.replaceManagerSummaryBatch(cwd, mapping.channelId, summary, authorization);
+				this.clearProjectSummaryRetry(cwd);
+				return;
 			}
 			if (!summary.delivery) {
 				await this.state.prepareProjectSummarySend(cwd, authorization.revision);
@@ -1079,17 +1079,15 @@ export class DiscordRelayCore {
 		const batchRevision = pages[0]!.revision;
 		let discovered = await this.transport.managerSummaryMessages(channelId);
 		if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
-		const matching = discovered.filter((message) => message.revision === batchRevision);
-		const complete = matching.length === pages.length && pages.every((page) =>
-			matching.some((message) => message.page === page.page && message.total === pages.length));
-		let newMessageIds: string[];
-		if (complete) {
-			newMessageIds = pages.map((page) => matching.find((message) => message.page === page.page)!.id);
-		} else {
-			for (const message of matching) {
-				if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
-				await this.transport.deleteOwnText(channelId, message.id);
+		const selected = new Map<number, string>();
+		for (const message of discovered) {
+			if (message.revision === batchRevision && message.total === pages.length && !selected.has(message.page)) {
+				selected.set(message.page, message.id);
 			}
+		}
+		const complete = pages.every((page) => selected.has(page.page));
+		let newMessageIds = complete ? pages.map((page) => selected.get(page.page)!) : [];
+		if (!complete) {
 			const sent: string[] = [];
 			try {
 				for (const page of pages) {
@@ -1105,13 +1103,9 @@ export class DiscordRelayCore {
 				throw error;
 			}
 			newMessageIds = sent;
-			discovered = [
-				...discovered.filter((message) => message.revision !== batchRevision),
-				...pages.map((page, index) => ({ id: sent[index]!, revision: page.revision, page: page.page, total: page.total })),
-			];
 		}
 		const retained = new Set(newMessageIds);
-		const stale = new Set(discovered.filter((message) => message.revision !== batchRevision).map((message) => message.id));
+		const stale = new Set(discovered.filter((message) => !retained.has(message.id)).map((message) => message.id));
 		if (summary.delivery && !retained.has(summary.delivery.messageId)) stale.add(summary.delivery.messageId);
 		for (const messageId of stale) {
 			if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;

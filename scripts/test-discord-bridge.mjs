@@ -204,7 +204,7 @@ class FakeGateway {
 	}
 
 	async managerSummaryMessages(channelId) {
-		return (FakeGateway.channelMessages.get(channelId) ?? []).flatMap((message) => {
+		return [...(FakeGateway.channelMessages.get(channelId) ?? [])].reverse().flatMap((message) => {
 			if (!message.botOwned) return [];
 			const match = /(?:^|\n)-# Manager summary · ([a-f0-9]{64}) · ([1-9]\d?)\/([1-9]\d?)$/.exec(message.text);
 			if (!match) return [];
@@ -1805,6 +1805,50 @@ try {
 	}, "manager presentation creates must suppress embeds without changing content, controls, nonce, or mention safety");
 	assert.deepEqual(normalizePresentationPayload(presentationEditPayloads[0]), expectedPresentationPayload,
 		"manager presentation edits must retain embed suppression, content, controls, and mention safety");
+
+	const historyRevision = "a".repeat(64);
+	const historyMessages = Array.from({ length: 150 }, (_, index) => ({
+		id: String(1_000 - index),
+		content: index === 149 ? `old page\n-# Manager summary · ${historyRevision} · 1/1` : "unrelated",
+		author: { id: index === 149 ? "bot-user" : "human-user" },
+	}));
+	const discoveryRequests = [];
+	const discoveryTransport = new DiscordJsTransport();
+	discoveryTransport.readyClient = () => ({ user: { id: "bot-user" } });
+	discoveryTransport.textChannel = async () => ({ messages: { async fetch(options) {
+		discoveryRequests.push(options);
+		const start = options.before ? historyMessages.findIndex((message) => message.id === options.before) + 1 : 0;
+		return new Map(historyMessages.slice(start, start + 100).map((message) => [message.id, message]));
+	} } });
+	assert.deepEqual(await discoveryTransport.managerSummaryMessages("project-channel"), [{
+		id: "851", revision: historyRevision, page: 1, total: 1,
+	}], "manager summary discovery must traverse beyond the newest 100 messages");
+	assert.deepEqual(discoveryRequests, [
+		{ limit: 100 }, { limit: 100, before: "901" }, { limit: 100, before: "851" },
+	], "manager summary discovery must obtain an empty-page proof");
+
+	const discoveryFailure = async (kind) => {
+		let requests = 0;
+		const transport = new DiscordJsTransport();
+		transport.readyClient = () => ({ user: { id: "bot-user" } });
+		transport.textChannel = async () => ({ messages: { async fetch(_options) {
+			requests++;
+			if (kind === "fetch" && requests === 2) throw new Error("injected discovery failure");
+			if (kind === "repeat") return new Map([["100", historyMessages[0]]]);
+			if (kind === "cap") return new Map(Array.from({ length: 100 }, (_, index) => {
+				const id = String(10_000 - (requests - 1) * 100 - index);
+				return [id, { id, content: "unrelated", author: { id: "human-user" } }];
+			}));
+			return new Map([["100", { id: "100", content: `marked\n-# Manager summary · ${historyRevision} · 1/1`, author: { id: "bot-user" } }]]);
+		} } });
+		await assert.rejects(() => transport.managerSummaryMessages("project-channel"),
+			kind === "fetch" ? /injected discovery failure/ : kind === "repeat" ? /repeated its cursor/ : /exceeded 1,000/);
+		return requests;
+	};
+	assert.equal(await discoveryFailure("fetch"), 2, "fetch failure must fail closed after no partial discovery result");
+	assert.equal(await discoveryFailure("repeat"), 2, "repeated cursors must fail closed promptly");
+	assert.equal(await discoveryFailure("cap"), 11, "history traversal must stop after 1,000 messages plus proof request");
+
 	const ordinarySendPayloads = [];
 	const ordinaryEditPayloads = [];
 	const ordinaryMessage = { author: { id: "bot-user" }, async edit(payload) { ordinaryEditPayloads.push(payload); } };
@@ -3540,6 +3584,16 @@ try {
 	const batchSummaryState = new DiscordStateStore(join(dataDir, "batch-summary-state.json"));
 	const batchSummaryGateway = new FakeGateway();
 	batchSummaryGateway.ensureProjectChannel = async () => batchSummaryChannel;
+	const batchDiscoveryTransport = new DiscordJsTransport();
+	batchDiscoveryTransport.readyClient = () => ({ user: { id: "bot-user" } });
+	batchDiscoveryTransport.textChannel = async () => ({ messages: { async fetch(options) {
+		const messages = [...(FakeGateway.channelMessages.get(batchSummaryChannel) ?? [])]
+			.map((message) => ({ ...message, content: message.text, author: { id: message.botOwned ? "bot-user" : "human-user" } }))
+			.sort((left, right) => right.id.localeCompare(left.id));
+		const start = options.before ? messages.findIndex((message) => message.id === options.before) + 1 : 0;
+		return new Map(messages.slice(start, start + 100).map((message) => [message.id, message]));
+	} } });
+	batchSummaryGateway.managerSummaryMessages = (channelId) => batchDiscoveryTransport.managerSummaryMessages(channelId);
 	const batchSummaryCore = new DiscordRelayCore(
 		{ token: "token", guildId: "12345", epoch: 1 }, batchSummaryState, batchSummaryGateway,
 	);
@@ -3552,21 +3606,28 @@ try {
 		undefined, false, undefined, true,
 		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "unused" }) },
 	);
-	const oldBatch = managerPresentationPayload("7".repeat(64), "last-good manager batch");
+	const oldBatch = managerPresentationPayload("7".repeat(64), `last-good manager batch\n${"o".repeat(2_100)}`);
 	const oldBatchRevision = paginateManagerPresentation(oldBatch)[0].revision;
 	await batchSummaryCore.queueManagerPresentation(
 		"batch-summary-client", "batch-summary-generation", "batch-summary-session", oldBatch,
 	);
 	await waitFor(async () => (await batchSummaryState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === oldBatch.revision,
 		"initial manager summary batch");
-	const oldBatchId = FakeGateway.channelMessages.get(batchSummaryChannel).at(-1).id;
+	const oldBatchMessages = FakeGateway.channelMessages.get(batchSummaryChannel)
+		.filter((message) => managerSummaryPageMetadata(message.text)?.revision === oldBatchRevision);
 	FakeGateway.channelMessages.get(batchSummaryChannel).push(
+		...Array.from({ length: 100 }, (_, index) => ({ id: `zz-history-${String(index).padStart(3, "0")}`, text: "history", botOwned: false })),
 		{ id: "unrelated-bot", text: "unrelated bot-authored message", botOwned: true },
 		{ id: "unrelated-human", text: "unrelated human message", botOwned: false },
 		{ id: "stale-page", text: `stale\n-# Manager summary · ${"8".repeat(64)} · 1/1`, botOwned: true },
 	);
 	const failedBatch = managerPresentationPayload("9".repeat(64), `failed replacement\n${"x".repeat(4_100)}`);
-	const failedBatchRevision = paginateManagerPresentation(failedBatch)[0].revision;
+	const failedBatchPages = paginateManagerPresentation(failedBatch);
+	const failedBatchRevision = failedBatchPages[0].revision;
+	FakeGateway.channelMessages.get(batchSummaryChannel).push(
+		{ id: "incomplete-desired", text: failedBatchPages[0].content, botOwned: true },
+		{ id: "conflicting-desired", text: `conflict\n-# Manager summary · ${failedBatchRevision} · 1/1`, botOwned: true },
+	);
 	const sendTextForBatch = batchSummaryGateway.sendText.bind(batchSummaryGateway);
 	let replacementSendAttempts = 0;
 	let rejectReplacement = true;
@@ -3580,14 +3641,21 @@ try {
 		"batch-summary-client", "batch-summary-generation", "batch-summary-session", failedBatch,
 	);
 	await waitFor(() => replacementSendAttempts >= 2, "partial manager summary send failure");
-	const retainedOldBatch = FakeGateway.channelMessages.get(batchSummaryChannel).find((message) => message.id === oldBatchId);
-	assert.deepEqual(retainedOldBatch?.presentation?.controls, oldBatch.controls,
-		"partial send failure must preserve usable last-good batch and control");
-	assert.equal((await batchSummaryGateway.managerSummaryMessages(batchSummaryChannel))
-		.filter((message) => message.revision === failedBatchRevision).length, 0,
-		"partial new batch pages must be removed best-effort");
+	const retainedOldBatch = FakeGateway.channelMessages.get(batchSummaryChannel)
+		.filter((message) => oldBatchMessages.some((old) => old.id === message.id));
+	assert.equal(retainedOldBatch.length, oldBatchMessages.length,
+		"partial send failure must preserve every last-good batch page beyond newest 100 messages");
+	assert.deepEqual(retainedOldBatch.at(-1)?.presentation?.controls, oldBatch.controls,
+		"partial send failure must preserve usable last-good final control");
+	const pagesAfterFailure = await batchSummaryGateway.managerSummaryMessages(batchSummaryChannel);
+	assert.deepEqual(pagesAfterFailure.filter((message) => message.revision === failedBatchRevision).map((message) => message.id),
+		["incomplete-desired", "conflicting-desired"],
+		"send failure must clean only current-attempt pages and preserve discovered incomplete/conflicting pages");
+	assert.ok(FakeGateway.channelMessages.get(batchSummaryChannel).some((message) => message.id === "stale-page"),
+		"send failure must not delete stale marked pages before replacement completeness");
 
 	rejectReplacement = false;
+	FakeGateway.failDeleteOnce.add("stale-page");
 	const replacementEventOffset = FakeGateway.summaryEvents.length;
 	await waitFor(async () => (await batchSummaryState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === failedBatch.revision,
 		"manager summary replacement retry");
@@ -3599,18 +3667,115 @@ try {
 	const deliveredBatchMessages = FakeGateway.channelMessages.get(batchSummaryChannel);
 	const deliveredBatchPages = await batchSummaryGateway.managerSummaryMessages(batchSummaryChannel);
 	assert.equal(deliveredBatchPages.filter((message) => message.revision === failedBatchRevision).length,
-		paginateManagerPresentation(failedBatch).length, "complete replacement must retain every new page");
+		failedBatchPages.length, "complete replacement must retain every new page");
+	assert.equal(replacementEvents.filter((event) => event.type === "send").length, failedBatchPages.length,
+		"cleanup failure retry must reuse discovered complete replacement without resending pages");
 	assert.equal(deliveredBatchPages.some((message) => message.revision === oldBatchRevision || message.id === "stale-page"), false,
 		"replacement must delete old and stale summary pages");
 	assert.ok(deliveredBatchMessages.some((message) => message.id === "unrelated-bot"));
-	assert.ok(deliveredBatchMessages.some((message) => message.id === "unrelated-human"),
-		"replacement must preserve unrelated messages");
+	assert.ok(deliveredBatchMessages.some((message) => message.id === "unrelated-human"));
+	assert.ok(deliveredBatchMessages.some((message) => message.id === "zz-history-000"),
+		"replacement must preserve unrelated messages across paginated history");
 	const deliveredPresentations = deliveredBatchMessages.filter((message) =>
 		managerSummaryPageMetadata(message.text)?.revision === failedBatchRevision);
 	assert.ok(deliveredPresentations.slice(0, -1).every((message) => !message.presentation));
 	assert.deepEqual(deliveredPresentations.at(-1).presentation.controls, failedBatch.controls,
 		"only final delivered page may carry Refresh & Reconcile");
+	const newestDuplicate = { id: "zzzzzz-newest-page-one", text: failedBatchPages[0].content, botOwned: true };
+	FakeGateway.channelMessages.get(batchSummaryChannel).push(newestDuplicate);
+	await batchSummaryCore.queueManagerPresentation(
+		"batch-summary-client", "batch-summary-generation", "batch-summary-session", failedBatch,
+	);
+	await waitFor(() => (FakeGateway.channelMessages.get(batchSummaryChannel) ?? [])
+		.filter((message) => managerSummaryPageMetadata(message.text)?.revision === failedBatchRevision).length === failedBatchPages.length,
+		"duplicate desired batch cleanup");
+	assert.ok(FakeGateway.channelMessages.get(batchSummaryChannel).some((message) => message.id === newestDuplicate.id),
+		"duplicate resolution must deterministically retain newest page per index");
 	await batchSummaryCore.stop();
+
+	async function pendingPresentationScenario(label, failRecovery) {
+		const cwd = `/pending-${label}`;
+		const channelId = `pending-${label}-channel`;
+		const sessionId = `pending-${label}-session`;
+		const state = new DiscordStateStore(join(dataDir, `pending-${label}-state.json`));
+		await state.resolveProjectChannel(cwd, async () => channelId);
+		await state.resolveSessionThread(sessionId, cwd, channelId, async () => `pending-${label}-thread`);
+		const accepted = managerPresentationPayload("b".repeat(64), `accepted pending ${label}`);
+		await state.setProjectSummaryDesired(sessionId, accepted.content, 1, accepted);
+		const pending = await state.prepareProjectSummarySend(cwd, 1);
+		const desired = managerPresentationPayload("c".repeat(64), `current ${label}\n${"z".repeat(2_100)}`);
+		await state.setProjectSummaryDesired(sessionId, desired.content, 2, desired);
+		await state.recordProjectSummaryBatchSent(cwd, "forbidden-batch", 2);
+		assert.equal((await state.projectSummaries())[0].summary.pendingSend.nonce, pending.nonce,
+			"batch recording must never bypass or clear pending legacy recovery");
+		const gateway = new FakeGateway();
+		gateway.ensureProjectChannel = async () => channelId;
+		gateway.ensureSessionThread = async () => `pending-${label}-thread`;
+		const legacyId = `pending-${label}-legacy`;
+		FakeGateway.channelMessages.set(channelId, [{
+			id: legacyId, text: accepted.content, presentation: accepted, botOwned: true,
+		}]);
+		if (failRecovery) FakeGateway.failOnceTexts.add(accepted.content);
+		else FakeGateway.nonceResults.set(pending.nonce, legacyId);
+		const core = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, state, gateway);
+		await core.start();
+		await core.prepareRegistration(`pending-${label}-client`, `pending-${label}-generation`, {
+			cwd, projectIdentityResolved: true, sessionId,
+		});
+		await core.activateRegistration(
+			`pending-${label}-client`, `pending-${label}-generation`, sessionId, () => true,
+			undefined, false, undefined, true,
+			{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "unused" }) },
+		);
+		await core.queueManagerPresentation(`pending-${label}-client`, `pending-${label}-generation`, sessionId, desired);
+		if (failRecovery) {
+			await waitFor(() => FakeGateway.sendAttempts.get(accepted.content) === 1, "pending presentation recovery failure");
+			const summary = (await state.projectSummaries())[0].summary;
+			assert.equal(summary.pendingSend.nonce, pending.nonce);
+			assert.deepEqual(FakeGateway.channelMessages.get(channelId).map((message) => message.id), [legacyId],
+				"pending recovery failure must cause zero batch send or deletion mutation");
+		} else {
+			await waitFor(async () => !(await state.projectSummaries())[0].summary.pendingSend &&
+				(await state.projectSummaries())[0].summary.delivery?.presentation?.revision === desired.revision,
+			"pending presentation recovery followed by batch replacement");
+			const messages = FakeGateway.channelMessages.get(channelId);
+			assert.equal(messages.some((message) => message.id === legacyId), false,
+				"recovered legacy message must be replaced only after pending nonce records");
+			assert.equal((await gateway.managerSummaryMessages(channelId)).length, paginateManagerPresentation(desired).length);
+			assert.equal(messages.filter((message) => message.presentation?.controls.length === 1).length, 1,
+				"pending recovery must converge to one complete batch with one control");
+		}
+		await core.stop();
+	}
+	await pendingPresentationScenario("success", false);
+	await pendingPresentationScenario("failure", true);
+
+	const discoveryFenceChannel = "discovery-fence-channel";
+	const discoveryFenceState = new DiscordStateStore(join(dataDir, "discovery-fence-state.json"));
+	const discoveryFenceGateway = new FakeGateway();
+	discoveryFenceGateway.ensureProjectChannel = async () => discoveryFenceChannel;
+	discoveryFenceGateway.managerSummaryMessages = async () => { throw new Error("injected complete-discovery failure"); };
+	const discoveryFenceCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, discoveryFenceState, discoveryFenceGateway,
+	);
+	await discoveryFenceCore.start();
+	await discoveryFenceCore.prepareRegistration("discovery-fence-client", "discovery-fence-generation", {
+		cwd: "/discovery-fence", projectIdentityResolved: true, sessionId: "discovery-fence-session",
+	});
+	await discoveryFenceCore.activateRegistration(
+		"discovery-fence-client", "discovery-fence-generation", "discovery-fence-session", () => true,
+		undefined, false, undefined, true,
+		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "unused" }) },
+	);
+	const discoveryFenceEvents = FakeGateway.summaryEvents.length;
+	await discoveryFenceCore.queueManagerPresentation(
+		"discovery-fence-client", "discovery-fence-generation", "discovery-fence-session",
+		managerPresentationPayload("d".repeat(64), "must not mutate"),
+	);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+	assert.equal(FakeGateway.summaryEvents.length, discoveryFenceEvents,
+		"failed complete discovery must cause zero Discord summary mutation");
+	await discoveryFenceCore.stop();
 
 	const presentationStateFile = join(dataDir, "presentation-state.json");
 	const presentationState = new DiscordStateStore(presentationStateFile);

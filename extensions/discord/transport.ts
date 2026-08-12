@@ -534,12 +534,31 @@ export class DiscordJsTransport implements DiscordTransport {
 	async managerSummaryMessages(channelId: string): Promise<DiscordManagerSummaryMessage[]> {
 		const client = this.readyClient();
 		const channel = await this.textChannel(channelId, "inspect manager summaries");
-		const messages = await channel.messages.fetch({ limit: 100 });
-		return [...messages.values()].flatMap((message) => {
-			if (message.author.id !== client.user.id) return [];
-			const metadata = managerSummaryPageMetadata(message.content);
-			return metadata ? [{ id: message.id, ...metadata }] : [];
-		});
+		const discovered: Array<{ id: string; content: string; authorId: string }> = [];
+		const cursors = new Set<string>();
+		let before: string | undefined;
+		for (let request = 0; request < 11; request++) {
+			const messages = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+			const page = [...messages.values()].map((message) => ({
+				id: message.id, content: message.content, authorId: message.author.id,
+			})).sort((left, right) => compareIds(right.id, left.id));
+			if (page.length === 0) {
+				return discovered.flatMap((message) => {
+					if (message.authorId !== client.user.id) return [];
+					const metadata = managerSummaryPageMetadata(message.content);
+					return metadata ? [{ id: message.id, ...metadata }] : [];
+				});
+			}
+			if (request === 10 || discovered.length + page.length > 1_000) {
+				throw new Error("Discord manager summary discovery exceeded 1,000 messages");
+			}
+			discovered.push(...page);
+			const cursor = page.at(-1)!.id;
+			if (cursor === before || cursors.has(cursor)) throw new Error("Discord manager summary discovery repeated its cursor");
+			cursors.add(cursor);
+			before = cursor;
+		}
+		throw new Error("Discord manager summary discovery did not terminate");
 	}
 
 	async editOwnText(channelId: string, messageId: string, text: string): Promise<void> {
