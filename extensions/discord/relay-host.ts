@@ -276,6 +276,7 @@ export class LocalRelayHost {
 				sessionId: parsed.sessionId,
 				sessionName: parsed.sessionName,
 				managerWake: parsed.managerWake,
+				managerTaskSnapshotTaskId: parsed.managerTaskSnapshotTaskId,
 				subscribeOwnerToThread: parsed.subscribeOwnerToThread,
 			});
 			if (state.closed) {
@@ -327,6 +328,7 @@ export class LocalRelayHost {
 					controlIds: managerPresentation.controlIds,
 					execute: (request) => this.requestPresentationControl(state, request),
 				} : undefined,
+				parsed.managerTaskSnapshotTaskId,
 			);
 			if (state.closed) {
 				this.options.core.unregisterClient(parsed.clientId, parsed.generation);
@@ -357,6 +359,16 @@ export class LocalRelayHost {
 				return;
 			}
 			this.write(state, { type: "manager_presentation_queued", requestId: parsed.requestId });
+			return;
+		}
+		if (parsed.type === "manager_task_snapshot") {
+			try {
+				await this.options.core.queueManagerTaskSnapshot(clientId, generation, sessionId, parsed.snapshot);
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
+				return;
+			}
+			this.write(state, { type: "manager_task_snapshot_queued", requestId: parsed.requestId });
 			return;
 		}
 		if (parsed.type === "manager_catalogue") {

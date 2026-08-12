@@ -43,6 +43,7 @@ import {
 	type PiSessionControlResult,
 } from "./controls.js";
 import { wakeManagerSession, type ManagerWakeDescriptor } from "./manager-wake.js";
+import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 import {
 	isSupportedManagerPresentationControl,
 	SUPPORTED_MANAGER_PRESENTATION_CONTROLS,
@@ -56,6 +57,7 @@ export interface RelaySessionRegistration {
 	sessionName?: string;
 	managerTaskSummaryProducer?: true;
 	managerWake?: ManagerWakeDescriptor | null;
+	managerTaskSnapshotTaskId?: string;
 	subscribeOwnerToThread?: true;
 }
 
@@ -72,6 +74,7 @@ interface ActiveSession {
 	cwd: string;
 	threadId: string;
 	managerTaskSummaryProducer: boolean;
+	managerTaskSnapshotTaskId?: string;
 	managerPresentationControlIds: string[]; managerPresentation?: ManagerPresentation;
 	summaryProducerOrder: number;
 	deliver(message: QueuedDiscordMessage): boolean;
@@ -99,6 +102,8 @@ const MAX_PENDING_LIFECYCLE_UPDATES = 256;
 const MAX_DESIRED_REACTIONS = 2_000;
 const SUMMARY_RETRY_MIN_MS = 250;
 const SUMMARY_RETRY_MAX_MS = 30_000;
+const TASK_SNAPSHOT_RETRY_MIN_MS = 250;
+const TASK_SNAPSHOT_RETRY_MAX_MS = 30_000;
 const INBOUND_RETRY_MIN_MS = 1_000;
 const INBOUND_RETRY_MAX_MS = 30_000;
 export const DISCORD_STATE_COMPACTION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
@@ -177,6 +182,10 @@ export class DiscordRelayCore {
 	private readonly summaryRevisions = new Map<string, number>();
 	private readonly summaryOwners = new Map<string, ActiveSession>();
 	private readonly summaryOwnerRetirements = new Map<string, Promise<void>>();
+	private readonly taskSnapshotReconciliations = new Map<string, Promise<void>>();
+	private readonly taskSnapshotRevisions = new Map<string, string>();
+	private readonly taskSnapshotRetryAttempts = new Map<string, number>();
+	private readonly taskSnapshotRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly recentlyDisconnectedSessions = new Set<string>();
 	private readonly wakeEpisodes = new Map<string, string>();
 	private nextSummaryProducerOrder = 0;
@@ -317,6 +326,12 @@ export class DiscordRelayCore {
 		this.summaryReconciliations.clear();
 		this.summaryOwners.clear();
 		this.summaryOwnerRetirements.clear();
+		for (const timer of this.taskSnapshotRetryTimers.values()) clearTimeout(timer);
+		this.taskSnapshotRetryTimers.clear();
+		this.taskSnapshotRetryAttempts.clear();
+		this.taskSnapshotRevisions.clear();
+		await Promise.allSettled(this.taskSnapshotReconciliations.values());
+		this.taskSnapshotReconciliations.clear();
 		await this.transport.disconnect();
 		if (compactionError) throw compactionError;
 	}
@@ -354,6 +369,7 @@ export class DiscordRelayCore {
 					...(registration.subscribeOwnerToThread ? { subscribeOwner: true as const } : {}),
 				}),
 				registration.managerWake,
+				registration.managerTaskSnapshotTaskId,
 			);
 			const catchUp = this.inboundQueue.then(() => this.catchUp(registration.sessionId, mapping));
 			this.inboundQueue = catchUp.catch(() => {});
@@ -388,6 +404,7 @@ export class DiscordRelayCore {
 			controlIds: string[];
 			execute(request: { requestId: string; revision: string; controlId: string; command: string }): Promise<PiSessionControlResult>;
 		},
+		managerTaskSnapshotTaskId?: string,
 	): Promise<void> {
 		const reserved = this.reservedSessions.get(sessionId);
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
@@ -407,6 +424,7 @@ export class DiscordRelayCore {
 			cwd: mapping!.cwd,
 			threadId: mapping!.threadId,
 			managerTaskSummaryProducer,
+			...(managerTaskSnapshotTaskId ? { managerTaskSnapshotTaskId } : {}),
 			managerPresentationControlIds: managerPresentation?.controlIds.slice() ?? [],
 			summaryProducerOrder: this.nextSummaryProducerOrder++,
 			deliver,
@@ -432,6 +450,10 @@ export class DiscordRelayCore {
 			if (!this.deliverMessage(active, message)) break;
 		}
 		if (this.inboundCursorBlockedSessions.has(sessionId)) this.scheduleInboundRetry(sessionId);
+		if (managerTaskSnapshotTaskId && mapping?.managerTaskSnapshot?.desired.taskId === managerTaskSnapshotTaskId) {
+			this.taskSnapshotRevisions.set(sessionId, mapping.managerTaskSnapshot.desired.revision);
+			this.scheduleManagerTaskSnapshotReconciliation(sessionId);
+		}
 		if (managerTaskSummaryProducer) {
 			const owner = this.summaryOwners.get(active.cwd);
 			if (replaced && owner === replaced) this.retireManagerTaskSummaryOwner(active.cwd, replaced);
@@ -784,6 +806,26 @@ export class DiscordRelayCore {
 		if (this.summaryOwners.get(active.cwd) === active) await this.queueSummary(active, presentation.content, presentation);
 	}
 
+	async queueManagerTaskSnapshot(
+		clientId: string,
+		generation: string,
+		sessionId: string,
+		snapshot: ManagerTaskSnapshot,
+	): Promise<void> {
+		this.assertClientSession(clientId, generation, sessionId);
+		if (!isManagerTaskSnapshot(snapshot)) throw new Error("Discord manager task snapshot is invalid");
+		const active = this.activeSessions.get(sessionId)!;
+		if (!active.managerTaskSnapshotTaskId || active.managerTaskSnapshotTaskId !== snapshot.taskId) {
+			throw new Error("Local client is not registered for this manager task snapshot");
+		}
+		await this.taskSnapshotReconciliations.get(sessionId)?.catch(() => {});
+		const update = await this.state.setManagerTaskSnapshotDesired(sessionId, snapshot);
+		if (!update.accepted) return;
+		this.taskSnapshotRevisions.set(sessionId, snapshot.revision);
+		this.clearManagerTaskSnapshotRetry(sessionId);
+		this.scheduleManagerTaskSnapshotReconciliation(sessionId);
+	}
+
 	private async queueSummary(active: ActiveSession, text: string, presentation?: ManagerPresentation): Promise<void> {
 		await this.summaryOwnerRetirements.get(active.cwd)?.catch(() => {});
 		if (this.summaryOwners.get(active.cwd) !== active) return;
@@ -985,6 +1027,76 @@ export class DiscordRelayCore {
 		if (timer) clearTimeout(timer);
 		this.summaryRetryTimers.delete(cwd);
 		this.summaryRetryAttempts.delete(cwd);
+	}
+
+	private scheduleManagerTaskSnapshotReconciliation(sessionId: string): void {
+		const revision = this.taskSnapshotRevisions.get(sessionId);
+		if (!revision || this.taskSnapshotReconciliations.has(sessionId) ||
+			this.taskSnapshotRetryTimers.has(sessionId)) return;
+		let tracked: Promise<void>;
+		tracked = this.reconcileManagerTaskSnapshot(sessionId, revision)
+			.catch(() => this.scheduleManagerTaskSnapshotRetry(sessionId, revision))
+			.finally(() => {
+				if (this.taskSnapshotReconciliations.get(sessionId) === tracked) {
+					this.taskSnapshotReconciliations.delete(sessionId);
+				}
+			});
+		this.taskSnapshotReconciliations.set(sessionId, tracked);
+	}
+
+	private async reconcileManagerTaskSnapshot(sessionId: string, revision: string): Promise<void> {
+		for (let step = 0; step < 4 && this.started && this.taskSnapshotRevisions.get(sessionId) === revision; step++) {
+			const mapping = await this.state.getSession(sessionId);
+			const state = mapping?.managerTaskSnapshot;
+			if (!mapping || !state || state.desired.revision !== revision ||
+				this.taskSnapshotRevisions.get(sessionId) !== revision) return;
+			if (state.pendingSend) {
+				const pending = await this.state.prepareManagerTaskSnapshotSend(sessionId, revision);
+				if (!pending || this.taskSnapshotRevisions.get(sessionId) !== revision) return;
+				const messageId = await this.transport.sendText(mapping.threadId, pending.snapshot.content, pending.nonce);
+				await this.state.recordManagerTaskSnapshotSent(sessionId, pending.nonce, messageId, revision);
+				continue;
+			}
+			if (!state.delivery) {
+				await this.state.prepareManagerTaskSnapshotSend(sessionId, revision);
+				continue;
+			}
+			if (state.delivery.snapshot.revision === state.desired.revision) {
+				this.clearManagerTaskSnapshotRetry(sessionId);
+				return;
+			}
+			await this.transport.editOwnText(mapping.threadId, state.delivery.messageId, state.desired.content);
+			await this.state.recordManagerTaskSnapshotEdited(
+				sessionId,
+				state.delivery.messageId,
+				state.desired,
+				revision,
+			);
+		}
+		if (this.started && this.taskSnapshotRevisions.get(sessionId) === revision) {
+			this.scheduleManagerTaskSnapshotRetry(sessionId, revision);
+		}
+	}
+
+	private scheduleManagerTaskSnapshotRetry(sessionId: string, revision: string): void {
+		if (!this.started || this.taskSnapshotRevisions.get(sessionId) !== revision ||
+			this.taskSnapshotRetryTimers.has(sessionId)) return;
+		const attempt = (this.taskSnapshotRetryAttempts.get(sessionId) ?? 0) + 1;
+		this.taskSnapshotRetryAttempts.set(sessionId, attempt);
+		const delay = Math.min(TASK_SNAPSHOT_RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 7), TASK_SNAPSHOT_RETRY_MAX_MS);
+		const timer = setTimeout(() => {
+			this.taskSnapshotRetryTimers.delete(sessionId);
+			this.scheduleManagerTaskSnapshotReconciliation(sessionId);
+		}, delay);
+		timer.unref();
+		this.taskSnapshotRetryTimers.set(sessionId, timer);
+	}
+
+	private clearManagerTaskSnapshotRetry(sessionId: string): void {
+		const timer = this.taskSnapshotRetryTimers.get(sessionId);
+		if (timer) clearTimeout(timer);
+		this.taskSnapshotRetryTimers.delete(sessionId);
+		this.taskSnapshotRetryAttempts.delete(sessionId);
 	}
 
 	private async drainLifecycleUpdates(): Promise<void> {

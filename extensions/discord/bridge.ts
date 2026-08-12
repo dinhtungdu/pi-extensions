@@ -16,6 +16,7 @@ import {
 } from "./inbound-images.js";
 import type { ManagerPresentation } from "./manager-presentation.js";
 import type { ManagerWakeDescriptor } from "./manager-wake.js";
+import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
@@ -29,6 +30,7 @@ export interface BridgeSession {
 	sessionName?: string;
 	managerTaskSummaryProducer?: true;
 	managerWake?: ManagerWakeDescriptor | null;
+	managerTaskSnapshotTaskId?: string;
 	subscribeOwnerToThread?: true;
 }
 
@@ -166,6 +168,10 @@ export class DiscordBridge {
 
 	async publishManagerPresentation(presentation: ManagerPresentation): Promise<boolean> {
 		return this.relay.publishManagerPresentation(presentation);
+	}
+
+	async publishManagerTaskSnapshot(snapshot: ManagerTaskSnapshot): Promise<void> {
+		await this.relay.publishManagerTaskSnapshot(snapshot);
 	}
 
 	async updateManagerCatalogues(

@@ -24,6 +24,7 @@ import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
 import { ManagerPresentationProducer, type ManagerPresentation } from "./manager-presentation.js";
 import { ManagerControlExecutor } from "./manager-controls.js";
 import { managerWakeRegistration } from "./manager-wake.js";
+import { acceptedManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
 	MAX_SESSION_CONTROL_TEXT_LENGTH,
@@ -157,8 +158,19 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		let desiredPresentation: ManagerPresentation | undefined;
 		let publishingPresentation: Promise<void> | undefined;
 		let presentationPublishRequested = false;
+		let desiredTaskSnapshot: ManagerTaskSnapshot | undefined;
+		let publishingTaskSnapshot: Promise<void> | undefined;
+		let taskSnapshotPublishRequested = false;
+		let currentCtx: ExtensionContext | undefined;
 		let operation: Promise<void> = Promise.resolve();
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
+
+		const unsubscribeTaskSnapshots = pi.events.on("manager:task-snapshot", (value) => {
+			const snapshot = acceptedManagerTaskSnapshot(environment, value);
+			if (!snapshot || desiredTaskSnapshot?.revision === snapshot.revision) return;
+			desiredTaskSnapshot = snapshot;
+			if (currentCtx) publishTaskSnapshot(currentCtx);
+		});
 
 		function modelCatalogue(ctx: ExtensionContext): PiModelCatalogueEntry[] {
 			const scoped = ctx.scopedModels.length > 0 ? ctx.scopedModels.map((entry) => entry.model) : ctx.modelRegistry.getAvailable();
@@ -231,6 +243,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					sessionId: ctx.sessionManager.getSessionId(),
 					sessionName: pi.getSessionName() ?? await discoverTaskTitle(project.checkoutRoot),
 					...(managerWake !== undefined ? { managerWake } : {}),
+					...(environment.THE_MANAGER_ROLE === "middle-manager" && environment.THE_MANAGER_TASK_ID
+						? { managerTaskSnapshotTaskId: environment.THE_MANAGER_TASK_ID } : {}),
 					...(shouldSubscribeOwnerToMiddleManagerThread(environment) ? { subscribeOwnerToThread: true as const } : {}),
 				},
 			};
@@ -261,6 +275,31 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			});
 		}
 
+		function publishTaskSnapshot(ctx: ExtensionContext): void {
+			if (!desiredTaskSnapshot || !bridge?.status().connected) return;
+			if (publishingTaskSnapshot) {
+				taskSnapshotPublishRequested = true;
+				return;
+			}
+			publishingTaskSnapshot = (async () => {
+				do {
+					taskSnapshotPublishRequested = false;
+					const active = bridge;
+					const snapshot = desiredTaskSnapshot;
+					if (!active || !snapshot || !active.status().connected) return;
+					try {
+						await active.publishManagerTaskSnapshot(snapshot);
+					} catch (error) {
+						ctx.ui.notify(`Discord manager task-snapshot update deferred: ${errorMessage(error)}`, "warning");
+						return;
+					}
+				} while (taskSnapshotPublishRequested);
+			})().finally(() => {
+				publishingTaskSnapshot = undefined;
+				if (taskSnapshotPublishRequested) publishTaskSnapshot(ctx);
+			});
+		}
+
 		function setConnectedStatus(ctx: ExtensionContext): void {
 			const status = bridge?.status();
 			ctx.ui.setStatus(
@@ -279,6 +318,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			managerProjectCatalogue = [];
 			desiredPresentation = undefined;
 			presentationPublishRequested = false;
+			taskSnapshotPublishRequested = false;
 			const active = bridge;
 			bridge = undefined;
 			await active?.stop();
@@ -352,6 +392,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 						if (status.connected) {
 							taskSummaryProducer?.requestRefresh(0);
 							presentationProducer?.requestRefresh(0);
+							publishTaskSnapshot(ctx);
 						}
 					},
 					supportsImageInput: () => ctx.model?.input?.includes("image") === true,
@@ -427,6 +468,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				bridge = candidate;
 				await candidate.start();
 				setConnectedStatus(ctx);
+				publishTaskSnapshot(ctx);
 				taskSummaryProducer = managerProducer;
 				presentationProducer = managerPresentationProducer;
 				taskSummaryProducer?.start();
@@ -496,13 +538,16 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		}
 
 		pi.on("session_start", async (_event, ctx) => {
+			currentCtx = ctx;
 			await serialize(() => autoStartForCwd(ctx.cwd) ? startBridge(ctx, false) : stopBridge(ctx));
 		});
 
 		pi.on("session_shutdown", async (_event, ctx) => {
+			unsubscribeTaskSnapshots();
 			for (const timer of inboundAcceptanceTimers) clearTimeout(timer);
 			inboundAcceptanceTimers.clear();
 			await serialize(() => stopBridge(ctx));
+			if (currentCtx === ctx) currentCtx = undefined;
 		});
 
 		pi.on("input", async (event, ctx) => {

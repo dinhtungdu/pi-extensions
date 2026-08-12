@@ -7,6 +7,7 @@ import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reacti
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
 import { isManagerPresentation, type ManagerPresentation } from "./manager-presentation.js";
 import { isManagerWakeDescriptor, type ManagerWakeDescriptor } from "./manager-wake.js";
+import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 
 const STATE_VERSION = 1;
 export const MAX_RECENT_MESSAGE_IDS = 2_000;
@@ -84,6 +85,18 @@ export interface RetainedInboundImages {
 	images: QueuedInboundImage[];
 }
 
+export interface ManagerTaskSnapshotState {
+	desired: ManagerTaskSnapshot;
+	delivery?: {
+		messageId: string;
+		snapshot: ManagerTaskSnapshot;
+	};
+	pendingSend?: {
+		nonce: string;
+		snapshot: ManagerTaskSnapshot;
+	};
+}
+
 export interface SessionThreadMapping {
 	cwd: string;
 	channelId: string;
@@ -95,6 +108,8 @@ export interface SessionThreadMapping {
 	outboundMessages: OutboundMessage[];
 	lifecycleMessages: DiscordLifecycleMessage[];
 	managerWake?: ManagerWakeDescriptor | null;
+	managerTaskSnapshotTaskId?: string;
+	managerTaskSnapshot?: ManagerTaskSnapshotState;
 }
 
 export interface DiscordBridgeState {
@@ -176,6 +191,38 @@ function parsePendingMessages(value: unknown, file: string): QueuedDiscordMessag
 			...(images?.length ? { images: images.map((image) => ({ ...image })) } : {}),
 		};
 	});
+}
+
+function parseManagerTaskSnapshotState(value: unknown, file: string): ManagerTaskSnapshotState | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value) || !isManagerTaskSnapshot(value.desired)) {
+		throw new Error(`Discord bridge state ${file} has an invalid manager task snapshot`);
+	}
+	let delivery: ManagerTaskSnapshotState["delivery"];
+	if (value.delivery !== undefined) {
+		if (!isRecord(value.delivery) || typeof value.delivery.messageId !== "string" ||
+			!isManagerTaskSnapshot(value.delivery.snapshot)) {
+			throw new Error(`Discord bridge state ${file} has an invalid delivered manager task snapshot`);
+		}
+		delivery = { messageId: value.delivery.messageId, snapshot: structuredClone(value.delivery.snapshot) };
+	}
+	let pendingSend: ManagerTaskSnapshotState["pendingSend"];
+	if (value.pendingSend !== undefined) {
+		if (!isRecord(value.pendingSend) || typeof value.pendingSend.nonce !== "string" ||
+			!isManagerTaskSnapshot(value.pendingSend.snapshot)) {
+			throw new Error(`Discord bridge state ${file} has an invalid pending manager task snapshot`);
+		}
+		pendingSend = { nonce: value.pendingSend.nonce, snapshot: structuredClone(value.pendingSend.snapshot) };
+	}
+	if (delivery?.snapshot.taskId !== undefined && delivery.snapshot.taskId !== value.desired.taskId ||
+		pendingSend?.snapshot.taskId !== undefined && pendingSend.snapshot.taskId !== value.desired.taskId) {
+		throw new Error(`Discord bridge state ${file} has inconsistent manager task snapshot identities`);
+	}
+	return {
+		desired: structuredClone(value.desired),
+		...(delivery ? { delivery } : {}),
+		...(pendingSend ? { pendingSend } : {}),
+	};
 }
 
 function parseRetainedImages(value: unknown, file: string): RetainedInboundImages[] {
@@ -276,7 +323,9 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 			(mapping.lastActiveAt !== undefined && (!Number.isSafeInteger(mapping.lastActiveAt) || Number(mapping.lastActiveAt) < 0)) ||
 			(mapping.lastMessageId !== undefined && typeof mapping.lastMessageId !== "string") ||
 			(mapping.threadCursors !== undefined && !isRecord(mapping.threadCursors)) ||
-			(mapping.managerWake !== undefined && mapping.managerWake !== null && !isManagerWakeDescriptor(mapping.managerWake))
+			(mapping.managerWake !== undefined && mapping.managerWake !== null && !isManagerWakeDescriptor(mapping.managerWake)) ||
+			(mapping.managerTaskSnapshotTaskId !== undefined &&
+				(typeof mapping.managerTaskSnapshotTaskId !== "string" || mapping.managerTaskSnapshotTaskId.length === 0))
 		) {
 			throw new Error(`Discord bridge state ${file} has an invalid session mapping`);
 		}
@@ -290,6 +339,10 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 		if (typeof mapping.lastMessageId === "string" && !threadCursors[mapping.threadId]) {
 			threadCursors[mapping.threadId] = mapping.lastMessageId;
 		}
+		const managerTaskSnapshot = parseManagerTaskSnapshotState(mapping.managerTaskSnapshot, file);
+		if (managerTaskSnapshot && mapping.managerTaskSnapshotTaskId !== managerTaskSnapshot.desired.taskId) {
+			throw new Error(`Discord bridge state ${file} has an invalid manager task snapshot identity`);
+		}
 		sessions[sessionId] = {
 			cwd: mapping.cwd,
 			channelId: mapping.channelId,
@@ -302,6 +355,9 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 			lifecycleMessages: parseLifecycleMessages(mapping.lifecycleMessages, file, fallbackActivityAt),
 			...(mapping.managerWake === null ? { managerWake: null } :
 				isManagerWakeDescriptor(mapping.managerWake) ? { managerWake: { ...mapping.managerWake } } : {}),
+			...(typeof mapping.managerTaskSnapshotTaskId === "string"
+				? { managerTaskSnapshotTaskId: mapping.managerTaskSnapshotTaskId } : {}),
+			...(managerTaskSnapshot ? { managerTaskSnapshot } : {}),
 		};
 	}
 
@@ -336,7 +392,8 @@ function compactState(state: DiscordBridgeState, now: number, protectedSessionId
 		.map(([sessionId]) => sessionId));
 	for (const [sessionId, session] of Object.entries(state.sessions)) {
 		const hasQueuedWork = session.pendingMessages.length > 0 || session.outboundMessages.length > 0 ||
-			session.retainedImages.length > 0 || session.lifecycleMessages.some((message) => !isCompletedLifecycle(message.status));
+			session.retainedImages.length > 0 || session.managerTaskSnapshot !== undefined ||
+			session.lifecycleMessages.some((message) => !isCompletedLifecycle(message.status));
 		if (session.lastActiveAt < retentionCutoff && !latestSessionIds.has(sessionId) &&
 			!protectedSessionIds.has(sessionId) && !hasQueuedWork) {
 			delete state.sessions[sessionId];
@@ -420,9 +477,14 @@ export class DiscordStateStore {
 		channelId: string,
 		resolve: (existingThreadId: string | undefined) => Promise<string>,
 		managerWake?: ManagerWakeDescriptor | null,
+		managerTaskSnapshotTaskId?: string,
 	): Promise<SessionThreadMapping> {
 		return this.mutate(async (state) => {
 			const existing = state.sessions[sessionId];
+			if (managerTaskSnapshotTaskId && existing?.managerTaskSnapshotTaskId &&
+				existing.managerTaskSnapshotTaskId !== managerTaskSnapshotTaskId) {
+				throw new Error(`Pi session ${sessionId} changed manager task snapshot identity`);
+			}
 			const sameParent = existing?.cwd === cwd && existing.channelId === channelId;
 			const threadId = await resolve(sameParent ? existing.threadId : undefined);
 			const outboundMessages = existing?.outboundMessages ?? [];
@@ -440,6 +502,9 @@ export class DiscordStateStore {
 				...(managerWake === null ? { managerWake: existing?.managerWake ?? null } :
 					managerWake ? { managerWake: { ...managerWake } } :
 						existing?.managerWake !== undefined ? { managerWake: existing.managerWake } : {}),
+				...(managerTaskSnapshotTaskId ? { managerTaskSnapshotTaskId } :
+					existing?.managerTaskSnapshotTaskId ? { managerTaskSnapshotTaskId: existing.managerTaskSnapshotTaskId } : {}),
+				...(existing?.managerTaskSnapshot ? { managerTaskSnapshot: existing.managerTaskSnapshot } : {}),
 			};
 			state.sessions[sessionId] = mapping;
 			return structuredClone(mapping);
@@ -557,6 +622,71 @@ export class DiscordStateStore {
 			const summary = state.projects[cwd]?.summary;
 			if (summary?.delivery?.messageId === messageId &&
 				(expectedRevision === undefined || summary.revision === expectedRevision)) delete summary.delivery;
+		});
+	}
+
+	async setManagerTaskSnapshotDesired(
+		sessionId: string,
+		snapshot: ManagerTaskSnapshot,
+	): Promise<{ accepted: boolean; revision: string }> {
+		if (!isManagerTaskSnapshot(snapshot)) throw new Error("Discord manager task snapshot is invalid");
+		return this.mutate(async (state) => {
+			const session = state.sessions[sessionId];
+			if (!session || session.managerTaskSnapshotTaskId !== snapshot.taskId) {
+				throw new Error(`Pi session ${sessionId} is not mapped to manager task ${snapshot.taskId}`);
+			}
+			session.lastActiveAt = this.now();
+			if (session.managerTaskSnapshot?.desired.revision === snapshot.revision) {
+				return { accepted: false, revision: snapshot.revision };
+			}
+			if (session.managerTaskSnapshot) session.managerTaskSnapshot.desired = structuredClone(snapshot);
+			else session.managerTaskSnapshot = { desired: structuredClone(snapshot) };
+			return { accepted: true, revision: snapshot.revision };
+		});
+	}
+
+	async prepareManagerTaskSnapshotSend(
+		sessionId: string,
+		expectedRevision: string,
+	): Promise<ManagerTaskSnapshotState["pendingSend"] | undefined> {
+		return this.mutate(async (state) => {
+			const snapshot = state.sessions[sessionId]?.managerTaskSnapshot;
+			if (!snapshot || snapshot.desired.revision !== expectedRevision || snapshot.delivery) return undefined;
+			if (!snapshot.pendingSend) snapshot.pendingSend = {
+				nonce: projectSummaryNonce(),
+				snapshot: structuredClone(snapshot.desired),
+			};
+			else if (!isValidDiscordNonce(snapshot.pendingSend.nonce)) snapshot.pendingSend.nonce = projectSummaryNonce();
+			return structuredClone(snapshot.pendingSend);
+		});
+	}
+
+	async recordManagerTaskSnapshotSent(
+		sessionId: string,
+		nonce: string,
+		messageId: string,
+		expectedRevision: string,
+	): Promise<void> {
+		await this.mutate(async (state) => {
+			const snapshot = state.sessions[sessionId]?.managerTaskSnapshot;
+			if (!snapshot?.pendingSend || snapshot.pendingSend.nonce !== nonce ||
+				snapshot.desired.revision !== expectedRevision) return;
+			snapshot.delivery = { messageId, snapshot: structuredClone(snapshot.pendingSend.snapshot) };
+			delete snapshot.pendingSend;
+		});
+	}
+
+	async recordManagerTaskSnapshotEdited(
+		sessionId: string,
+		messageId: string,
+		delivered: ManagerTaskSnapshot,
+		expectedRevision: string,
+	): Promise<void> {
+		await this.mutate(async (state) => {
+			const snapshot = state.sessions[sessionId]?.managerTaskSnapshot;
+			if (snapshot?.delivery?.messageId === messageId && snapshot.desired.revision === expectedRevision) {
+				snapshot.delivery.snapshot = structuredClone(delivered);
+			}
 		});
 	}
 

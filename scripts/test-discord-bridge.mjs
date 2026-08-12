@@ -58,6 +58,7 @@ class FakeGateway {
 	static summaryEvents = [];
 	static failDeleteOnce = new Set();
 	static failEditOnce = new Set();
+	static nextThreadId = 0;
 
 	connected = false;
 	listeners = new Set();
@@ -70,7 +71,6 @@ class FakeGateway {
 	projectRequests = [];
 	threadRequests = [];
 	sent = [];
-	threadCounter = 0;
 
 	constructor() {
 		FakeGateway.instances.push(this);
@@ -157,7 +157,7 @@ class FakeGateway {
 	async ensureSessionThread(request) {
 		this.threadRequests.push(request);
 		if (request.mappedThreadId && !FakeGateway.deletedThreads.has(request.mappedThreadId)) return request.mappedThreadId;
-		return `thread-${++this.threadCounter}-${request.name.slice(-8)}`;
+		return `thread-${++FakeGateway.nextThreadId}-${request.name.slice(-8)}`;
 	}
 
 	async fetchMessagesAfter(threadId, afterId) {
@@ -268,6 +268,7 @@ function createExtensionHarness(extension, {
 	trackConcurrentUserAcceptance = false,
 }) {
 	const events = new Map();
+	const eventBus = new EventEmitter();
 	const commands = new Map();
 	const entryRenderers = new Map();
 	const notifications = [];
@@ -286,6 +287,13 @@ function createExtensionHarness(extension, {
 	let pendingUserAcceptances = 0;
 	const processingErrors = [];
 	const pi = {
+		events: {
+			emit: (name, value) => eventBus.emit(name, value),
+			on(name, listener) {
+				eventBus.on(name, listener);
+				return () => eventBus.off(name, listener);
+			},
+		},
 		on(name, handler) {
 			const handlers = events.get(name) ?? [];
 			handlers.push(handler);
@@ -367,6 +375,7 @@ function createExtensionHarness(extension, {
 		thinkingLevel: () => thinkingLevel,
 		setInjectionError(value) { injectionError = value; },
 		setSessionName(value) { currentSessionName = value; },
+		emitBus(name, value) { return eventBus.emit(name, value); },
 		nextUserMessage() {
 			return new Promise((resolveMessage) => userWaiters.push(resolveMessage));
 		},
@@ -442,6 +451,11 @@ try {
 	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
 	const { managerWakeRegistration, wakeManagerSession } = await importBuilt("extensions/discord/manager-wake.js");
 	const {
+		acceptedManagerTaskSnapshot,
+		isManagerTaskSnapshot,
+		MAX_MANAGER_TASK_SNAPSHOT_CONTENT,
+	} = await importBuilt("extensions/discord/manager-task-snapshot.js");
+	const {
 		MAX_MANAGER_PROJECT_CATALOGUE_ITEMS,
 		MAX_MANAGER_TARGET_AUTOCOMPLETE_CHOICES,
 		MAX_MANAGER_TASK_AUTOCOMPLETE_CHOICES,
@@ -504,6 +518,28 @@ try {
 	}), false, "fresh review workers must not request owner subscription");
 	assert.equal(shouldSubscribeOwnerToMiddleManagerThread({}), false,
 		"ordinary sessions must not request owner subscription");
+
+	const taskSnapshot = {
+		schemaVersion: 1,
+		revision: "1".repeat(64),
+		taskId: "wake-task",
+		title: "Opaque task title",
+		status: "opaque-status",
+		content: "exact snapshot @everyone\nstatus: do not parse",
+	};
+	assert.equal(isManagerTaskSnapshot(taskSnapshot), true);
+	assert.deepEqual(acceptedManagerTaskSnapshot({
+		THE_MANAGER_ROLE: "middle-manager", THE_MANAGER_TASK_ID: "wake-task",
+	}, taskSnapshot), taskSnapshot);
+	assert.equal(acceptedManagerTaskSnapshot({ THE_MANAGER_ROLE: "worker", THE_MANAGER_TASK_ID: "wake-task" }, taskSnapshot), undefined);
+	assert.equal(acceptedManagerTaskSnapshot({ THE_MANAGER_ROLE: "middle-manager", THE_MANAGER_TASK_ID: "other-task" }, taskSnapshot), undefined);
+	for (const malformed of [
+		{ ...taskSnapshot, schemaVersion: 2 },
+		{ ...taskSnapshot, revision: "A".repeat(64) },
+		{ ...taskSnapshot, content: "" },
+		{ ...taskSnapshot, content: "x".repeat(MAX_MANAGER_TASK_SNAPSHOT_CONTENT + 1) },
+		{ ...taskSnapshot, extra: true },
+	]) assert.equal(isManagerTaskSnapshot(malformed), false, "malformed task snapshots must fail closed");
 
 	const wakeRoot = join(dataDir, "manager-wake-root");
 	const wakeSocket = join(wakeRoot, ".manager", "supervisor.sock");
@@ -651,6 +687,97 @@ try {
 	assert.equal(wakeRequests.length, 3, "relay restart must not replay persisted Manager wakes");
 	await restartWakeCore.stop();
 
+	const snapshotStateFile = join(dataDir, "manager-task-snapshot-state.json");
+	const snapshotState = new DiscordStateStore(snapshotStateFile);
+	const snapshotGateway = new FakeGateway();
+	snapshotGateway.ensureProjectChannel = async () => "snapshot-channel";
+	snapshotGateway.ensureSessionThread = async () => "snapshot-thread";
+	const snapshotCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, snapshotState, snapshotGateway,
+	);
+	await snapshotCore.start();
+	await snapshotCore.prepareRegistration("snapshot-client", "snapshot-generation", {
+		cwd: "/snapshot", projectIdentityResolved: true, sessionId: "snapshot-session",
+		managerTaskSnapshotTaskId: "wake-task",
+	});
+	await snapshotCore.activateRegistration(
+		"snapshot-client", "snapshot-generation", "snapshot-session", () => true,
+		undefined, false, undefined, false, undefined, "wake-task",
+	);
+	FakeGateway.failOnceTexts.add(taskSnapshot.content);
+	await snapshotCore.queueManagerTaskSnapshot(
+		"snapshot-client", "snapshot-generation", "snapshot-session", taskSnapshot,
+	);
+	await waitFor(() => FakeGateway.sendAttempts.get(taskSnapshot.content) === 1, "failed task snapshot send");
+	let persistedSnapshot = (await snapshotState.getSession("snapshot-session")).managerTaskSnapshot;
+	assert.equal(persistedSnapshot.desired.content, taskSnapshot.content);
+	assert.equal(persistedSnapshot.delivery, undefined);
+	assert.equal(persistedSnapshot.pendingSend.snapshot.revision, taskSnapshot.revision,
+		"failed sends must retain durable desired and nonce-bound pending state");
+	const pendingSnapshotNonce = persistedSnapshot.pendingSend.nonce;
+	await snapshotCore.stop();
+
+	const restartedSnapshotGateway = new FakeGateway();
+	restartedSnapshotGateway.ensureProjectChannel = async () => "snapshot-channel";
+	restartedSnapshotGateway.ensureSessionThread = async () => "snapshot-thread";
+	const restartedSnapshotState = new DiscordStateStore(snapshotStateFile);
+	const restartedSnapshotCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, restartedSnapshotState, restartedSnapshotGateway,
+	);
+	await restartedSnapshotCore.start();
+	await restartedSnapshotCore.prepareRegistration("snapshot-client-2", "snapshot-generation-2", {
+		cwd: "/snapshot", projectIdentityResolved: true, sessionId: "snapshot-session",
+		managerTaskSnapshotTaskId: "wake-task",
+	});
+	await restartedSnapshotCore.activateRegistration(
+		"snapshot-client-2", "snapshot-generation-2", "snapshot-session", () => true,
+		undefined, false, undefined, false, undefined, "wake-task",
+	);
+	await waitFor(async () => Boolean((await restartedSnapshotState.getSession("snapshot-session"))?.managerTaskSnapshot?.delivery),
+		"task snapshot restart reconciliation");
+	persistedSnapshot = (await restartedSnapshotState.getSession("snapshot-session")).managerTaskSnapshot;
+	const snapshotMessageId = persistedSnapshot.delivery.messageId;
+	assert.equal(persistedSnapshot.pendingSend, undefined);
+	assert.equal(persistedSnapshot.delivery.snapshot.content, taskSnapshot.content);
+	assert.equal(FakeGateway.nonceResults.get(pendingSnapshotNonce), snapshotMessageId,
+		"restart reconciliation must reuse persisted nonce without duplicate creation");
+	assert.equal((FakeGateway.channelMessages.get("snapshot-thread") ?? []).length, 1);
+
+	const nextTaskSnapshot = {
+		...taskSnapshot,
+		revision: "2".repeat(64),
+		title: "Ignored transport metadata",
+		status: "another-opaque-status",
+		content: "new exact snapshot content\n@here",
+	};
+	await restartedSnapshotCore.queueManagerTaskSnapshot(
+		"snapshot-client-2", "snapshot-generation-2", "snapshot-session", nextTaskSnapshot,
+	);
+	await waitFor(async () => (await restartedSnapshotState.getSession("snapshot-session"))
+		?.managerTaskSnapshot?.delivery?.snapshot.revision === nextTaskSnapshot.revision, "task snapshot edit");
+	persistedSnapshot = (await restartedSnapshotState.getSession("snapshot-session")).managerTaskSnapshot;
+	assert.equal(persistedSnapshot.delivery.messageId, snapshotMessageId, "later revisions must edit exact same message");
+	assert.equal(persistedSnapshot.delivery.snapshot.content, nextTaskSnapshot.content);
+	assert.equal((FakeGateway.channelMessages.get("snapshot-thread") ?? []).length, 1);
+	const snapshotEventCount = FakeGateway.summaryEvents.length;
+	await restartedSnapshotCore.queueManagerTaskSnapshot(
+		"snapshot-client-2", "snapshot-generation-2", "snapshot-session", { ...nextTaskSnapshot, content: "same revision ignored" },
+	);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+	assert.equal(FakeGateway.summaryEvents.length, snapshotEventCount, "duplicate revisions must be no-ops");
+	await assert.rejects(() => restartedSnapshotCore.queueManagerTaskSnapshot(
+		"snapshot-client-2", "snapshot-generation-2", "snapshot-session",
+		{ ...nextTaskSnapshot, revision: "3".repeat(64), taskId: "other-task" },
+	), /not registered for this manager task snapshot/, "cross-task relay frames must fail closed");
+	await restartedSnapshotCore.stop();
+
+	const malformedSnapshotStateFile = join(dataDir, "malformed-manager-task-snapshot-state.json");
+	const malformedSnapshotState = JSON.parse(await readFile(snapshotStateFile, "utf8"));
+	malformedSnapshotState.sessions["snapshot-session"].managerTaskSnapshot.desired.content = "";
+	await writeFile(malformedSnapshotStateFile, JSON.stringify(malformedSnapshotState));
+	await assert.rejects(() => new DiscordStateStore(malformedSnapshotStateFile).load(), /invalid manager task snapshot/,
+		"malformed persisted task snapshots must fail visibly");
+
 	const genericState = new DiscordStateStore(join(dataDir, "generic-offline-state.json"));
 	const genericGateway = new FakeGateway();
 	const genericCore = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, genericState, genericGateway);
@@ -753,12 +880,36 @@ try {
 		sessionId: "middle-manager",
 		sessionName: "Middle manager",
 	});
+	middleManager.emitBus("manager:task-snapshot", taskSnapshot);
+	middleManager.emitBus("manager:task-snapshot", { ...taskSnapshot, revision: "3".repeat(64), taskId: "other-task" });
+	middleManager.emitBus("manager:task-snapshot", { ...taskSnapshot, revision: "4".repeat(64), content: "" });
 	await middleManager.emit("session_start", { reason: "startup" });
+	await waitFor(async () => Boolean((await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager"))
+		?.managerTaskSnapshot?.delivery), "pre-registration manager task snapshot delivery");
 	const middleManagerMapping = await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager");
 	assert.deepEqual(middleManagerMapping.managerWake, wakeDescriptor,
 		"authenticated relay registration must bind the trusted descriptor to the exact Pi session");
 	assert.equal(middleManagerGateway.threadRequests[0].subscribeOwner, true,
 		"middle-manager metadata must request owner subscription");
+	assert.equal(middleManagerMapping.managerTaskSnapshotTaskId, taskSnapshot.taskId);
+	assert.equal(middleManagerMapping.managerTaskSnapshot.desired.content, taskSnapshot.content,
+		"event before bridge registration must retain exact latest accepted content");
+	assert.equal(middleManagerMapping.managerTaskSnapshot.delivery.snapshot.content, taskSnapshot.content);
+	const extensionSnapshotMessageId = middleManagerMapping.managerTaskSnapshot.delivery.messageId;
+	assert.equal((FakeGateway.channelMessages.get(middleManagerMapping.threadId) ?? [])
+		.find((message) => message.id === extensionSnapshotMessageId)?.text, taskSnapshot.content);
+	const extensionNextSnapshot = { ...taskSnapshot, revision: "5".repeat(64), content: "extension exact update\n@here" };
+	middleManager.emitBus("manager:task-snapshot", extensionNextSnapshot);
+	await waitFor(async () => (await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager"))
+		?.managerTaskSnapshot?.delivery?.snapshot.revision === extensionNextSnapshot.revision, "extension task snapshot edit");
+	const extensionUpdatedMapping = await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager");
+	assert.equal(extensionUpdatedMapping.managerTaskSnapshot.delivery.messageId, extensionSnapshotMessageId);
+	assert.equal(extensionUpdatedMapping.managerTaskSnapshot.delivery.snapshot.content, extensionNextSnapshot.content);
+	const extensionEventsBeforeDuplicate = FakeGateway.summaryEvents.length;
+	middleManager.emitBus("manager:task-snapshot", { ...extensionNextSnapshot, content: "duplicate revision ignored" });
+	await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+	assert.equal(FakeGateway.summaryEvents.length, extensionEventsBeforeDuplicate,
+		"extension duplicate revisions must not reach relay transport");
 	await middleManager.runCommand("discord", "reconnect");
 	assert.deepEqual(middleManagerGateway.threadRequests.at(-1), {
 		channelId: middleManagerMapping.channelId,
@@ -786,10 +937,13 @@ try {
 		sessionId: "retained-primary-worker",
 		sessionName: "Retained primary worker",
 	});
+	primaryWorker.emitBus("manager:task-snapshot", taskSnapshot);
 	await primaryWorker.emit("session_start", { reason: "startup" });
 	const primaryMapping = await new DiscordStateStore(primaryStateFile).getSession("retained-primary-worker");
 	assert.equal(primaryGateway.threadRequests[0].subscribeOwner, undefined,
 		"retained primary workers must not subscribe the owner");
+	assert.equal(primaryMapping.managerTaskSnapshotTaskId, undefined);
+	assert.equal(primaryMapping.managerTaskSnapshot, undefined, "non-middle-manager roles must reject task snapshot events");
 	await primaryWorker.runCommand("discord", "reconnect");
 	assert.deepEqual(primaryGateway.threadRequests.at(-1), {
 		channelId: primaryMapping.channelId,
@@ -3800,6 +3954,13 @@ try {
 		choice.value === "task:task-39"), "ask target filtering must search task IDs beyond the first unfiltered page");
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "summary" }), true);
 	assert.equal(isClientFrame({ type: "project_summary", requestId: "summary-request", text: "x".repeat(2_001) }), false);
+	assert.equal(isClientFrame({ type: "manager_task_snapshot", requestId: "task-snapshot-request", snapshot: taskSnapshot }), true);
+	assert.equal(isClientFrame({
+		type: "manager_task_snapshot", requestId: "task-snapshot-request", snapshot: { ...taskSnapshot, content: "" },
+	}), false);
+	assert.equal(isServerFrame({ type: "manager_task_snapshot_queued", requestId: "task-snapshot-request" }), true);
+	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, managerTaskSnapshotTaskId: "wake-task" }), true);
+	assert.equal(isClientFrame({ ...resolvedRegistrationFrame, managerTaskSnapshotTaskId: "" }), false);
 	const ipcPresentation = {
 		schemaVersion: 1, revision: "4".repeat(64), content: "opaque", degraded: false, warnings: [],
 		controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "github-refresh-reconcile" }],
@@ -3856,7 +4017,7 @@ try {
 		async prepareRegistration() {
 			return { channelId: "old-client-channel", threadId: "old-client-thread", cwd: "/workspace/the-manager" };
 		},
-		async activateRegistration(...args) { oldClientActivatedAsProducer = args.at(-2); },
+		async activateRegistration(...args) { oldClientActivatedAsProducer = args.at(-3); },
 		unregisterClient() {},
 		async resumeDelivery() {},
 		updateManagerCatalogues() {},
