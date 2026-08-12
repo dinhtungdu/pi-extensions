@@ -203,6 +203,15 @@ class FakeGateway {
 		return FakeGateway.channelMessages.get(channelId)?.at(-1)?.id;
 	}
 
+	async managerSummaryMessages(channelId) {
+		return (FakeGateway.channelMessages.get(channelId) ?? []).flatMap((message) => {
+			if (!message.botOwned) return [];
+			const match = /(?:^|\n)-# Manager summary · ([a-f0-9]{64}) · ([1-9]\d?)\/([1-9]\d?)$/.exec(message.text);
+			if (!match) return [];
+			return [{ id: message.id, revision: match[1], page: Number(match[2]), total: Number(match[3]) }];
+		});
+	}
+
 	async editOwnText(channelId, messageId, text) {
 		if (FakeGateway.failEditOnce.delete(messageId)) throw new Error("injected Discord edit failure");
 		const message = (FakeGateway.channelMessages.get(channelId) ?? []).find((candidate) => candidate.id === messageId);
@@ -461,6 +470,10 @@ try {
 		ManagerPresentationProducer,
 		parseManagerPresentationEnvelope,
 	} = await importBuilt("extensions/discord/manager-presentation.js");
+	const {
+		managerSummaryPageMetadata,
+		paginateManagerPresentation,
+	} = await importBuilt("extensions/discord/manager-summary-pages.js");
 	const {
 		MANAGER_CONTROL_PROCESS_TIMEOUT_MS,
 		ManagerControlExecutor,
@@ -2031,7 +2044,7 @@ try {
 		["mismatched command", { controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "task-reconcile-pr" }] }],
 		["bad revision", { revision: "A".repeat(64) }],
 		["empty content", { content: "" }],
-		["overlong content", { content: "x".repeat(2_001) }],
+		["overlong content", { content: "x".repeat(10_001) }],
 		["overlong label", { controls: [{ id: "github-refresh-reconcile", label: "x".repeat(81), style: "secondary", command: "github-refresh-reconcile" }] }],
 		["unknown style", { controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "link", command: "github-refresh-reconcile" }] }],
 	]) {
@@ -3505,139 +3518,99 @@ try {
 	const managerPresentationPayload = (revision, content, controls = [{ id: "github-refresh-reconcile",
 		label: "Refresh & Reconcile", style: "secondary", command: "github-refresh-reconcile" }]) =>
 		({ schemaVersion: 1, revision, content, controls, degraded: false, warnings: [] });
-	const teardownSummaryChannel = "teardown-summary-channel";
-	FakeGateway.channelMessages.delete(teardownSummaryChannel);
-	const teardownSummaryStateFile = join(dataDir, "teardown-summary-state.json");
-	const teardownSummaryState = new DiscordStateStore(teardownSummaryStateFile);
-	const teardownSummaryGateway = new FakeGateway();
-	teardownSummaryGateway.ensureProjectChannel = async () => teardownSummaryChannel;
-	const teardownSummaryCore = new DiscordRelayCore(
-		{ token: "token", guildId: "12345", epoch: 1 },
-		teardownSummaryState,
-		teardownSummaryGateway,
-	);
-	await teardownSummaryCore.start();
-	await teardownSummaryCore.prepareRegistration("teardown-summary-client", "teardown-summary-generation", {
-		cwd: "/teardown-manager",
-		projectIdentityResolved: true,
-		sessionId: "teardown-summary-session",
-	});
-	await teardownSummaryCore.activateRegistration(
-		"teardown-summary-client",
-		"teardown-summary-generation",
-		"teardown-summary-session",
-		() => true,
-		undefined,
-		false,
-		undefined,
-		true,
-		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "unused" }) },
-	);
-	const recordTeardownSummarySent = teardownSummaryState.recordProjectSummarySent.bind(teardownSummaryState);
-	let releaseTeardownRecord;
-	let teardownRecordStarted;
-	const teardownRecordAttempt = new Promise((resolveStarted) => { teardownRecordStarted = resolveStarted; });
-	let failTeardownRecord = true;
-	teardownSummaryState.recordProjectSummarySent = async (...args) => {
-		if (!failTeardownRecord) return recordTeardownSummarySent(...args);
-		failTeardownRecord = false;
-		teardownRecordStarted();
-		await new Promise((resolveRecord) => { releaseTeardownRecord = resolveRecord; });
-		throw new Error("injected teardown after accepted summary send");
-	};
-	const acceptedTeardownPresentation = managerPresentationPayload("6".repeat(64), "summary accepted before teardown");
-	await teardownSummaryCore.queueManagerPresentation(
-		"teardown-summary-client", "teardown-summary-generation", "teardown-summary-session", acceptedTeardownPresentation,
-	);
-	await teardownRecordAttempt;
-	const acceptedTeardownMessage = FakeGateway.channelMessages.get(teardownSummaryChannel).at(-1);
-	const pendingTeardownSummary = (await teardownSummaryState.projectSummaries())[0].summary.pendingSend;
-	assert.deepEqual(pendingTeardownSummary?.presentation, acceptedTeardownPresentation,
-		"accepted presentation send must retain its full components and durable pending nonce until recorded");
-	const compactTeardownSummaryState = teardownSummaryState.compact.bind(teardownSummaryState);
-	let teardownStopCompacted;
-	const teardownStopCompaction = new Promise((resolveCompacted) => { teardownStopCompacted = resolveCompacted; });
-	teardownSummaryState.compact = async (...args) => {
-		const result = await compactTeardownSummaryState(...args);
-		teardownStopCompacted();
-		return result;
-	};
-	const teardownStop = teardownSummaryCore.stop();
-	await teardownStopCompaction;
-	await new Promise((resolveTurn) => setImmediate(resolveTurn));
-	releaseTeardownRecord();
-	await teardownStop;
-	assert.equal(FakeGateway.sendAttempts.get("summary accepted before teardown"), 1,
-		"teardown must prevent the stopped relay from retrying uncertain summary transport");
-	assert.equal((await new DiscordStateStore(teardownSummaryStateFile).projectSummaries())[0].summary.pendingSend.nonce,
-		pendingTeardownSummary.nonce, "teardown must preserve the uncertain send nonce for restart recovery");
+	assert.equal(paginateManagerPresentation(managerPresentationPayload("4".repeat(64), "x".repeat(1_900))).length, 1,
+		"manager summary payload boundary must fit one page");
+	assert.equal(paginateManagerPresentation(managerPresentationPayload("5".repeat(64), "x".repeat(1_901))).length, 2,
+		"manager summary payload overflow must create another page");
+	const boundaryPresentation = managerPresentationPayload("6".repeat(64), `${"a".repeat(1_899)}😀${"b".repeat(2_100)}`);
+	const boundaryPages = paginateManagerPresentation(boundaryPresentation);
+	assert.ok(boundaryPages.length > 1, "long manager summaries must paginate");
+	assert.equal(boundaryPages.map((page) => page.payload).join(""), boundaryPresentation.content,
+		"pagination must preserve every opaque content character");
+	assert.ok(boundaryPages.every((page) => page.content.length <= 2_000), "every manager summary page must fit Discord");
+	assert.ok(boundaryPages.slice(0, -1).every((page) => page.presentation.controls.length === 0));
+	assert.deepEqual(boundaryPages.at(-1).presentation.controls, boundaryPresentation.controls,
+		"only final manager summary page may carry controls");
+	assert.deepEqual(boundaryPages.map((page) => managerSummaryPageMetadata(page.content)),
+		boundaryPages.map(({ revision, page, total }) => ({ revision, page, total })), "page metadata must round-trip");
+	assert.equal(managerSummaryPageMetadata("unrelated bot message"), undefined);
 
-	const teardownRestartGateway = new FakeGateway();
-	teardownRestartGateway.ensureProjectChannel = async () => teardownSummaryChannel;
-	const teardownRestartCore = new DiscordRelayCore(
-		{ token: "token", guildId: "12345", epoch: 1 },
-		new DiscordStateStore(teardownSummaryStateFile),
-		teardownRestartGateway,
+	const batchSummaryChannel = "batch-summary-channel";
+	FakeGateway.channelMessages.delete(batchSummaryChannel);
+	const batchSummaryState = new DiscordStateStore(join(dataDir, "batch-summary-state.json"));
+	const batchSummaryGateway = new FakeGateway();
+	batchSummaryGateway.ensureProjectChannel = async () => batchSummaryChannel;
+	const batchSummaryCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, batchSummaryState, batchSummaryGateway,
 	);
-	let teardownRestartSummaryOperations = 0;
-	for (const method of ["latestMessageId", "sendText", "sendPresentation", "editOwnText", "editOwnPresentation", "deleteOwnText"]) {
-		const original = teardownRestartGateway[method].bind(teardownRestartGateway);
-		teardownRestartGateway[method] = async (...args) => {
-			teardownRestartSummaryOperations++;
-			return original(...args);
-		};
-	}
-	await teardownRestartCore.start();
-	await teardownRestartCore.prepareRegistration("teardown-unrelated-client", "teardown-unrelated-generation", {
-		cwd: "/teardown-unrelated",
-		projectIdentityResolved: true,
-		sessionId: "teardown-unrelated-session",
+	await batchSummaryCore.start();
+	await batchSummaryCore.prepareRegistration("batch-summary-client", "batch-summary-generation", {
+		cwd: "/batch-manager", projectIdentityResolved: true, sessionId: "batch-summary-session",
 	});
-	await teardownRestartCore.activateRegistration(
-		"teardown-unrelated-client",
-		"teardown-unrelated-generation",
-		"teardown-unrelated-session",
-		() => true,
-	);
-	await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-	assert.equal(teardownRestartSummaryOperations, 0,
-		"an unrelated restarted session must not reconcile another project's pending summary nonce");
-	await teardownRestartCore.prepareRegistration("teardown-recovery-client", "teardown-recovery-generation", {
-		cwd: "/teardown-manager",
-		projectIdentityResolved: true,
-		sessionId: "teardown-recovery-session",
-	});
-	await teardownRestartCore.activateRegistration(
-		"teardown-recovery-client",
-		"teardown-recovery-generation",
-		"teardown-recovery-session",
-		() => true,
-		undefined,
-		false,
-		undefined,
-		true,
+	await batchSummaryCore.activateRegistration(
+		"batch-summary-client", "batch-summary-generation", "batch-summary-session", () => true,
+		undefined, false, undefined, true,
 		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "unused" }) },
 	);
-	const changedTeardownPresentation = managerPresentationPayload("7".repeat(64), "changed summary after restart");
-	await teardownRestartCore.queueManagerPresentation(
-		"teardown-recovery-client", "teardown-recovery-generation", "teardown-recovery-session", changedTeardownPresentation,
+	const oldBatch = managerPresentationPayload("7".repeat(64), "last-good manager batch");
+	const oldBatchRevision = paginateManagerPresentation(oldBatch)[0].revision;
+	await batchSummaryCore.queueManagerPresentation(
+		"batch-summary-client", "batch-summary-generation", "batch-summary-session", oldBatch,
 	);
-	await waitFor(async () => {
-		const summary = (await new DiscordStateStore(teardownSummaryStateFile).projectSummaries())[0]?.summary;
-		return summary?.delivery?.content === "changed summary after restart" && !summary.pendingSend;
-	}, "accepted teardown summary nonce recovery before changed restart summary");
-	assert.equal(FakeGateway.sendAttempts.get("summary accepted before teardown"), 2,
-		"restart must recover the accepted send with its durable nonce");
-	assert.equal(FakeGateway.sendAttempts.get("changed summary after restart"), undefined,
-		"changed desired text must edit the recovered send instead of creating a second summary");
-	assert.equal(FakeGateway.channelMessages.get(teardownSummaryChannel).filter((message) => message.botOwned).length, 1,
-		"teardown recovery and changed desired text must retain one bot summary");
-	assert.deepEqual(FakeGateway.channelMessages.get(teardownSummaryChannel).find((message) => message.botOwned), {
-		...acceptedTeardownMessage,
-		text: "changed summary after restart",
-		presentation: changedTeardownPresentation,
-	}, "restart recovery must update the originally accepted Discord message and components");
-	await teardownRestartCore.stop();
+	await waitFor(async () => (await batchSummaryState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === oldBatch.revision,
+		"initial manager summary batch");
+	const oldBatchId = FakeGateway.channelMessages.get(batchSummaryChannel).at(-1).id;
+	FakeGateway.channelMessages.get(batchSummaryChannel).push(
+		{ id: "unrelated-bot", text: "unrelated bot-authored message", botOwned: true },
+		{ id: "unrelated-human", text: "unrelated human message", botOwned: false },
+		{ id: "stale-page", text: `stale\n-# Manager summary · ${"8".repeat(64)} · 1/1`, botOwned: true },
+	);
+	const failedBatch = managerPresentationPayload("9".repeat(64), `failed replacement\n${"x".repeat(4_100)}`);
+	const failedBatchRevision = paginateManagerPresentation(failedBatch)[0].revision;
+	const sendTextForBatch = batchSummaryGateway.sendText.bind(batchSummaryGateway);
+	let replacementSendAttempts = 0;
+	let rejectReplacement = true;
+	batchSummaryGateway.sendText = async (...args) => {
+		if (args[1].includes(`Manager summary · ${failedBatchRevision}`) && ++replacementSendAttempts === 2 && rejectReplacement) {
+			throw new Error("injected manager summary page failure");
+		}
+		return sendTextForBatch(...args);
+	};
+	await batchSummaryCore.queueManagerPresentation(
+		"batch-summary-client", "batch-summary-generation", "batch-summary-session", failedBatch,
+	);
+	await waitFor(() => replacementSendAttempts >= 2, "partial manager summary send failure");
+	const retainedOldBatch = FakeGateway.channelMessages.get(batchSummaryChannel).find((message) => message.id === oldBatchId);
+	assert.deepEqual(retainedOldBatch?.presentation?.controls, oldBatch.controls,
+		"partial send failure must preserve usable last-good batch and control");
+	assert.equal((await batchSummaryGateway.managerSummaryMessages(batchSummaryChannel))
+		.filter((message) => message.revision === failedBatchRevision).length, 0,
+		"partial new batch pages must be removed best-effort");
+
+	rejectReplacement = false;
+	const replacementEventOffset = FakeGateway.summaryEvents.length;
+	await waitFor(async () => (await batchSummaryState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === failedBatch.revision,
+		"manager summary replacement retry");
+	const replacementEvents = FakeGateway.summaryEvents.slice(replacementEventOffset)
+		.filter((event) => event.channelId === batchSummaryChannel);
+	const lastSend = replacementEvents.map((event) => event.type).lastIndexOf("send");
+	const firstDelete = replacementEvents.findIndex((event) => event.type === "delete");
+	assert.ok(lastSend >= 0 && firstDelete > lastSend, "full new batch must send before any prior batch page deletion");
+	const deliveredBatchMessages = FakeGateway.channelMessages.get(batchSummaryChannel);
+	const deliveredBatchPages = await batchSummaryGateway.managerSummaryMessages(batchSummaryChannel);
+	assert.equal(deliveredBatchPages.filter((message) => message.revision === failedBatchRevision).length,
+		paginateManagerPresentation(failedBatch).length, "complete replacement must retain every new page");
+	assert.equal(deliveredBatchPages.some((message) => message.revision === oldBatchRevision || message.id === "stale-page"), false,
+		"replacement must delete old and stale summary pages");
+	assert.ok(deliveredBatchMessages.some((message) => message.id === "unrelated-bot"));
+	assert.ok(deliveredBatchMessages.some((message) => message.id === "unrelated-human"),
+		"replacement must preserve unrelated messages");
+	const deliveredPresentations = deliveredBatchMessages.filter((message) =>
+		managerSummaryPageMetadata(message.text)?.revision === failedBatchRevision);
+	assert.ok(deliveredPresentations.slice(0, -1).every((message) => !message.presentation));
+	assert.deepEqual(deliveredPresentations.at(-1).presentation.controls, failedBatch.controls,
+		"only final delivered page may carry Refresh & Reconcile");
+	await batchSummaryCore.stop();
 
 	const presentationStateFile = join(dataDir, "presentation-state.json");
 	const presentationState = new DiscordStateStore(presentationStateFile);
@@ -3666,7 +3639,7 @@ try {
 	await presentationCore.queueManagerPresentation(
 		"presentation-client", "presentation-generation", "presentation-session", firstPresentation);
 	const presentationMapping = await presentationState.getSession("presentation-session");
-	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.revision === firstPresentation.revision,
+	await waitFor(async () => (await presentationState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === firstPresentation.revision,
 		"manager presentation delivery with components");
 	const deliveredPresentation = FakeGateway.channelMessages.get(presentationMapping.channelId).at(-1);
 	assert.equal(FakeGateway.channelMessages.get(presentationMapping.channelId).length, 1, "one manager presentation message");
@@ -3703,7 +3676,7 @@ try {
 	const componentlessPresentation = managerPresentationPayload("3".repeat(64), "opaque presentation two", []);
 	await presentationCore.queueManagerPresentation(
 		"presentation-client", "presentation-generation", "presentation-session", componentlessPresentation);
-	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.revision === componentlessPresentation.revision,
+	await waitFor(async () => (await presentationState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === componentlessPresentation.revision,
 		"explicit manager component removal");
 	assert.deepEqual(FakeGateway.channelMessages.get(presentationMapping.channelId).at(-1).presentation.controls, [],
 		"editing to zero controls must explicitly persist an empty component presentation");
@@ -3712,7 +3685,7 @@ try {
 	const ownerLossPresentation = managerPresentationPayload("5".repeat(64), "owner-loss payload");
 	await presentationCore.queueManagerPresentation(
 		"presentation-client", "presentation-generation", "presentation-session", ownerLossPresentation);
-	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.revision === ownerLossPresentation.revision,
+	await waitFor(async () => (await presentationState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === ownerLossPresentation.revision,
 		"owner-loss presentation delivery");
 	const ownerLossMessage = FakeGateway.channelMessages.get(presentationMapping.channelId).at(-1);
 	await presentationCore.prepareRegistration("backup-client", "backup-generation",
@@ -3730,7 +3703,8 @@ try {
 	assert.deepEqual(await ownerLossControl, { ok: false,
 		message: "The manager presentation owner disconnected while the control was running." },
 	"owner loss must fence stale completion");
-	await waitFor(() => FakeGateway.channelMessages.get(presentationMapping.channelId)?.at(-1)?.presentation?.revision === backupPresentation.revision, "backup owner publication");
+	await waitFor(async () => (await presentationState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === backupPresentation.revision,
+		"backup owner publication");
 	assert.equal(FakeGateway.channelMessages.get(presentationMapping.channelId).filter((message) => message.botOwned).length, 1);
 	assert.deepEqual(FakeGateway.channelMessages.get(presentationMapping.channelId).at(-1).presentation.controls, backupPresentation.controls);
 	presentationCore.unregisterClient("backup-client", "backup-generation");
@@ -4311,6 +4285,12 @@ try {
 		controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "github-refresh-reconcile" }],
 	};
 	assert.equal(isClientFrame({ type: "manager_presentation", requestId: "presentation-request", presentation: ipcPresentation }), true);
+	assert.equal(isClientFrame({ type: "manager_presentation", requestId: "long-presentation", presentation: {
+		...ipcPresentation, content: "x".repeat(10_000),
+	} }), true, "complete bounded Manager presentations must cross relay IPC before Discord pagination");
+	assert.equal(isClientFrame({ type: "manager_presentation", requestId: "overlong-presentation", presentation: {
+		...ipcPresentation, content: "x".repeat(10_001),
+	} }), false);
 	assert.equal(isClientFrame({ type: "manager_presentation", requestId: "presentation-request", presentation: {
 		...ipcPresentation, controls: [{ ...ipcPresentation.controls[0], command: "status" }],
 	} }), false);
@@ -5033,7 +5013,8 @@ try {
 	assert.equal(FakeGateway.summaryEvents.filter((event) =>
 		event.channelId === "extension-terminal-thread").length, extensionTerminalEventCount,
 		"replayed extension terminal events must be durable no-ops");
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "opaque manager payload @everyone",
+	const managerSummaryState = () => sharedState.projectSummaryByChannel(managerSummaryMapping.channelId);
+	await waitFor(async () => (await managerSummaryState())?.summary.delivery?.content === "opaque manager payload @everyone",
 		"automatic initial manager presentation");
 	const canonicalSummaryCommand = "/github-refresh-reconcile";
 	const settleManagerCommand = async (stopReason = "stop") => {
@@ -5043,9 +5024,9 @@ try {
 		await managerSummarySession.emit("agent_settled", {});
 	};
 	assert.deepEqual(JSON.parse(await readFile(join(managerFixture, "summary-render-args.json"), "utf8")),
-		["summary-render", "--root", await realpath(managerFixture), "--max-chars", "2000"], "exact summary-render command");
+		["summary-render", "--root", await realpath(managerFixture), "--max-chars", "10000"], "exact summary-render command");
 	const managerSummaryMessage = FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1);
-	const managerSummaryMessageId = managerSummaryMessage.id;
+	let managerSummaryMessageId = managerSummaryMessage.id;
 	assert.deepEqual(managerSummaryMessage.presentation.controls.map(({ id, label, command }) => ({ id, label, command })), [{
 		id: "github-refresh-reconcile", label: "Refresh & Reconcile", command: "github-refresh-reconcile",
 	}], "the opaque manager presentation must render the sole canonical control");
@@ -5054,19 +5035,21 @@ try {
 		{ action: "continue" }, "the exact TUI prompt-template command must retain normal Pi handling");
 	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("b".repeat(64), fullSummary))}\n`);
 	await writeFile(join(managerFixture, "data", "tasks", "tui-command-active.md"), "changed during TUI command\n");
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === fullSummary,
-		"single canonical task lifecycle change must automatically edit the manager summary");
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
-		"automatic lifecycle publication must edit the existing manager summary message");
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).filter((message) => message.botOwned).length, 1,
-		"automatic lifecycle publication must not post a duplicate manager summary");
+	await waitFor(async () => (await managerSummaryState())?.summary.delivery?.content === fullSummary,
+		"single canonical task lifecycle change must automatically replace the manager summary batch");
+	const fullSummaryPages = paginateManagerPresentation(parseManagerPresentationEnvelope(managerPresentation("b".repeat(64), fullSummary)));
+	const fullSummaryMessages = FakeGateway.channelMessages.get(managerSummaryMapping.channelId).filter((message) => message.botOwned);
+	assert.equal(fullSummaryMessages.length, fullSummaryPages.length, "long automatic publication must retain every page");
+	assert.equal(fullSummaryMessages.some((message) => message.id === managerSummaryMessageId), false,
+		"automatic lifecycle publication must replace the prior batch after new pages succeed");
+	managerSummaryMessageId = fullSummaryMessages.at(-1).id;
 	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive" }),
 		{ action: "handled" }, "a second canonical TUI command must be rejected while one is active");
 	await settleManagerCommand();
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === fullSummary,
+	await waitFor(async () => (await managerSummaryState())?.summary.delivery?.content === fullSummary,
 		"complete untruncated TUI-origin summary publication");
 	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
-		"TUI-origin publication must edit the configured manager summary message");
+		"duplicate TUI-origin publication must retain the complete configured batch");
 	assert.deepEqual(await managerSummarySession.emit("input", { text: `${canonicalSummaryCommand} extra`, source: "interactive" }),
 		{ action: "continue" }, "commands with arguments must not enter manager-summary correlation");
 
@@ -5086,10 +5069,10 @@ try {
 	const discordSummary = "Discord-origin complete summary";
 	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("c".repeat(64), discordSummary))}\n`);
 	await writeFile(join(managerFixture, "data", "tasks", "discord-command-active.md"), "changed during Discord command\n");
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === discordSummary,
-		"Discord-origin canonical task change must automatically edit the manager summary");
+	await waitFor(async () => (await managerSummaryState())?.summary.delivery?.content === discordSummary,
+		"Discord-origin canonical task change must automatically replace the manager summary");
 	await settleManagerCommand();
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === discordSummary,
+	await waitFor(async () => (await managerSummaryState())?.summary.delivery?.content === discordSummary,
 		"Discord-origin summary publication after correlated settlement");
 	await assert.rejects(() => readFile(join(managerFixture, "forbidden-direct-command.txt"), "utf8"), { code: "ENOENT" });
 	await assert.rejects(() => readFile(join(managerFixture, "reconcile-count.txt"), "utf8"), { code: "ENOENT" });
@@ -5099,7 +5082,7 @@ try {
 	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("d".repeat(64), "must not publish"))}\n`);
 	await settleManagerCommand("error");
 	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, discordSummary,
+	assert.equal((await managerSummaryState()).summary.delivery.content, discordSummary,
 		"failed command settlement must retain the last-good Discord summary");
 	assert.match(managerSummarySession.notifications.at(-1)[0], /retry manually/);
 
@@ -5108,7 +5091,7 @@ try {
 	await writeFile(join(managerFixture, "presentation.json"), '{"ok":true,"command":"summary-render"}\n');
 	await settleManagerCommand();
 	await new Promise((resolveWait) => setTimeout(resolveWait, 150));
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, discordSummary,
+	assert.equal((await managerSummaryState()).summary.delivery.content, discordSummary,
 		"render failure must retain the last-good Discord summary");
 	assert.match(managerSummarySession.notifications.at(-1)[0], /retry manually/);
 	managerSummarySession.setInjectionError(true);
@@ -5116,9 +5099,9 @@ try {
 		requestId: "manager-presentation-rejected", customId: `m:${"c".repeat(64)}:github-refresh-reconcile` })).ok, false,
 	"failed Pi command injection must be surfaced without changing the summary");
 	managerSummarySession.setInjectionError(false);
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).text, discordSummary);
+	assert.equal((await managerSummaryState()).summary.delivery.content, discordSummary);
 	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).filter((message) => message.botOwned).length, 1,
-		"all command outcomes must retain one manager summary message");
+		"all failed command outcomes must retain one last-good manager summary page");
 	managerStatus = {
 		...managerStatus,
 		summary: { tasks: 1, pending_events: 0, ready_tasks: 0, orphan_events: 0 },
@@ -5127,12 +5110,12 @@ try {
 	await writeFile(join(managerFixture, "status.json"), `${JSON.stringify(managerStatus)}\n`);
 	await writeFile(join(managerFixture, "presentation.json"), `${JSON.stringify(managerPresentation("e".repeat(64), "second opaque payload"))}\n`);
 	await writeFile(join(managerFixture, "data", "tasks", "changed.md"), "changed\n");
-	await waitFor(() => FakeGateway.channelMessages.get(managerSummaryMapping.channelId)?.at(-1)?.text === "second opaque payload",
+	await waitFor(async () => (await managerSummaryState())?.summary.delivery?.content === "second opaque payload",
 		"later canonical task changes must automatically refresh the manager summary");
-	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
-		"later automatic refresh must retain the existing manager summary message");
+	assert.notEqual(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).at(-1).id, managerSummaryMessageId,
+		"later automatic refresh must replace the prior manager summary batch");
 	assert.equal(FakeGateway.channelMessages.get(managerSummaryMapping.channelId).filter((message) => message.botOwned).length, 1,
-		"later automatic refresh must not post duplicate manager summaries");
+		"later automatic refresh must remove stale manager summary pages");
 	await waitFor(() => FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "discord").length === 1,
 		"manager catalogue registration and live IPC refresh");
 	assert.deepEqual(FakeGateway.instances[0].managerAutocomplete(managerSummaryMapping.threadId, "discord"), [{

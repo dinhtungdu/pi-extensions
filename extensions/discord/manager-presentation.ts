@@ -3,7 +3,7 @@ import { unwatchFile, watch, watchFile, type FSWatcher } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 const RENDER_TIMEOUT_MS = 2_000, MAX_OUTPUT_BYTES = 1_048_576, REFRESH_DEBOUNCE_MS = 100;
-export const MAX_MANAGER_PRESENTATION_CONTENT = 2_000, MANAGER_PRESENTATION_SCHEMA_VERSION = 1;
+export const MAX_MANAGER_PRESENTATION_CONTENT = 10_000, MANAGER_PRESENTATION_SCHEMA_VERSION = 1;
 export const MANAGER_PRESENTATION_CONTROL_COMMANDS = {
 	"github-refresh-reconcile": "github-refresh-reconcile",
 } as const;
@@ -56,7 +56,7 @@ export function parseManagerPresentationEnvelope(value: unknown): ManagerPresent
 async function defaultRender(root: string): Promise<unknown> {
 	return new Promise((resolveResult, reject) => execFile(
 		process.execPath,
-		[join(root, "bin", "manager.mjs"), "summary-render", "--root", root, "--max-chars", "2000"],
+		[join(root, "bin", "manager.mjs"), "summary-render", "--root", root, "--max-chars", String(MAX_MANAGER_PRESENTATION_CONTENT)],
 		{ cwd: root, encoding: "utf8", maxBuffer: MAX_OUTPUT_BYTES, timeout: RENDER_TIMEOUT_MS, windowsHide: true },
 		(error, stdout, stderr) => {
 			if (error) return reject(new Error(`Cannot render the-manager presentation: ${stderr.trim() || error.message}`));

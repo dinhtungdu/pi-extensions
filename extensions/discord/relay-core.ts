@@ -1,9 +1,10 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { DiscordBridgeConfig } from "./config.js";
 import {
 	DiscordStateStore,
 	type DiscordLifecycleMessage,
 	type OutboundMessage,
+	type ProjectSummaryState,
 	type QueuedDiscordMessage,
 	type SessionThreadMapping,
 } from "./state.js";
@@ -50,6 +51,7 @@ import {
 	SUPPORTED_MANAGER_PRESENTATION_CONTROLS,
 	type ManagerPresentation,
 } from "./manager-presentation.js";
+import { paginateManagerPresentation } from "./manager-summary-pages.js";
 
 export interface RelaySessionRegistration {
 	cwd: string;
@@ -979,7 +981,8 @@ export class DiscordRelayCore {
 				if (project?.summary.revision === authorization.revision && !project.summary.pendingSend &&
 					project.summary.delivery?.content === project.summary.desiredText &&
 					samePresentation(project.summary.delivery?.presentation, project.summary.desiredPresentation) &&
-					await this.transport.latestMessageId(project.mapping.channelId) === project.summary.delivery.messageId) return;
+					(project.summary.desiredPresentation ||
+						await this.transport.latestMessageId(project.mapping.channelId) === project.summary.delivery.messageId)) return;
 			} catch {
 				// Keep the old owner authoritative until uncertain transport state is durably recovered.
 			}
@@ -1017,6 +1020,11 @@ export class DiscordRelayCore {
 			if (!project || project.summary.revision !== authorization.revision ||
 				!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
 			const { mapping, summary } = project;
+			if (summary.desiredPresentation) {
+				await this.replaceManagerSummaryBatch(cwd, mapping.channelId, summary, authorization);
+				this.clearProjectSummaryRetry(cwd);
+				return;
+			}
 			if (summary.pendingSend) {
 				const pending = await this.state.prepareProjectSummarySend(cwd, authorization.revision);
 				if (!pending || !this.isCurrentSummaryAuthorization(cwd, authorization)) return;
@@ -1058,6 +1066,59 @@ export class DiscordRelayCore {
 			await this.state.recordProjectSummaryDeleted(cwd, summary.delivery.messageId, authorization.revision);
 		}
 		if (this.isCurrentSummaryAuthorization(cwd, authorization)) this.scheduleProjectSummaryRetry(cwd);
+	}
+
+	private async replaceManagerSummaryBatch(
+		cwd: string,
+		channelId: string,
+		summary: ProjectSummaryState,
+		authorization: SummaryAuthorization,
+	): Promise<void> {
+		const presentation = summary.desiredPresentation!;
+		const pages = paginateManagerPresentation(presentation);
+		const batchRevision = pages[0]!.revision;
+		let discovered = await this.transport.managerSummaryMessages(channelId);
+		if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
+		const matching = discovered.filter((message) => message.revision === batchRevision);
+		const complete = matching.length === pages.length && pages.every((page) =>
+			matching.some((message) => message.page === page.page && message.total === pages.length));
+		let newMessageIds: string[];
+		if (complete) {
+			newMessageIds = pages.map((page) => matching.find((message) => message.page === page.page)!.id);
+		} else {
+			for (const message of matching) {
+				if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
+				await this.transport.deleteOwnText(channelId, message.id);
+			}
+			const sent: string[] = [];
+			try {
+				for (const page of pages) {
+					if (!this.isCurrentSummaryAuthorization(cwd, authorization)) throw new Error("Manager summary owner changed during replacement");
+					const nonce = randomBytes(18).toString("base64url");
+					const messageId = page.page === page.total
+						? await this.transport.sendPresentation(channelId, page.presentation, nonce)
+						: await this.transport.sendText(channelId, page.content, nonce);
+					sent.push(messageId);
+				}
+			} catch (error) {
+				await Promise.allSettled([...sent].reverse().map((messageId) => this.transport.deleteOwnText(channelId, messageId)));
+				throw error;
+			}
+			newMessageIds = sent;
+			discovered = [
+				...discovered.filter((message) => message.revision !== batchRevision),
+				...pages.map((page, index) => ({ id: sent[index]!, revision: page.revision, page: page.page, total: page.total })),
+			];
+		}
+		const retained = new Set(newMessageIds);
+		const stale = new Set(discovered.filter((message) => message.revision !== batchRevision).map((message) => message.id));
+		if (summary.delivery && !retained.has(summary.delivery.messageId)) stale.add(summary.delivery.messageId);
+		for (const messageId of stale) {
+			if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
+			await this.transport.deleteOwnText(channelId, messageId);
+		}
+		if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
+		await this.state.recordProjectSummaryBatchSent(cwd, newMessageIds.at(-1)!, authorization.revision);
 	}
 
 	private scheduleProjectSummaryRetry(cwd: string): void {

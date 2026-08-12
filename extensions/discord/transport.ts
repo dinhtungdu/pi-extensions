@@ -32,6 +32,7 @@ import {
 	type PiSessionControlResult,
 } from "./controls.js";
 import type { ManagerPresentation, ManagerPresentationStyle } from "./manager-presentation.js";
+import { managerSummaryPageMetadata, type ManagerSummaryPageMetadata } from "./manager-summary-pages.js";
 
 const READY_TIMEOUT_MS = 30_000;
 const CONTROL_EXECUTION_TIMEOUT_MS = 12_000;
@@ -66,6 +67,8 @@ export interface SessionThreadRequest {
 	subscribeOwner?: true;
 }
 
+export interface DiscordManagerSummaryMessage extends ManagerSummaryPageMetadata { id: string }
+
 export interface DiscordTransport {
 	connect(config: DiscordBridgeConfig): Promise<void>;
 	disconnect(): Promise<void>;
@@ -83,6 +86,7 @@ export interface DiscordTransport {
 	lockThread(channelId: string): Promise<void>;
 	archiveThread(channelId: string): Promise<void>;
 	latestMessageId(channelId: string): Promise<string | undefined>;
+	managerSummaryMessages(channelId: string): Promise<DiscordManagerSummaryMessage[]>;
 	editOwnText(channelId: string, messageId: string, text: string): Promise<void>;
 	editOwnPresentation(channelId: string, messageId: string, presentation: ManagerPresentation): Promise<void>;
 	deleteOwnText(channelId: string, messageId: string): Promise<void>;
@@ -525,6 +529,17 @@ export class DiscordJsTransport implements DiscordTransport {
 	async latestMessageId(channelId: string): Promise<string | undefined> {
 		const channel = await this.textChannel(channelId, "inspect messages");
 		return (await channel.messages.fetch({ limit: 1 })).first()?.id;
+	}
+
+	async managerSummaryMessages(channelId: string): Promise<DiscordManagerSummaryMessage[]> {
+		const client = this.readyClient();
+		const channel = await this.textChannel(channelId, "inspect manager summaries");
+		const messages = await channel.messages.fetch({ limit: 100 });
+		return [...messages.values()].flatMap((message) => {
+			if (message.author.id !== client.user.id) return [];
+			const metadata = managerSummaryPageMetadata(message.content);
+			return metadata ? [{ id: message.id, ...metadata }] : [];
+		});
 	}
 
 	async editOwnText(channelId: string, messageId: string, text: string): Promise<void> {
