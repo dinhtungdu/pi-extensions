@@ -1003,9 +1003,10 @@ export class DiscordRelayCore {
 		retirement = settlement.catch(() => {}).then(async () => {
 			if (authorization?.owner === owner) await this.settleRetiringProjectSummary(cwd, authorization);
 			if (this.summaryOwners.get(cwd) !== owner) return;
+			const next = this.electManagerTaskSummaryOwner(cwd);
 			const project = (await this.state.projectSummaries()).find((candidate) => candidate.cwd === cwd);
 			const desired = project?.summary.desiredPresentation;
-			if (project && (desired?.controls.length || desired?.actionControls?.length)) {
+			if (!next && project && (desired?.controls.length || desired?.actionControls?.length)) {
 				const revision = Math.max(this.summaryRevisions.get(cwd) ?? 0, project.summary.revision) + 1;
 				this.summaryRevisions.set(cwd, revision);
 				const stripped: ManagerPresentation = { ...desired, controls: [], actionControls: [] };
@@ -1017,7 +1018,6 @@ export class DiscordRelayCore {
 				}
 			}
 			if (this.summaryAuthorizations.get(cwd)?.owner === owner) this.summaryAuthorizations.delete(cwd);
-			const next = this.electManagerTaskSummaryOwner(cwd);
 			if (next) this.summaryOwners.set(cwd, next);
 			else this.summaryOwners.delete(cwd);
 		}).finally(() => {

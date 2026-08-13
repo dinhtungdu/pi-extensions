@@ -4041,6 +4041,51 @@ try {
 	await pendingPresentationScenario("success", false);
 	await pendingPresentationScenario("failure", true);
 
+	const replacementChannel = "summary-owner-replacement-channel";
+	FakeGateway.channelMessages.delete(replacementChannel);
+	const replacementState = new DiscordStateStore(join(dataDir, "summary-owner-replacement-state.json"));
+	const replacementGateway = new FakeGateway();
+	replacementGateway.ensureProjectChannel = async () => replacementChannel;
+	const replacementCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, replacementState, replacementGateway,
+	);
+	await replacementCore.start();
+	const replacementSessionId = "summary-owner-replacement-session";
+	const replacementPresentation = managerPresentationPayload("f".repeat(64), `stable replacement\n${"s".repeat(2_100)}`);
+	await replacementCore.prepareRegistration("replacement-client", "old-replacement-generation", {
+		cwd: "/summary-owner-replacement", projectIdentityResolved: true, sessionId: replacementSessionId,
+	});
+	await replacementCore.activateRegistration(
+		"replacement-client", "old-replacement-generation", replacementSessionId, () => true,
+		undefined, false, undefined, true,
+		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "old" }) },
+	);
+	await replacementCore.queueManagerPresentation(
+		"replacement-client", "old-replacement-generation", replacementSessionId, replacementPresentation,
+	);
+	await waitFor(async () => (await replacementState.projectSummaries())[0]?.summary.delivery?.presentation?.revision ===
+		replacementPresentation.revision, "initial replacement-owner presentation");
+	const replacementDelivery = (await replacementState.projectSummaries())[0].summary.delivery;
+	const ownerReplacementEventOffset = FakeGateway.summaryEvents.length;
+	await replacementCore.prepareRegistration("replacement-client", "new-replacement-generation", {
+		cwd: "/summary-owner-replacement", projectIdentityResolved: true, sessionId: replacementSessionId,
+	});
+	await replacementCore.activateRegistration(
+		"replacement-client", "new-replacement-generation", replacementSessionId, () => true,
+		undefined, false, undefined, true,
+		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "new" }) },
+	);
+	await replacementCore.queueManagerPresentation(
+		"replacement-client", "new-replacement-generation", replacementSessionId, replacementPresentation,
+	);
+	await waitFor(async () => (await replacementState.projectSummaries())[0]?.summary.revision > 1,
+		"identical replacement-owner publication");
+	assert.deepEqual((await replacementState.projectSummaries())[0].summary.delivery.messageIds, replacementDelivery.messageIds,
+		"identical successor presentation must retain last-good batch IDs");
+	assert.deepEqual(FakeGateway.summaryEvents.slice(ownerReplacementEventOffset), [],
+		"owner replacement and identical successor presentation must cause zero Discord sends or deletes");
+	await replacementCore.stop();
+
 	const discoveryFenceChannel = "discovery-fence-channel";
 	const discoveryFenceState = new DiscordStateStore(join(dataDir, "discovery-fence-state.json"));
 	const discoveryFenceGateway = new FakeGateway();
