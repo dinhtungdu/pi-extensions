@@ -5,7 +5,7 @@ Pi extensions:
 - `auto-dark-mode` — macOS dark/light theme switching
 - `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 - `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
-- `codex-fast` — request OpenAI Codex Fast mode and show `⚡` while active
+- `codex-fast` — persistently toggle OpenAI Codex Fast mode and show `⚡` while active
 - `discord` — automatic Discord project channels and Pi session threads with bidirectional text mirroring
 - `tool-visibility` — hide/show all tool execution rows without changing tools, messages, or session history
 - `voice` — local hands-free STT/TTS for Apple Silicon with streaming speech and deterministic keyboard interruption
@@ -96,7 +96,24 @@ Notes:
 
 ## OpenAI Codex fast mode
 
-For `openai-codex` models using the Codex Responses API, every request sets `service_tier: "priority"`. Other providers and APIs are unchanged. The footer shows `⚡` before the Discord status while Fast mode applies.
+For `openai-codex` models using the Codex Responses API, enabled Fast mode sets `service_tier: "priority"`. Other providers and APIs are unchanged. The footer shows `⚡` before the Discord status while Fast mode applies.
+
+```text
+/fast on
+/fast off
+/fast status
+/fast toggle
+```
+
+The setting persists across sessions in `~/.pi/agent/codex-fast.json`. Default: enabled. It can also be edited directly:
+
+```json
+{
+	"enabled": false
+}
+```
+
+Direct config edits take effect on next session or `/reload`.
 
 ## Discord bridge
 
