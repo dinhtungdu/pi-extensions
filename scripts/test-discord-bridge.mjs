@@ -3868,6 +3868,10 @@ try {
 		"action pagination preserves Unicode content byte-for-byte");
 	assert.deepEqual(boundaryPages.map((page) => managerSummaryPageMetadata(page.content)),
 		boundaryPages.map(({ revision, page, total }) => ({ revision, page, total })), "page metadata must round-trip");
+	const normalizedComponentsV2Content = `summary body-# Manager summary · ${"a".repeat(64)} · 1/1`;
+	assert.deepEqual(managerSummaryPageMetadata(normalizedComponentsV2Content), {
+		revision: "a".repeat(64), page: 1, total: 1,
+	}, "Components V2 discovery tolerates Discord stripping the marker text block's leading newline");
 	assert.equal(managerSummaryPageMetadata("unrelated bot message"), undefined);
 
 	const batchSummaryChannel = "batch-summary-channel";

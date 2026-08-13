@@ -5,7 +5,7 @@ export const DISCORD_MANAGER_SUMMARY_PAGE_LIMIT = 2_000;
 export const MANAGER_SUMMARY_PAGE_PAYLOAD_LIMIT = 1_900;
 export const MAX_MANAGER_SUMMARY_PAGES = 99;
 
-const PAGE_MARKER = /(?:^|\n)-# Manager summary · ([a-f0-9]{64}) · ([1-9]\d?)\/([1-9]\d?)$/;
+const PAGE_MARKER = /-# Manager summary · ([a-f0-9]{64}) · ([1-9]\d?)\/([1-9]\d?)$/;
 
 export interface ManagerSummaryPageMetadata {
 	revision: string;
