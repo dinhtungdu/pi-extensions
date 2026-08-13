@@ -8,6 +8,7 @@ import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-ima
 import {
 	isLegacyOutboundImageDescriptorList,
 	isOutboundImageDescriptorList,
+	outboundLogicalHash,
 	type OutboundImageDescriptor,
 } from "./outbound-images.js";
 import {
@@ -195,16 +196,19 @@ function parseOutboundMessages(
 			return { index: chunk.index, content: chunk.content, nonce: chunk.nonce,
 				...(typeof chunk.discordMessageId === "string" ? { discordMessageId: chunk.discordMessageId } : {}) };
 		});
-		// DOI-001..004 path-based queues never upload after upgrade. Unattempted text drains; uncertain multipart is receipted and abandoned.
+		// DOI-001..004 path-based queues never upload after upgrade. Migrate identity to exact native text-only delivery.
+		const migratedHash = legacyImages
+			? outboundLogicalHash(chunks.map((chunk) => chunk.content).join(""), Array.isArray(message.responseTo) ? message.responseTo as string[] : [], [])
+			: typeof message.logicalHash === "string" ? message.logicalHash : undefined;
 		if (legacyImages && message.multipartAttempted === true) {
-			if (typeof message.logicalHash === "string") abandonLegacy(message.id, message.logicalHash);
+			abandonLegacy(message.id, migratedHash!);
 			return [];
 		}
 		return [{ id: message.id, kind: message.kind,
 			threadId: typeof message.threadId === "string" ? message.threadId : fallbackThreadId, chunks,
 			...(typeof message.inboundMessageId === "string" ? { inboundMessageId: message.inboundMessageId } : {}),
 			...(Array.isArray(message.responseTo) ? { responseTo: [...message.responseTo] as string[] } : {}),
-			...(typeof message.logicalHash === "string" ? { logicalHash: message.logicalHash } : {}),
+			...(migratedHash ? { logicalHash: migratedHash } : {}),
 			...(currentImages ? { images: (message.images as OutboundImageDescriptor[]).map((image) => ({ ...image })) } : {}),
 			...(currentImages && message.multipartAttempted === true ? { multipartAttempted: true as const } : {}) }];
 	});

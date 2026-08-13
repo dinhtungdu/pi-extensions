@@ -617,6 +617,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		});
 
 		pi.on("input", async (event, ctx) => {
+			settledReplies.recordInput(event.streamingBehavior);
 			if (event.text === MANAGER_SUMMARY_COMMAND && presentationProducer) {
 				if (event.source === "extension") {
 					if (managerSummaryTurn?.origin !== "discord" || !managerSummaryTurn.awaitingInput) {
@@ -669,7 +670,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 		pi.on("message_start", async (event, ctx) => {
 			if (event.message.role !== "user") return;
-			await deliverSettledReply(settledReplies.settle(), ctx);
+			await deliverSettledReply(settledReplies.startUserMessage(), ctx);
 			const text = typeof event.message.content === "string"
 				? event.message.content
 				: event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");

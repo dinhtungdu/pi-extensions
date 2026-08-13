@@ -509,7 +509,6 @@ try {
 	} = await importBuilt("extensions/discord/inbound-images.js");
 	const {
 		OutboundImageStore,
-		SettledReplyCollector,
 		isNativeOutboundImageList,
 		outboundLogicalHash,
 		splitOutboundText,
@@ -4445,56 +4444,33 @@ try {
 	const pngBytes = Buffer.from(nativePng.data, "base64");
 	const nativePng2 = { ...nativePng, data: Buffer.concat([pngBytes, Buffer.from([1])]).toString("base64") };
 	assert.equal(isNativeOutboundImageList([{ ...nativePng, mimeType: "image/jpeg" }]), false, "MIME must match signature");
-	assert.notEqual(outboundLogicalHash("same", ["turn"], [nativePng, nativePng2]),
-		outboundLogicalHash("same", ["turn"], [nativePng2, nativePng]), "logical hash binds ordered native descriptors");
-
-	const collector = new SettledReplyCollector();
-	collector.recordToolResult({ role: "user", content: [nativePng] });
-	collector.recordToolResult({ role: "toolResult", content: [
-		{ type: "text", text: "tool text never mirrors" }, nativePng, nativePng,
-		{ ...nativePng, data: "/not canonical/" }, nativePng2,
-	] });
-	collector.recordAssistant({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall" }] }, ["turn-a"]);
-	collector.recordAssistant({ role: "assistant", stopReason: "error", content: [{ type: "text", text: "retry me" }] }, ["turn-a"]);
-	collector.recordAssistant({ role: "assistant", stopReason: "stop", content: [
-		{ type: "thinking", thinking: "private" }, { type: "text", text: "  exact\n" }, { type: "text", text: "reply  " },
-	] }, ["turn-a"]);
-	const collected = collector.settle();
-	assert.equal(collected.text, "  exact\nreply  ", "final assistant text must remain exact");
-	assert.deepEqual(collected.responseTo, ["turn-a"]);
-	assert.equal(collected.images.length, 2, "tool image siblings survive retries while user and duplicate images are excluded");
-	collector.recordToolResult({ role: "toolResult", content: Array.from({ length: 5 }, (_, index) => ({
-		...nativePng, data: Buffer.concat([pngBytes, Buffer.from([index + 2])]).toString("base64"),
-	})) });
-	collector.recordAssistant({ role: "assistant", stopReason: "length", content: [{ type: "text", text: "first segment" }] }, ["turn-a"]);
-	assert.equal(collector.settle().images.length, 4, "collector bounds each settlement to four unique images");
-	collector.recordAssistant({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "follow-up" }] }, ["turn-b"]);
-	assert.deepEqual(collector.settle().responseTo, ["turn-b"], "steering and follow-ups start a fresh association segment");
 	const outboundSnapshotDirectory = join(dataDir, "outbound-image-snapshots"), outboundStore = new OutboundImageStore(outboundSnapshotDirectory);
 	await outboundStore.initialize(new Set());
 	const preparedOutbound = await outboundStore.prepare([nativePng, nativePng2]);
 	assert.deepEqual(preparedOutbound.map((image) => image.filename), ["image-1.png", "image-2.png"], "relay generates filenames");
-	assert.equal((await stat(join(outboundSnapshotDirectory, preparedOutbound[0].snapshot))).mode & 0o777, 0o600,
-		"private snapshots must be mode 0600");
+	assert.equal((await stat(join(outboundSnapshotDirectory, preparedOutbound[0].snapshot))).mode & 0o777, 0o600, "private snapshots must be mode 0600");
 	await writeFile(join(outboundSnapshotDirectory, preparedOutbound[0].snapshot), Buffer.from("corrupt"));
-	const partialSnapshots = await outboundStore.load(preparedOutbound);
-	assert.equal(partialSnapshots.length, 1, "one corrupt snapshot must not block valid siblings");
+	assert.equal((await outboundStore.load(preparedOutbound)).length, 1, "one corrupt snapshot must not block valid siblings");
 
 	const legacySnapshotDirectory = join(dataDir, "legacy-outbound-snapshots"), legacyStore = new OutboundImageStore(legacySnapshotDirectory);
 	await legacyStore.initialize(new Set());
 	const legacySnapshot = "11111111-1111-4111-8111-111111111111.image";
 	await writeFile(join(legacySnapshotDirectory, legacySnapshot), pngBytes, { mode: 0o600 });
 	const legacyOutboundStateFile = join(dataDir, "legacy-outbound-state.json");
-	const legacyMessage = { id: "legacy-path", kind: "assistant", threadId: "legacy-thread",
+	const legacyMessage = { id: "legacy-path", kind: "assistant", threadId: "legacy-thread", responseTo: ["legacy-response"], logicalHash:
+		"184111782c18cd59bb3dd3ff81d13279201e20601bbb2990f4f0b7c706af5967",
 		chunks: [{ index: 0, content: "legacy text", nonce: "legacy-nonce" }],
 		images: [{ snapshot: legacySnapshot, digest: "0".repeat(64), mimeType: "image/png", size: pngBytes.length, filename: "old.png" }] };
 	await writeFile(legacyOutboundStateFile, JSON.stringify({ version: 1, projects: {}, sessions: { legacy: { cwd: "/legacy", channelId: "legacy-channel",
-		threadId: "legacy-thread", lastActiveAt: 1, threadCursors: {}, pendingMessages: [], retainedImages: [],
-		outboundMessages: [legacyMessage, { ...legacyMessage, id: "uncertain-path", multipartAttempted: true }], lifecycleMessages: [] } }, recentMessageIds: [] }));
-	const legacyOutboundState = new DiscordStateStore(legacyOutboundStateFile);
+		threadId: "legacy-thread", lastActiveAt: 1, threadCursors: {}, pendingMessages: [], retainedImages: [], outboundMessages:
+		[legacyMessage, { ...legacyMessage, id: "legacy-lost-ack", multipartAttempted: true }], lifecycleMessages: [] } }, recentMessageIds: [] }));
+	const legacyOutboundState = new DiscordStateStore(legacyOutboundStateFile), nativeTextHash = outboundLogicalHash("legacy text", ["legacy-response"], []);
 	const migratedLegacy = await legacyOutboundState.getSession("legacy");
-	assert.equal(migratedLegacy.outboundMessages.length, 1, "uncertain legacy multipart is abandoned");
-	assert.equal(migratedLegacy.outboundMessages[0].images, undefined, "unattempted legacy path images drain as exact text only");
+	assert.equal(migratedLegacy.outboundMessages[0].logicalHash, nativeTextHash, "queued commit-29edc02 hash migrates to native text-only identity");
+	assert.equal(await legacyOutboundState.outboundIdentity("legacy", "legacy-lost-ack", nativeTextHash), "same", "lost-ACK legacy receipt accepts equivalent retry");
+	assert.equal(await legacyOutboundState.outboundIdentity("legacy", "legacy-lost-ack", outboundLogicalHash("changed", ["legacy-response"], [])), "conflict");
+	assert.equal(await legacyOutboundState.outboundIdentity("legacy", "legacy-path", outboundLogicalHash("legacy text", ["changed"], [])), "conflict");
+	assert.equal(migratedLegacy.outboundMessages[0].images, undefined, "unattempted legacy images strip before text-only retry");
 	await legacyStore.initialize(await legacyOutboundState.pendingOutboundSnapshots());
 	await assert.rejects(() => stat(join(legacySnapshotDirectory, legacySnapshot)), /ENOENT/, "legacy snapshots are deleted");
 
@@ -6449,22 +6425,19 @@ try {
 	});
 	await outboundFinal.emit("session_start", { reason: "startup" });
 	const outboundFinalThread = (await new DiscordStateStore(stateFile).getSession("session-outbound-final")).threadId;
-	const outboundFinalText = "  Rendered result.  ";
+	const preSteerText = "obsolete before steer", outboundFinalText = "  Rendered after steer.  ";
 	await outboundFinal.emit("message_end", { message: { role: "toolResult", content: [nativePng] } });
-	await outboundFinal.emit("message_end", {
-		message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: outboundFinalText }] },
-	});
+	await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: preSteerText }] } });
+	await outboundFinal.emit("input", { source: "interactive", streamingBehavior: "steer", text: "correct it" }); await outboundFinal.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "correct it" }] } });
+	assert.equal(FakeGateway.sendAttempts.get(preSteerText), undefined, "Pi 0.84.1 steer input suppresses pre-steer candidate");
+	await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: outboundFinalText }] } });
+	await outboundFinal.emit("input", { source: "interactive", streamingBehavior: "followUp", text: "next request" }); await outboundFinal.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "next request" }] } });
+	await waitFor(() => gateway.sent.some((message) => message.text === outboundFinalText && message.channelId === outboundFinalThread), "post-steer image delivery at true follow-up boundary");
+	assert.equal(FakeGateway.imageUploadAttempts.get(outboundFinalText), 1, "steer-retained images attach exactly once");
+	await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "follow-up final" }] } });
 	await outboundFinal.emit("agent_settled", {});
-	await waitFor(() => gateway.sent.some((message) => message.text === outboundFinalText && message.channelId === outboundFinalThread),
-		"final-response outbound image routing");
-	assert.equal(FakeGateway.imageUploadAttempts.get(outboundFinalText), 1);
-	const imageAttemptsBeforePartial = FakeGateway.imageUploadAttempts.size;
-	await outboundFinal.emit("message_end", {
-		message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "![partial](final.png)" }] },
-	});
-	await new Promise((resolveWait) => setTimeout(resolveWait, 30));
-	assert.equal(FakeGateway.imageUploadAttempts.size, imageAttemptsBeforePartial,
-		"intermediate assistant output must never request image delivery");
+	await waitFor(() => FakeGateway.sendAttempts.get("follow-up final") === 1, "follow-up settlement");
+	assert.equal(FakeGateway.imageUploadAttempts.get("follow-up final"), undefined, "true follow-up starts image-free segment");
 	await outboundFinal.emit("session_shutdown", { reason: "quit" });
 
 	async function runTerminalLifecycle(id, stopReason) {

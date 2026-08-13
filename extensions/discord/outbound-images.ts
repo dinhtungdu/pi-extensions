@@ -138,6 +138,11 @@ export class SettledReplyCollector {
 	private digests = new Set<string>();
 	private totalBytes = 0;
 	private candidate?: SettledReply;
+	private pendingSteers = 0;
+
+	recordInput(streamingBehavior?: "steer" | "followUp"): void {
+		if (streamingBehavior === "steer") { this.pendingSteers++; this.candidate = undefined; }
+	}
 
 	recordToolResult(message: { role?: string; content?: unknown }): void {
 		if (message.role !== "toolResult" || !Array.isArray(message.content)) return;
@@ -161,9 +166,14 @@ export class SettledReplyCollector {
 		this.candidate = { messageId: randomUUID(), text, responseTo: [...responseTo], images: this.images.map((image) => ({ ...image })) };
 	}
 
+	startUserMessage(): SettledReply | undefined {
+		if (this.pendingSteers > 0) { this.pendingSteers--; this.candidate = undefined; return undefined; }
+		return this.settle();
+	}
+
 	settle(): SettledReply | undefined {
 		const candidate = this.candidate;
-		this.images = []; this.digests.clear(); this.totalBytes = 0; this.candidate = undefined;
+		this.images = []; this.digests.clear(); this.totalBytes = 0; this.candidate = undefined; this.pendingSteers = 0;
 		return candidate;
 	}
 }
