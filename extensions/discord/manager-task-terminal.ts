@@ -1,6 +1,3 @@
-import { createHash } from "node:crypto";
-import type { PiSessionControlResult } from "./controls.js";
-
 export const MANAGER_TASK_TERMINAL_SCHEMA_VERSION = 1;
 export const MAX_MANAGER_TASK_TERMINAL_CONTENT = 1_900;
 const MANAGER_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -11,19 +8,6 @@ export interface ManagerTaskTerminal {
 	taskId: string;
 	content: string;
 	closeThread: true;
-}
-
-export type ManagerPresentationExecutionResult = PiSessionControlResult & { terminal?: ManagerTaskTerminal };
-
-export function renderMergedManagerTaskTerminal(taskId: string): ManagerTaskTerminal {
-	const content = `✅ **Task \`${taskId}\` finished**\n\nTask was merged, pushed to its configured direct-landing branch, and archived successfully.`;
-	return {
-		schemaVersion: MANAGER_TASK_TERMINAL_SCHEMA_VERSION,
-		revision: createHash("sha256").update(`${taskId}\0${content}\0close-thread`, "utf8").digest("hex"),
-		taskId,
-		content,
-		closeThread: true,
-	};
 }
 
 function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {

@@ -5,7 +5,11 @@ import { DISCORD_STATE_FILE } from "./config.js";
 import { collidingProjectChannelName, normalizeCwd, projectChannelName } from "./text.js";
 import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reactions.js";
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
-import { isManagerPresentation, type ManagerPresentation } from "./manager-presentation.js";
+import {
+	isManagerPresentation,
+	normalizePersistedManagerPresentation,
+	type ManagerPresentation,
+} from "./manager-presentation.js";
 import { isManagerWakeDescriptor, type ManagerWakeDescriptor } from "./manager-wake.js";
 import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
@@ -284,21 +288,23 @@ function parseProjectSummary(value: unknown, file: string): ProjectSummaryState 
 				!value.delivery.messageIds.includes(value.delivery.messageId)))) {
 			throw new Error(`Discord bridge state ${file} has an invalid project summary delivery`);
 		}
-		if (value.delivery.presentation !== undefined && !isManagerPresentation(value.delivery.presentation)) {
+		const deliveryPresentation = value.delivery.presentation === undefined
+			? undefined : normalizePersistedManagerPresentation(value.delivery.presentation);
+		if (value.delivery.presentation !== undefined && !deliveryPresentation) {
 			throw new Error(`Discord bridge state ${file} has an invalid delivered manager presentation`);
 		}
 		let pages: NonNullable<ProjectSummaryState["delivery"]>["pages"];
 		if (value.delivery.pages !== undefined) {
 			if (!Array.isArray(value.delivery.pages) || value.delivery.pages.length < 1 || value.delivery.pages.length > 99 ||
-				!value.delivery.pages.every((page) => isRecord(page) && typeof page.messageId === "string" &&
-					isManagerPresentation(page.presentation)) ||
+				!value.delivery.pages.every((page) => isRecord(page) && typeof page.messageId === "string") ||
 				new Set(value.delivery.pages.map((page) => (page as { messageId: string }).messageId)).size !== value.delivery.pages.length) {
 				throw new Error(`Discord bridge state ${file} has invalid delivered manager presentation pages`);
 			}
-			pages = value.delivery.pages.map((page) => ({
-				messageId: (page as { messageId: string }).messageId,
-				presentation: structuredClone((page as { presentation: ManagerPresentation }).presentation),
-			}));
+			pages = value.delivery.pages.map((page) => {
+				const presentation = normalizePersistedManagerPresentation((page as Record<string, unknown>).presentation);
+				if (!presentation) throw new Error(`Discord bridge state ${file} has invalid delivered manager presentation pages`);
+				return { messageId: (page as { messageId: string }).messageId, presentation };
+			});
 			const deliveredMessageIds = value.delivery.messageIds;
 			if (Array.isArray(deliveredMessageIds) &&
 				pages.some((page, index) => page.messageId !== deliveredMessageIds[index])) {
@@ -309,7 +315,7 @@ function parseProjectSummary(value: unknown, file: string): ProjectSummaryState 
 			messageId: value.delivery.messageId,
 			...(Array.isArray(value.delivery.messageIds) ? { messageIds: [...value.delivery.messageIds] as string[] } : {}),
 			content: value.delivery.content,
-			...(value.delivery.presentation ? { presentation: structuredClone(value.delivery.presentation as ManagerPresentation) } : {}),
+			...(deliveryPresentation ? { presentation: deliveryPresentation } : {}),
 			...(pages ? { pages } : {}),
 		};
 	}
@@ -318,24 +324,28 @@ function parseProjectSummary(value: unknown, file: string): ProjectSummaryState 
 		if (!isRecord(value.pendingSend) || typeof value.pendingSend.nonce !== "string" || typeof value.pendingSend.content !== "string") {
 			throw new Error(`Discord bridge state ${file} has an invalid pending project summary`);
 		}
-		if (value.pendingSend.presentation !== undefined && !isManagerPresentation(value.pendingSend.presentation)) {
+		const pendingPresentation = value.pendingSend.presentation === undefined
+			? undefined : normalizePersistedManagerPresentation(value.pendingSend.presentation);
+		if (value.pendingSend.presentation !== undefined && !pendingPresentation) {
 			throw new Error(`Discord bridge state ${file} has an invalid pending manager presentation`);
 		}
 		pendingSend = {
 			nonce: value.pendingSend.nonce,
 			content: value.pendingSend.content,
-			...(value.pendingSend.presentation ? { presentation: structuredClone(value.pendingSend.presentation as ManagerPresentation) } : {}),
+			...(pendingPresentation ? { presentation: pendingPresentation } : {}),
 		};
 	}
 	if (value.revision !== undefined && (!Number.isSafeInteger(value.revision) || Number(value.revision) < 0)) {
 		throw new Error(`Discord bridge state ${file} has an invalid project summary revision`);
 	}
-	if (value.desiredPresentation !== undefined && !isManagerPresentation(value.desiredPresentation)) {
+	const desiredPresentation = value.desiredPresentation === undefined
+		? undefined : normalizePersistedManagerPresentation(value.desiredPresentation);
+	if (value.desiredPresentation !== undefined && !desiredPresentation) {
 		throw new Error(`Discord bridge state ${file} has an invalid desired manager presentation`);
 	}
 	return {
 		desiredText: value.desiredText,
-		...(value.desiredPresentation ? { desiredPresentation: structuredClone(value.desiredPresentation as ManagerPresentation) } : {}),
+		...(desiredPresentation ? { desiredPresentation } : {}),
 		revision: value.revision === undefined ? 0 : Number(value.revision),
 		...(delivery ? { delivery } : {}),
 		...(pendingSend ? { pendingSend } : {}),

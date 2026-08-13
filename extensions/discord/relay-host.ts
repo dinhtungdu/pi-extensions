@@ -13,7 +13,6 @@ import {
 	type PiSessionControlResult,
 } from "./controls.js";
 import { MANAGER_PRESENTATION_SCHEMA_VERSION, SUPPORTED_MANAGER_PRESENTATION_CONTROLS } from "./manager-presentation.js";
-import type { ManagerPresentationExecutionResult } from "./manager-task-terminal.js";
 
 export interface RelayHostOptions {
 	paths: RelayPaths;
@@ -39,7 +38,7 @@ interface SocketState {
 	queuedInputBytes: number;
 	writer: BoundedSocketWriter;
 	pendingControls: Map<string, {
-		resolve(result: ManagerPresentationExecutionResult): void;
+		resolve(result: PiSessionControlResult): void;
 		reject(error: Error): void;
 		timer: ReturnType<typeof setTimeout>;
 		resultType: "control_result" | "manager_control_result" | "manager_presentation_control_result";
@@ -352,12 +351,7 @@ export class LocalRelayHost {
 			if (!pending || pending.resultType !== parsed.type) return;
 			clearTimeout(pending.timer);
 			state.pendingControls.delete(parsed.requestId);
-			pending.resolve({
-				ok: parsed.ok,
-				message: parsed.message,
-				...(parsed.type === "manager_presentation_control_result" && parsed.terminal
-					? { terminal: structuredClone(parsed.terminal) } : {}),
-			});
+			pending.resolve({ ok: parsed.ok, message: parsed.message });
 			return;
 		}
 		if (parsed.type === "manager_presentation") {
@@ -478,7 +472,7 @@ export class LocalRelayHost {
 	private requestPresentationControl(
 		state: SocketState,
 		request: Omit<Extract<ServerFrame, { type: "manager_presentation_control" }>, "type">,
-	): Promise<ManagerPresentationExecutionResult> {
+	): Promise<PiSessionControlResult> {
 		return this.requestClientControl(state, { type: "manager_presentation_control", ...request }, MANAGER_CONTROL_IPC_TIMEOUT_MS);
 	}
 

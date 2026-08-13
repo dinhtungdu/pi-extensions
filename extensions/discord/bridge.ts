@@ -17,10 +17,7 @@ import {
 import type { ManagerPresentation, ManagerPresentationActionControl } from "./manager-presentation.js";
 import type { ManagerWakeDescriptor } from "./manager-wake.js";
 import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
-import type {
-	ManagerPresentationExecutionResult,
-	ManagerTaskTerminal,
-} from "./manager-task-terminal.js";
+import type { ManagerTaskTerminal } from "./manager-task-terminal.js";
 
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
@@ -52,7 +49,7 @@ export interface BridgeCallbacks {
 		request: { requestId: string; revision: string; controlId: string; command: string;
 			actionControl?: ManagerPresentationActionControl },
 		signal: AbortSignal,
-	): Promise<ManagerPresentationExecutionResult>;
+	): Promise<PiSessionControlResult>;
 }
 
 export interface BridgeStatus extends RelayClientStatus {}

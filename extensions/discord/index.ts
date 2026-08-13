@@ -467,13 +467,9 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 						onManagerPresentationControl: async (request) => {
 							if (request.command === "task-merge-and-archive" && request.actionControl) {
 								if (!managerExecutor) return { ok: false, message: "Manager lifecycle controls are unavailable." };
-								const execution = await managerExecutor.executePresentationMerge(
+								const result = boundedControlResult(await managerExecutor.executePresentationMerge(
 									request.requestId, request.actionControl.taskId,
-								);
-								const result = {
-									...boundedControlResult(execution),
-									...(execution.terminal ? { terminal: structuredClone(execution.terminal) } : {}),
-								};
+								));
 								try {
 									pi.appendEntry<ManagerControlResultEntryData>(MANAGER_CONTROL_RESULT_ENTRY, {
 										action: "merge-and-archive",

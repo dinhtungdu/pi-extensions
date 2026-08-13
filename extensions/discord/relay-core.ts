@@ -46,11 +46,7 @@ import {
 } from "./controls.js";
 import { wakeManagerSession, type ManagerWakeDescriptor } from "./manager-wake.js";
 import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
-import {
-	isManagerTaskTerminal,
-	type ManagerPresentationExecutionResult,
-	type ManagerTaskTerminal,
-} from "./manager-task-terminal.js";
+import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
 import {
 	isManagerPresentationActionControl,
 	isSupportedManagerPresentationControl,
@@ -98,7 +94,7 @@ interface ActiveSession {
 	managerAsk: boolean;
 	executeManagerControl?: (request: PiManagerControlRequest) => Promise<PiSessionControlResult>;
 	executePresentationControl?: (request: { requestId: string; revision: string; controlId: string; command: string;
-		actionControl?: ManagerPresentationActionControl }) => Promise<ManagerPresentationExecutionResult>;
+		actionControl?: ManagerPresentationActionControl }) => Promise<PiSessionControlResult>;
 	inboundImages: boolean;
 }
 
@@ -683,10 +679,8 @@ export class DiscordRelayCore {
 		const descriptorMatches = control
 			? isSupportedManagerPresentationControl(control.id, control.command) && JSON.stringify(control) === JSON.stringify(deliveredControl)
 			: actionControl
-				? isManagerPresentationActionControl(actionControl, desired?.content.length) && deliveredActionControl !== undefined &&
-					actionControl.id === deliveredActionControl.id && actionControl.command === deliveredActionControl.command &&
-					actionControl.taskId === deliveredActionControl.taskId &&
-					JSON.stringify(actionControl.confirmation) === JSON.stringify(deliveredActionControl.confirmation)
+				? isManagerPresentationActionControl(actionControl, desired?.content.length) &&
+					JSON.stringify(actionControl) === JSON.stringify(deliveredActionControl)
 				: false;
 		if (!owner?.executePresentationControl || this.activeSessions.get(owner.sessionId) !== owner ||
 			!authorization || authorization.owner !== owner || authorization.revision !== project.summary.revision ||
@@ -696,36 +690,19 @@ export class DiscordRelayCore {
 		const selected = actionControl ?? control!;
 		const execution = (async () => {
 			let result: PiSessionControlResult;
-			let terminal: ManagerTaskTerminal | undefined;
 			try {
-				const raw = await owner.executePresentationControl!({
+				result = boundedControlResult(await owner.executePresentationControl!({
 					requestId: request.requestId,
 					revision: custom[1]!,
 					controlId: selected.id,
 					command: selected.command,
 					...(actionControl ? { actionControl: structuredClone(actionControl) } : {}),
-				});
-				result = boundedControlResult(raw);
-				terminal = raw.terminal;
+				}));
 			} catch (error) {
 				result = boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
 			}
 			if (this.summaryOwners.get(project.cwd) !== owner || this.activeSessions.get(owner.sessionId) !== owner) {
 				return { ok: false, message: "The manager presentation owner disconnected while the control was running." };
-			}
-			if (result.ok && terminal) {
-				if (!actionControl || terminal.taskId !== actionControl.taskId) {
-					return { ok: false, message: "Manager action returned a conflicting terminal presentation." };
-				}
-				try {
-					await this.acceptManagerTaskTerminal(terminal);
-				} catch (error) {
-					return boundedControlResult({
-						ok: false,
-						message: `Manager action succeeded, but Discord terminal delivery could not start: ${
-							error instanceof Error ? error.message : String(error)}`,
-					});
-				}
 			}
 			return result;
 		})();

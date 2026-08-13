@@ -56,7 +56,7 @@ export type ClientFrame =
 	| { type: "control_result"; requestId: string; ok: boolean; message: string }
 	| { type: "manager_catalogue"; requestId: string; taskCatalogue: ManagerTaskCatalogueEntry[]; projectCatalogue?: ManagerProjectCatalogueEntry[] }
 	| { type: "manager_control_result"; requestId: string; ok: boolean; message: string }
-	| { type: "manager_presentation_control_result"; requestId: string; ok: boolean; message: string; terminal?: ManagerTaskTerminal }
+	| { type: "manager_presentation_control_result"; requestId: string; ok: boolean; message: string }
 	| { type: "unregister" }
 	| { type: "ping" };
 
@@ -176,8 +176,7 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 	if (frame.type === "control_result" || frame.type === "manager_control_result" || frame.type === "manager_presentation_control_result") {
 		return typeof frame.requestId === "string" && typeof frame.ok === "boolean" &&
 			typeof frame.message === "string" && frame.message.length <= 2_000 &&
-			(frame.type !== "manager_presentation_control_result" || frame.terminal === undefined ||
-				frame.ok === true && isManagerTaskTerminal(frame.terminal));
+			(frame.type !== "manager_presentation_control_result" || frame.terminal === undefined);
 	}
 	if (frame.type === "manager_catalogue") {
 		return typeof frame.requestId === "string" && isManagerTaskCatalogue(frame.taskCatalogue) &&

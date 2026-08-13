@@ -15,12 +15,10 @@ export function isSupportedManagerPresentationControl(id: unknown, command: unkn
 export const MANAGER_PRESENTATION_STYLES = ["primary", "secondary", "success", "danger"] as const;
 export type ManagerPresentationStyle = typeof MANAGER_PRESENTATION_STYLES[number];
 export interface ManagerPresentationControl { id: string; label: string; style: ManagerPresentationStyle; command: string }
-export interface ManagerPresentationActionConfirmation { title: string; body: string; confirmLabel: string }
 export interface ManagerPresentationActionControl extends ManagerPresentationControl {
 	command: "task-merge-and-archive";
 	taskId: string;
 	after: number;
-	confirmation: ManagerPresentationActionConfirmation;
 }
 export interface ManagerPresentation {
 	schemaVersion: 1;
@@ -48,20 +46,14 @@ function isControlShape(value: unknown): value is ManagerPresentationControl {
 		typeof value.label === "string" && value.label.length >= 1 && value.label.length <= 80 &&
 		typeof value.style === "string" && (MANAGER_PRESENTATION_STYLES as readonly string[]).includes(value.style);
 }
-function isConfirmationText(value: unknown, maximum: number): value is string {
-	return typeof value === "string" && value.length >= 1 && value.length <= maximum && !value.includes("\0");
-}
 export function isManagerPresentationActionControl(value: unknown, contentLength?: number): value is ManagerPresentationActionControl {
 	if (!isControlShape(value)) return false;
 	const action = value as unknown as Record<string, unknown>;
-	if (!hasExactKeys(action, ["id", "label", "style", "command", "taskId", "after", "confirmation"]) ||
-		!isRecord(action.confirmation) || !hasExactKeys(action.confirmation, ["title", "body", "confirmLabel"])) return false;
+	if (!hasExactKeys(action, ["id", "label", "style", "command", "taskId", "after"])) return false;
 	return action.command === "task-merge-and-archive" &&
 		typeof action.taskId === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(action.taskId) &&
 		Number.isSafeInteger(action.after) && Number(action.after) > 0 &&
-		(contentLength === undefined || Number(action.after) <= contentLength) &&
-		isConfirmationText(action.confirmation.title, 100) && isConfirmationText(action.confirmation.body, 1_500) &&
-		isConfirmationText(action.confirmation.confirmLabel, 80);
+		(contentLength === undefined || Number(action.after) <= contentLength);
 }
 function isSplitSurrogateOffset(after: number, content: string | undefined): boolean {
 	if (content === undefined || after <= 0 || after >= content.length) return false;
@@ -92,9 +84,37 @@ export function isManagerPresentation(value: unknown): value is ManagerPresentat
 	}
 	return true;
 }
+
+function isLegacyConfirmation(value: unknown): boolean {
+	if (!isRecord(value) || !hasExactKeys(value, ["title", "body", "confirmLabel"])) return false;
+	return typeof value.title === "string" && value.title.length >= 1 && value.title.length <= 100 &&
+		typeof value.body === "string" && value.body.length >= 1 && value.body.length <= 1_500 &&
+		typeof value.confirmLabel === "string" && value.confirmLabel.length >= 1 && value.confirmLabel.length <= 80 &&
+		![value.title, value.body, value.confirmLabel].some((text) => text.includes("\0"));
+}
+
+export function normalizePersistedManagerPresentation(value: unknown): ManagerPresentation | undefined {
+	if (isManagerPresentation(value)) return structuredClone(value);
+	if (!isRecord(value) || !Array.isArray(value.actionControls)) return undefined;
+	const actionControls = value.actionControls.map((raw) => {
+		if (!isRecord(raw) || !hasExactKeys(raw, ["id", "label", "style", "command", "taskId", "after", "confirmation"]) ||
+			!isLegacyConfirmation(raw.confirmation)) return undefined;
+		const action = {
+			id: raw.id,
+			label: raw.label,
+			style: raw.style,
+			command: raw.command,
+			taskId: raw.taskId,
+			after: raw.after,
+		};
+		return isManagerPresentationActionControl(action) ? action : undefined;
+	});
+	if (actionControls.some((action) => action === undefined)) return undefined;
+	const normalized = { ...value, actionControls };
+	return isManagerPresentation(normalized) ? structuredClone(normalized) : undefined;
+}
 function parseActionControl(value: unknown): ManagerPresentationActionControl | undefined {
-	if (!isRecord(value) || !hasExactKeys(value, ["id", "label", "style", "command", "task_id", "after", "confirmation"]) ||
-		!isRecord(value.confirmation) || !hasExactKeys(value.confirmation, ["title", "body", "confirm_label"])) return undefined;
+	if (!isRecord(value) || !hasExactKeys(value, ["id", "label", "style", "command", "task_id", "after"])) return undefined;
 	const action: ManagerPresentationActionControl = {
 		id: value.id as string,
 		label: value.label as string,
@@ -102,11 +122,6 @@ function parseActionControl(value: unknown): ManagerPresentationActionControl | 
 		command: value.command as "task-merge-and-archive",
 		taskId: value.task_id as string,
 		after: value.after as number,
-		confirmation: {
-			title: value.confirmation.title as string,
-			body: value.confirmation.body as string,
-			confirmLabel: value.confirmation.confirm_label as string,
-		},
 	};
 	return isManagerPresentationActionControl(action) ? action : undefined;
 }

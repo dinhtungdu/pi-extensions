@@ -28,10 +28,7 @@ import {
 	type ManagerPresentationActionControl,
 } from "./manager-presentation.js";
 import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
-import type {
-	ManagerPresentationExecutionResult,
-	ManagerTaskTerminal,
-} from "./manager-task-terminal.js";
+import type { ManagerTaskTerminal } from "./manager-task-terminal.js";
 
 const CONNECT_RETRY_MIN_MS = 25;
 const CONNECT_RETRY_MAX_MS = 500;
@@ -67,7 +64,7 @@ export interface RelayClientCallbacks {
 	onManagerPresentationControl?(
 		request: { requestId: string; revision: string; controlId: string; command: string; actionControl?: ManagerPresentationActionControl },
 		signal: AbortSignal,
-	): Promise<ManagerPresentationExecutionResult>;
+	): Promise<PiSessionControlResult>;
 }
 
 export interface RelayClientDependencies {
@@ -217,7 +214,17 @@ export class LocalRelayClient {
 	}
 
 	async startWorking(messageId: string): Promise<void> {
-		await this.sendRequest({ type: "working", requestId: randomUUID(), messageId }, REQUEST_TIMEOUT_MS);
+		for (;;) {
+			if (this.stopped) throw new Error("Local Discord relay client is stopped");
+			try {
+				await this.sendRequest({ type: "working", requestId: randomUUID(), messageId }, REQUEST_TIMEOUT_MS);
+				return;
+			} catch (error) {
+				if (this.stopped || error instanceof RelayRequestError) throw error;
+				await this.ensureConnected();
+				await delay(CONNECT_RETRY_MIN_MS);
+			}
+		}
 	}
 
 	async sendProjectSummary(text: string): Promise<boolean> {
@@ -537,21 +544,17 @@ export class LocalRelayClient {
 		if (frame.type === "manager_presentation_control") {
 			const abort = new AbortController();
 			this.presentationControlAborts.set(frame.requestId, abort);
-			let result: ManagerPresentationExecutionResult;
+			let result: PiSessionControlResult;
 			try {
-				const raw = this.callbacks.onManagerPresentationControl
-					? await this.callbacks.onManagerPresentationControl({
+				result = this.callbacks.onManagerPresentationControl
+					? boundedControlResult(await this.callbacks.onManagerPresentationControl({
 						requestId: frame.requestId,
 						revision: frame.revision,
 						controlId: frame.controlId,
 						command: frame.command,
 						...(frame.actionControl ? { actionControl: structuredClone(frame.actionControl) } : {}),
-					}, abort.signal)
+					}, abort.signal))
 					: { ok: false, message: "This Pi client does not support manager presentation controls." };
-				result = {
-					...boundedControlResult(raw),
-					...(raw.ok && raw.terminal ? { terminal: structuredClone(raw.terminal) } : {}),
-				};
 			} catch (error) {
 				result = boundedControlResult({ ok: false, message: asError(error).message });
 			} finally {

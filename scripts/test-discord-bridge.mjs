@@ -485,7 +485,6 @@ try {
 		MANAGER_CONTROL_IPC_TIMEOUT_MS,
 	} = await importBuilt("extensions/discord/relay-host.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
-	const { renderMergedManagerTaskTerminal } = await importBuilt("extensions/discord/manager-task-terminal.js");
 	const { DiscordBridge, inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const {
 		InboundImageStore,
@@ -982,6 +981,9 @@ try {
 		await workingCore.queueWorking(
 			`working-client-${suffix}`, `working-generation-${suffix}`, sessionId, `working-turn-${suffix}`,
 		);
+		await workingCore.queueWorking(
+			`working-client-${suffix}`, `working-generation-${suffix}`, sessionId, `working-turn-${suffix}`,
+		);
 	}
 	await waitFor(() => [...workingThreads.values()].every((threadId) =>
 		(FakeGateway.channelMessages.get(threadId) ?? []).some((message) => message.text === "Working...")),
@@ -1004,18 +1006,29 @@ try {
 	await waitFor(() => FakeGateway.sendAttempts.get("working answer a") === 1, "failed correlated response attempt");
 	assert.equal((FakeGateway.channelMessages.get("working-thread-a") ?? []).some((message) => message.id === indicatorA.id), true,
 		"failed response delivery must keep exact indicator visible");
+	FakeGateway.failDeleteOnce.add(indicatorB.id);
 	await workingCore.queueOutbound(
 		"working-client-b", "working-generation-b", "working-session-b",
 		"working-response-b", "assistant", "working answer b", ["working-turn-b"],
 	);
-	await waitFor(() => !(FakeGateway.channelMessages.get("working-thread-b") ?? []).some((message) => message.id === indicatorB.id),
-		"successful concurrent response indicator deletion");
+	await waitFor(() => FakeGateway.sendAttempts.get("working answer b") === 1, "response before injected indicator delete failure");
+	assert.equal((FakeGateway.channelMessages.get("working-thread-b") ?? []).some((message) => message.id === indicatorB.id), true,
+		"failed exact indicator deletion must retain only that turn's indicator for retry");
 	assert.equal((FakeGateway.channelMessages.get("working-thread-a") ?? []).some((message) => message.id === indicatorA.id), true,
-		"successful concurrent turn must not remove failed turn indicator");
+		"concurrent response/delete failure must not remove another turn's indicator");
+	await waitFor(() => !(FakeGateway.channelMessages.get("working-thread-b") ?? []).some((message) => message.id === indicatorB.id),
+		"retried concurrent response indicator deletion");
+	assert.deepEqual(FakeGateway.summaryEvents.filter((event) => event.type === "delete" &&
+		event.channelId === "working-thread-b").map((event) => event.messageId), [indicatorB.id],
+		"successful concurrent response must delete only exact mapped indicator");
 	await waitFor(() => !(FakeGateway.channelMessages.get("working-thread-a") ?? []).some((message) => message.id === indicatorA.id),
 		"retried response delivery indicator deletion");
 	assert.equal((FakeGateway.channelMessages.get("working-thread-a") ?? []).filter((message) => message.text === "Working...").length, 0);
 	assert.equal((FakeGateway.channelMessages.get("working-thread-b") ?? []).filter((message) => message.text === "Working...").length, 0);
+	assert.equal(FakeGateway.summaryEvents.filter((event) => event.channelId === "working-thread-a" &&
+		event.type === "send" && event.text === "Working...").length, 1, "duplicate working persistence must create one indicator");
+	assert.equal(FakeGateway.summaryEvents.filter((event) => event.channelId === "working-thread-b" &&
+		event.type === "send" && event.text === "Working...").length, 1, "concurrent turn must create one exact indicator");
 	await workingCore.stop();
 
 	const terminalStateFile = join(dataDir, "manager-task-terminal-state.json");
@@ -1893,7 +1906,6 @@ try {
 		actionControls: [{
 			id: "merge-ready", label: "Merge & archive", style: "success", command: "task-merge-and-archive",
 			taskId: "ready-task", after: "Ready 😀 task\n".length,
-			confirmation: { title: "Merge ready-task?", body: "Land on main and push origin/main.", confirmLabel: "Merge now" },
 		}],
 		degraded: false, warnings: [],
 	};
@@ -2218,17 +2230,56 @@ try {
 		action_controls: [{
 			id: "merge-ready-task", label: "Merge & archive", style: "success", command: "task-merge-and-archive",
 			task_id: "ready-task", after: directTaskContent.length,
-			confirmation: { title: "Merge ready-task?", body: "Land on main and push origin/main.", confirm_label: "Merge now" },
 		}],
 	};
 	const actionPresentation = parseManagerPresentationEnvelope(actionPresentationEnvelope);
 	assert.deepEqual(actionPresentation.actionControls, [{
 		id: "merge-ready-task", label: "Merge & archive", style: "success", command: "task-merge-and-archive",
 		taskId: "ready-task", after: directTaskContent.length,
-		confirmation: { title: "Merge ready-task?", body: "Land on main and push origin/main.", confirmLabel: "Merge now" },
-	}], "schema-v1 must consume exact manager-owned action_controls without interpreting content");
+	}], "schema-v1 must consume exact canonical six-field action_controls without interpreting content");
 	assert.equal(actionPresentation.actionControls.some((action) => action.taskId === "pull-request-task"), false,
 		"transport must not infer actions for tasks omitted by Manager");
+	const legacyPersistedPresentation = structuredClone(actionPresentation);
+	legacyPersistedPresentation.actionControls[0].confirmation = {
+		title: "Legacy confirmation", body: "Persisted before one-click contract", confirmLabel: "Merge now",
+	};
+	const legacyActionStateFile = join(dataDir, "legacy-action-presentation-state.json");
+	await writeFile(legacyActionStateFile, JSON.stringify({
+		version: 1,
+		projects: {
+			"/legacy-action": {
+				channelId: "legacy-action-channel",
+				summary: {
+					desiredText: legacyPersistedPresentation.content,
+					desiredPresentation: legacyPersistedPresentation,
+					revision: 1,
+					delivery: {
+						messageId: "legacy-action-message",
+						content: legacyPersistedPresentation.content,
+						presentation: legacyPersistedPresentation,
+					},
+				},
+			},
+		},
+		sessions: {},
+		recentMessageIds: [],
+	}));
+	const legacyActionState = new DiscordStateStore(legacyActionStateFile);
+	const normalizedLegacyAction = (await legacyActionState.projectSummaries())[0].summary.desiredPresentation.actionControls[0];
+	assert.deepEqual(normalizedLegacyAction, actionPresentation.actionControls[0],
+		"state loader may strip only bounded legacy confirmation metadata for restart compatibility");
+	const legacyActionCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, legacyActionState, new FakeGateway(),
+	);
+	await legacyActionCore.start();
+	assert.equal((await legacyActionCore.executeDiscordPresentationControl({
+		requestId: "legacy-action-click",
+		guildId: "12345",
+		channelId: "legacy-action-channel",
+		messageId: "legacy-action-message",
+		customId: `m:${actionPresentation.revision}:${actionPresentation.actionControls[0].id}`,
+	})).ok, false, "normalized legacy state must remain inert until fresh owner authorization");
+	await legacyActionCore.stop();
 	assert.equal(parseManagerPresentationEnvelope(validPresentationEnvelope).actionControls, undefined,
 		"presentations without action_controls remain backward compatible");
 	const actionComponents = managerPresentationComponents(actionPresentation).map((component) => component.toJSON());
@@ -2242,6 +2293,13 @@ try {
 		"Refresh & Reconcile remains after opaque summary content");
 	assert.equal(managerSummaryMessageContent({ content: "", components: actionComponents }), actionPresentation.content,
 		"Components V2 text remains discoverable for summary batch metadata");
+	assert.throws(() => parseManagerPresentationEnvelope({
+		...actionPresentationEnvelope,
+		action_controls: [{
+			...actionPresentationEnvelope.action_controls[0],
+			confirmation: { title: "Legacy", body: "Must not authorize", confirm_label: "Confirm" },
+		}],
+	}), /invalid presentation/, "fresh action envelopes must reject obsolete confirmation fields");
 	assert.throws(() => parseManagerPresentationEnvelope({
 		...actionPresentationEnvelope,
 		action_controls: [{ ...actionPresentationEnvelope.action_controls[0], after: actionPresentationEnvelope.content.length + 1 }],
@@ -2617,10 +2675,8 @@ try {
 		call.args.includes(join(managerExecutorRoot, "data", "tasks", "safe-task.md"))), true,
 	"supplied task selection must resolve only to the canonical active task path");
 	assert.deepEqual(await managerExecutor.executePresentationMerge("descriptor-merge", "descriptor-only-task"), {
-		ok: true,
-		message: "@descriptor-only-task merged, pushed, and archived.",
-		terminal: renderMergedManagerTaskTerminal("descriptor-only-task"),
-	}, "validated descriptor merge must return canonical terminal presentation without autocomplete or Markdown parsing");
+		ok: true, message: "@descriptor-only-task merged, pushed, and archived.",
+	}, "validated canonical descriptor merge must return ordinary result without autocomplete or Markdown parsing");
 	assert.deepEqual(managerProcessCalls.at(-1).args.slice(0, 6), [
 		join(managerExecutorRoot, "bin", "manager-supervisor-client.mjs"), "task-merge-and-archive",
 		"--root", managerExecutorRoot, "--task", join(managerExecutorRoot, "data", "tasks", "descriptor-only-task.md"),
@@ -3762,12 +3818,25 @@ try {
 	assert.deepEqual(boundaryPages.at(-1).presentation.controls, boundaryPresentation.controls,
 		"only final manager summary page may carry controls");
 	const pagedActionContent = `${"a".repeat(900)}😀${"b".repeat(3_500)}end`;
-	const pagedActions = [1_900, 3_800, 4_100].map((after, index) => ({
-		id: `merge-page-${index + 1}`, label: "Merge & archive", style: "success", command: "task-merge-and-archive",
-		taskId: `page-task-${index + 1}`, after,
-		confirmation: { title: `Merge page task ${index + 1}?`, body: `Body ${index + 1}`, confirmLabel: "Confirm" },
-	}));
-	const pagedActionPresentation = managerPresentationPayload("e".repeat(64), pagedActionContent, undefined, pagedActions);
+	const pagedActionEnvelope = {
+		ok: true,
+		command: "summary-render",
+		schema_version: 1,
+		revision: "e".repeat(64),
+		content: pagedActionContent,
+		controls: [{ id: "github-refresh-reconcile", label: "Refresh & Reconcile", style: "secondary", command: "github-refresh-reconcile" }],
+		action_controls: [1_900, 3_800, 4_100].map((after, index) => ({
+			id: `merge-page-${index + 1}`,
+			label: "Merge & archive",
+			style: "success",
+			command: "task-merge-and-archive",
+			task_id: `page-task-${index + 1}`,
+			after,
+		})),
+		degraded: false,
+		warnings: [],
+	};
+	const pagedActionPresentation = parseManagerPresentationEnvelope(pagedActionEnvelope);
 	const pagedActionPages = paginateManagerPresentation(pagedActionPresentation);
 	assert.equal(pagedActionPages.length, 3);
 	assert.deepEqual(pagedActionPages.map((page) => page.presentation.actionControls.map((action) => action.id)), [
@@ -4085,22 +4154,6 @@ try {
 	const actionGateway = new FakeGateway();
 	const actionCore = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, actionState, actionGateway);
 	await actionCore.start();
-	const actionTarget = await actionCore.prepareRegistration("action-target-client", "action-target-generation", {
-		cwd: "/presentation-action-target", projectIdentityResolved: true, sessionId: "action-target-session",
-		managerTaskSnapshotTaskId: "page-task-1",
-	});
-	await actionCore.activateRegistration(
-		"action-target-client", "action-target-generation", "action-target-session", () => true,
-		undefined, false, undefined, false, undefined, "page-task-1",
-	);
-	const unrelatedTarget = await actionCore.prepareRegistration("unrelated-target-client", "unrelated-target-generation", {
-		cwd: "/presentation-action-unrelated", projectIdentityResolved: true, sessionId: "unrelated-target-session",
-		managerTaskSnapshotTaskId: "unrelated-task",
-	});
-	await actionCore.activateRegistration(
-		"unrelated-target-client", "unrelated-target-generation", "unrelated-target-session", () => true,
-		undefined, false, undefined, false, undefined, "unrelated-task",
-	);
 	await actionCore.prepareRegistration("presentation-action-client", "presentation-action-generation", {
 		cwd: "/presentation-action-manager", projectIdentityResolved: true, sessionId: "presentation-action-session",
 	});
@@ -4112,11 +4165,7 @@ try {
 			controlIds: ["github-refresh-reconcile"],
 			execute: async (request) => {
 				actionExecutions.push(structuredClone(request));
-				return {
-					ok: true,
-					message: `@${request.actionControl.taskId} merged, pushed, and archived.`,
-					terminal: renderMergedManagerTaskTerminal(request.actionControl.taskId),
-				};
+				return managerExecutor.executePresentationMerge(request.requestId, request.actionControl.taskId);
 			},
 		},
 	);
@@ -4151,17 +4200,18 @@ try {
 		ok: true, message: "@page-task-1 merged, pushed, and archived.",
 	}, "duplicate interaction ID must reuse first-click result");
 	assert.equal(actionExecutions.length, 1, "first click executes exactly once");
-	await waitFor(async () => (await actionState.getSession("action-target-session"))?.managerTaskTerminal?.archived,
-		"merge action terminal delivery and exact task thread close");
-	assert.deepEqual((FakeGateway.channelMessages.get(actionTarget.threadId) ?? []).map((message) => message.text), [
-		renderMergedManagerTaskTerminal("page-task-1").content,
-	], "successful merge action must deliver canonical terminal content to exact mapped task thread");
-	assert.equal(FakeGateway.archivedThreads.has(actionTarget.threadId), true,
-		"observed ready-merge regression: exact task thread must close after terminal delivery");
-	assert.equal(FakeGateway.archivedThreads.has(unrelatedTarget.threadId), false,
-		"merge action must not close unrelated mapped thread");
+	assert.equal((await actionState.managerTaskTerminals()).length, 0,
+		"presentation-control success must not synthesize terminal state before canonical Manager receipt");
 	assert.deepEqual(actionExecutions[0].actionControl, pagedActionPresentation.actionControls[0],
-		"relay forwards exact manager-owned action descriptor instead of parsing summary Markdown");
+		"relay forwards exact canonical envelope descriptor instead of parsing summary Markdown");
+	assert.deepEqual(managerProcessCalls.at(-1).args.slice(0, 6), [
+		join(managerExecutorRoot, "bin", "manager-supervisor-client.mjs"),
+		"task-merge-and-archive",
+		"--root",
+		managerExecutorRoot,
+		"--task",
+		join(managerExecutorRoot, "data", "tasks", "page-task-1.md"),
+	], "first canonical action click must reach exact Supervisor merge execution");
 	const replacedActionPresentation = { ...pagedActionPresentation, revision: "7".repeat(64), content: `${pagedActionPresentation.content}\nUpdated.` };
 	await actionCore.queueManagerPresentation(
 		"presentation-action-client", "presentation-action-generation", "presentation-action-session", replacedActionPresentation,
@@ -4323,15 +4373,13 @@ try {
 		type: "outbound", requestId: "response-invalid", messageId: "assistant-2", kind: "user", text: "bad",
 		responseTo: ["turn-1"],
 	}), false, "only assistant delivery may settle exact working indicators");
-	const protocolTerminal = renderMergedManagerTaskTerminal("protocol-task");
 	assert.equal(isClientFrame({
 		type: "manager_presentation_control_result", requestId: "merge-1", ok: true, message: "done",
-		terminal: protocolTerminal,
 	}), true);
 	assert.equal(isClientFrame({
-		type: "manager_presentation_control_result", requestId: "merge-failed", ok: false, message: "failed",
-		terminal: protocolTerminal,
-	}), false, "failed Manager actions must not inject terminal presentation");
+		type: "manager_presentation_control_result", requestId: "merge-with-terminal", ok: true, message: "done",
+		terminal: taskTerminal,
+	}), false, "presentation-control IPC must reject terminal payloads");
 	assert.equal(isClientFrame({ type: "release_inbound_images", requestId: "release-1", messageId: "message-1" }), true);
 	assert.equal(isServerFrame({ type: "inbound_images_released", requestId: "release-1", messageId: "message-1" }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "high" } }), true);
@@ -4786,7 +4834,7 @@ try {
 		type: "manager_presentation_control", requestId: "task-action-interaction", revision: actionPresentation.revision,
 		controlId: actionPresentation.actionControls[0].id, command: "task-merge-and-archive",
 		actionControl: actionPresentation.actionControls[0],
-	}), true, "validated task action descriptors cross relay IPC only after confirmation");
+	}), true, "validated canonical task action descriptors cross relay IPC for first-click execution");
 	assert.equal(isServerFrame({
 		type: "manager_presentation_control", requestId: "mismatched-task-action", revision: actionPresentation.revision,
 		controlId: "wrong-action", command: "task-merge-and-archive", actionControl: actionPresentation.actionControls[0],
@@ -4894,10 +4942,13 @@ try {
 	compatibilityDirectory = await mkdtemp(join(tmpdir(), "dc-ipc-"));
 	const compatibilityPaths = relayPaths(compatibilityDirectory);
 	const previousHostFrames = [];
+	const previousHostWorkingFrames = [];
 	const previousHostRegistrations = [];
 	const compatibilitySockets = [];
 	let rejectOutbound = false;
+	let rejectWorking = false;
 	let handleOutbound;
+	let handleWorking;
 	const compatibilityServer = createServer((socket) => {
 		compatibilitySockets.push(socket);
 		socket.setEncoding("utf8");
@@ -4914,6 +4965,15 @@ try {
 						previousHostRegistrations.push(frame);
 						if (!previousRegisterValidator(frame)) socket.end();
 						else socket.write(`${JSON.stringify({ type: "registered", channelId: "compat-channel", threadId: "compat-thread", leaderPid: process.pid })}\n`);
+					} else if (frame.type === "working") {
+						previousHostWorkingFrames.push(frame);
+						if (handleWorking?.(frame, socket)) {
+							// Focused retry tests control acknowledgement or disconnection.
+						} else if (rejectWorking) {
+							socket.write(`${JSON.stringify({ type: "error", message: "injected working rejection", requestId: frame.requestId })}\n`);
+						} else {
+							socket.write(`${JSON.stringify({ type: "working_queued", requestId: frame.requestId, messageId: frame.messageId })}\n`);
+						}
 					} else if (frame.type === "outbound") {
 						previousHostFrames.push(frame);
 						if (!previousValidator(frame)) {
@@ -4963,6 +5023,25 @@ try {
 		"the previous relay registration validator must accept the additive producer capability");
 	assert.equal(compatibilityClient.status().sessionControls, undefined, "an older relay must not advertise unsupported controls");
 	assert.equal(compatibilityClient.status().inboundImages, undefined, "an older relay must preserve text-only rolling compatibility");
+	let workingRetryAttempts = 0;
+	handleWorking = (_frame, socket) => {
+		if (++workingRetryAttempts !== 1) return false;
+		socket.destroy();
+		return true;
+	};
+	await compatibilityClient.startWorking("compatibility-inbound");
+	handleWorking = undefined;
+	assert.equal(previousHostWorkingFrames.length, 2, "transient working persistence failure must reconnect and retry");
+	assert.deepEqual(new Set(previousHostWorkingFrames.map((frame) => frame.messageId)), new Set(["compatibility-inbound"]),
+		"working retry must preserve exact inbound identity for relay deduplication");
+	assert.notEqual(previousHostWorkingFrames[0].requestId, previousHostWorkingFrames[1].requestId,
+		"working retries need fresh request correlation");
+	rejectWorking = true;
+	const rejectedWorkingCount = previousHostWorkingFrames.length;
+	await assert.rejects(() => compatibilityClient.startWorking("rejected-working"), /injected working rejection/);
+	assert.equal(previousHostWorkingFrames.length, rejectedWorkingCount + 1,
+		"explicit relay rejection must stop working retries");
+	rejectWorking = false;
 	compatibilityClient.updateLifecycle("compatibility-inbound", "thinking");
 	await compatibilityClient.sendInteractiveUserText("hot **reload**");
 	assert.equal(previousHostFrames.length, 1);
