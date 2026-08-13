@@ -4086,6 +4086,126 @@ try {
 		"owner replacement and identical successor presentation must cause zero Discord sends or deletes");
 	await replacementCore.stop();
 
+	const disconnectChannel = "summary-successor-disconnect-channel";
+	FakeGateway.channelMessages.delete(disconnectChannel);
+	const disconnectState = new DiscordStateStore(join(dataDir, "summary-successor-disconnect-state.json"));
+	const disconnectGateway = new FakeGateway();
+	disconnectGateway.ensureProjectChannel = async () => disconnectChannel;
+	const disconnectCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, disconnectState, disconnectGateway,
+	);
+	await disconnectCore.start();
+	for (const producer of ["retiring", "successor"]) {
+		await disconnectCore.prepareRegistration(`${producer}-client`, `${producer}-generation`, {
+			cwd: "/summary-successor-disconnect", projectIdentityResolved: true, sessionId: `${producer}-session`,
+		});
+		await disconnectCore.activateRegistration(
+			`${producer}-client`, `${producer}-generation`, `${producer}-session`, () => true,
+			undefined, false, undefined, true,
+			{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: producer }) },
+		);
+	}
+	const disconnectPresentation = managerPresentationPayload("e".repeat(64), "disconnect during retirement");
+	await disconnectCore.queueManagerPresentation(
+		"retiring-client", "retiring-generation", "retiring-session", disconnectPresentation,
+	);
+	await waitFor(async () => (await disconnectState.projectSummaries())[0]?.summary.delivery?.presentation?.revision ===
+		disconnectPresentation.revision, "disconnect retirement seed");
+	const readProjectSummaries = disconnectState.projectSummaries.bind(disconnectState);
+	let retirementReads = 0, releaseRetirementRead, markRetirementRead;
+	const retirementRead = new Promise((resolveStarted) => { markRetirementRead = resolveStarted; });
+	disconnectState.projectSummaries = async () => {
+		if (++retirementReads === 3) {
+			markRetirementRead();
+			await new Promise((resolveRead) => { releaseRetirementRead = resolveRead; });
+		}
+		return readProjectSummaries();
+	};
+	disconnectCore.unregisterClient("retiring-client", "retiring-generation");
+	await retirementRead;
+	disconnectCore.unregisterClient("successor-client", "successor-generation");
+	releaseRetirementRead();
+	await waitFor(() => FakeGateway.channelMessages.get(disconnectChannel)?.at(-1)?.presentation?.controls.length === 0,
+		"disconnected successor control stripping");
+	await disconnectCore.stop();
+
+	const incapableChannel = "summary-incapable-successor-channel";
+	FakeGateway.channelMessages.delete(incapableChannel);
+	const incapableState = new DiscordStateStore(join(dataDir, "summary-incapable-successor-state.json"));
+	const incapableGateway = new FakeGateway();
+	incapableGateway.ensureProjectChannel = async () => incapableChannel;
+	const incapableCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, incapableState, incapableGateway,
+	);
+	await incapableCore.start();
+	await incapableCore.prepareRegistration("controlled-client", "controlled-generation", {
+		cwd: "/summary-incapable-successor", projectIdentityResolved: true, sessionId: "controlled-session",
+	});
+	await incapableCore.activateRegistration(
+		"controlled-client", "controlled-generation", "controlled-session", () => true,
+		undefined, false, undefined, true,
+		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "controlled" }) },
+	);
+	const incapablePresentation = managerPresentationPayload("d".repeat(64), "incapable successor");
+	await incapableCore.queueManagerPresentation(
+		"controlled-client", "controlled-generation", "controlled-session", incapablePresentation,
+	);
+	await waitFor(async () => (await incapableState.projectSummaries())[0]?.summary.delivery?.presentation?.revision ===
+		incapablePresentation.revision, "incapable successor seed");
+	await incapableCore.prepareRegistration("basic-client", "basic-generation", {
+		cwd: "/summary-incapable-successor", projectIdentityResolved: true, sessionId: "basic-session",
+	});
+	await incapableCore.activateRegistration(
+		"basic-client", "basic-generation", "basic-session", () => true,
+		undefined, false, undefined, true,
+	);
+	incapableCore.unregisterClient("controlled-client", "controlled-generation");
+	await waitFor(() => FakeGateway.channelMessages.get(incapableChannel)?.at(-1)?.presentation?.controls.length === 0,
+		"incapable successor control stripping");
+	await incapableCore.queueProjectSummary("basic-client", "basic-generation", "basic-session", "basic successor summary");
+	await waitFor(() => FakeGateway.channelMessages.get(incapableChannel)?.at(-1)?.text === "basic successor summary",
+		"basic successor promotion after stripping");
+	await incapableCore.stop();
+
+	const capabilityLossChannel = "summary-capability-loss-channel";
+	FakeGateway.channelMessages.delete(capabilityLossChannel);
+	const capabilityLossState = new DiscordStateStore(join(dataDir, "summary-capability-loss-state.json"));
+	const capabilityLossGateway = new FakeGateway();
+	capabilityLossGateway.ensureProjectChannel = async () => capabilityLossChannel;
+	const capabilityLossCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, capabilityLossState, capabilityLossGateway,
+	);
+	await capabilityLossCore.start();
+	await capabilityLossCore.prepareRegistration("capability-client", "capable-generation", {
+		cwd: "/summary-capability-loss", projectIdentityResolved: true, sessionId: "capability-session",
+	});
+	await capabilityLossCore.activateRegistration(
+		"capability-client", "capable-generation", "capability-session", () => true,
+		undefined, false, undefined, true,
+		{ controlIds: ["github-refresh-reconcile"], execute: async () => ({ ok: true, message: "capable" }) },
+	);
+	const capabilityLossPresentation = managerPresentationPayload("c".repeat(64), "capability loss");
+	await capabilityLossCore.queueManagerPresentation(
+		"capability-client", "capable-generation", "capability-session", capabilityLossPresentation,
+	);
+	await waitFor(async () => (await capabilityLossState.projectSummaries())[0]?.summary.delivery?.presentation?.revision ===
+		capabilityLossPresentation.revision, "capability-loss seed");
+	const capabilityLossMessage = FakeGateway.channelMessages.get(capabilityLossChannel).at(-1);
+	await capabilityLossCore.prepareRegistration("capability-client", "incapable-generation", {
+		cwd: "/summary-capability-loss", projectIdentityResolved: true, sessionId: "capability-session",
+	});
+	await capabilityLossCore.activateRegistration(
+		"capability-client", "incapable-generation", "capability-session", () => true,
+	);
+	assert.equal((await capabilityLossCore.executeDiscordPresentationControl({
+		requestId: "capability-loss-control", guildId: "12345", channelId: capabilityLossChannel,
+		messageId: capabilityLossMessage.id,
+		customId: `m:${capabilityLossPresentation.revision}:github-refresh-reconcile`,
+	})).ok, false, "replaced capable owner must immediately lose control authorization");
+	await waitFor(() => FakeGateway.channelMessages.get(capabilityLossChannel)?.at(-1)?.presentation?.controls.length === 0,
+		"same-session capability-loss stripping");
+	await capabilityLossCore.stop();
+
 	const discoveryFenceChannel = "discovery-fence-channel";
 	const discoveryFenceState = new DiscordStateStore(join(dataDir, "discovery-fence-state.json"));
 	const discoveryFenceGateway = new FakeGateway();
