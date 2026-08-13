@@ -485,6 +485,7 @@ try {
 		MANAGER_CONTROL_IPC_TIMEOUT_MS,
 	} = await importBuilt("extensions/discord/relay-host.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
+	const { renderMergedManagerTaskTerminal } = await importBuilt("extensions/discord/manager-task-terminal.js");
 	const { DiscordBridge, inboundMessageId, stripInboundMarker } = await importBuilt("extensions/discord/bridge.js");
 	const {
 		InboundImageStore,
@@ -951,6 +952,72 @@ try {
 	await assert.rejects(() => new DiscordStateStore(malformedSnapshotStateFile).load(), /invalid manager task snapshot/,
 		"malformed persisted task snapshots must fail visibly");
 
+	const workingState = new DiscordStateStore(join(dataDir, "working-indicator-state.json"));
+	const workingGateway = new FakeGateway();
+	workingGateway.ensureProjectChannel = async () => "working-channel";
+	const workingThreads = new Map([
+		["working-a", "working-thread-a"],
+		["working-b", "working-thread-b"],
+	]);
+	workingGateway.ensureSessionThread = async (request) => [...workingThreads.values()].find((id) => id === request.mappedThreadId) ??
+		workingThreads.get(request.name);
+	const workingCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 }, workingState, workingGateway,
+	);
+	await workingCore.start();
+	for (const suffix of ["a", "b"]) {
+		const sessionId = `working-session-${suffix}`;
+		await workingCore.prepareRegistration(`working-client-${suffix}`, `working-generation-${suffix}`, {
+			cwd: `/working/${suffix}`, projectIdentityResolved: true, sessionId, sessionName: `working-${suffix}`,
+		});
+		await workingCore.activateRegistration(
+			`working-client-${suffix}`, `working-generation-${suffix}`, sessionId, () => true,
+		);
+		await workingGateway.emit({
+			id: `working-turn-${suffix}`, channelId: `working-thread-${suffix}`, content: `turn ${suffix}`, authorBot: false,
+		});
+		await workingCore.queueLifecycleUpdate(
+			`working-client-${suffix}`, `working-generation-${suffix}`, sessionId, `working-turn-${suffix}`, "thinking",
+		);
+		await workingCore.queueWorking(
+			`working-client-${suffix}`, `working-generation-${suffix}`, sessionId, `working-turn-${suffix}`,
+		);
+	}
+	await waitFor(() => [...workingThreads.values()].every((threadId) =>
+		(FakeGateway.channelMessages.get(threadId) ?? []).some((message) => message.text === "Working...")),
+	"one exact working indicator per accepted concurrent turn");
+	const indicatorA = (FakeGateway.channelMessages.get("working-thread-a") ?? []).find((message) => message.text === "Working...");
+	const indicatorB = (FakeGateway.channelMessages.get("working-thread-b") ?? []).find((message) => message.text === "Working...");
+	assert.ok(indicatorA && indicatorB && indicatorA.id !== indicatorB.id);
+	await workingCore.queueOutbound(
+		"working-client-a", "working-generation-a", "working-session-a",
+		"cross-turn-response", "assistant", "cross turn response", ["working-turn-b"],
+	);
+	await waitFor(() => FakeGateway.sendAttempts.get("cross turn response") === 1, "cross-turn response delivery");
+	assert.equal((FakeGateway.channelMessages.get("working-thread-b") ?? []).some((message) => message.id === indicatorB.id), true,
+		"response from another session must not remove unrelated indicator");
+	FakeGateway.failOnceTexts.add("working answer a");
+	await workingCore.queueOutbound(
+		"working-client-a", "working-generation-a", "working-session-a",
+		"working-response-a", "assistant", "working answer a", ["working-turn-a"],
+	);
+	await waitFor(() => FakeGateway.sendAttempts.get("working answer a") === 1, "failed correlated response attempt");
+	assert.equal((FakeGateway.channelMessages.get("working-thread-a") ?? []).some((message) => message.id === indicatorA.id), true,
+		"failed response delivery must keep exact indicator visible");
+	await workingCore.queueOutbound(
+		"working-client-b", "working-generation-b", "working-session-b",
+		"working-response-b", "assistant", "working answer b", ["working-turn-b"],
+	);
+	await waitFor(() => !(FakeGateway.channelMessages.get("working-thread-b") ?? []).some((message) => message.id === indicatorB.id),
+		"successful concurrent response indicator deletion");
+	assert.equal((FakeGateway.channelMessages.get("working-thread-a") ?? []).some((message) => message.id === indicatorA.id), true,
+		"successful concurrent turn must not remove failed turn indicator");
+	await waitFor(() => !(FakeGateway.channelMessages.get("working-thread-a") ?? []).some((message) => message.id === indicatorA.id),
+		"retried response delivery indicator deletion");
+	assert.equal((FakeGateway.channelMessages.get("working-thread-a") ?? []).filter((message) => message.text === "Working...").length, 0);
+	assert.equal((FakeGateway.channelMessages.get("working-thread-b") ?? []).filter((message) => message.text === "Working...").length, 0);
+	await workingCore.stop();
+
 	const terminalStateFile = join(dataDir, "manager-task-terminal-state.json");
 	const terminalState = new DiscordStateStore(terminalStateFile);
 	const terminalGateway = new FakeGateway();
@@ -989,6 +1056,11 @@ try {
 	await terminalCore.queueManagerTaskTerminal(
 		"terminal-producer-client", "terminal-producer-generation", "terminal-producer-session", taskTerminal,
 	);
+	await waitFor(() => FakeGateway.sendAttempts.get(taskTerminal.content) === 1, "failed terminal delivery attempt");
+	assert.equal(FakeGateway.lockedThreads.has("terminal-thread"), false,
+		"failed terminal content delivery must leave exact thread unlocked");
+	assert.equal(FakeGateway.archivedThreads.has("terminal-thread"), false,
+		"failed terminal content delivery must leave exact thread open");
 	let persistedTerminal = (await terminalState.getSession("terminal-target-session")).managerTaskTerminal;
 	assert.equal(persistedTerminal.desired.content, taskTerminal.content,
 		"terminal desired state must be durable before Discord side effects settle");
@@ -1833,91 +1905,33 @@ try {
 	assert.equal(actionPayload.flags, MessageFlags.SuppressEmbeds | MessageFlags.IsComponentsV2);
 	assert.equal(actionPayload.components[0].type, 17);
 	assert.deepEqual(actionPayload.allowedMentions, { parse: [] });
-	const confirmationTransport = new DiscordJsTransport();
-	const confirmationRequests = [];
-	confirmationTransport.onPresentationControl(async (request) => {
-		confirmationRequests.push(request);
-		return request.confirmed
-			? { ok: true, message: "@ready-task merged, pushed, and archived." }
-			: { ok: true, message: "Confirmation required.", confirmation: {
-				title: "Merge ready-task?", body: "Land on main and push origin/main.", confirmLabel: "Merge now",
-			} };
+	const actionTransport = new DiscordJsTransport();
+	const actionRequests = [];
+	actionTransport.onPresentationControl(async (request) => {
+		actionRequests.push(request);
+		return { ok: true, message: "@ready-task merged, pushed, and archived." };
 	});
-	const confirmationReplies = [];
-	let confirmationDeferredFlags;
-	let decisionDeferred = false;
-	const confirmationInteraction = {
-		id: "preview-interaction", guildId: "12345", user: { id: "owner" },
+	const actionReplies = [];
+	let actionDeferredFlags;
+	await actionTransport.executePresentationControlInteraction({
+		id: "merge-interaction", guildId: "12345", user: { id: "owner" },
 		message: { id: "summary-message" }, customId: `m:${"9".repeat(64)}:merge-ready`,
-		async deferReply(options) { confirmationDeferredFlags = options.flags; },
-		async editReply(payload) {
-			confirmationReplies.push(payload);
-			return {
-				async awaitMessageComponent(options) {
-					const customId = payload.components[0].toJSON().components[0].custom_id;
-					const decision = { id: "confirm-interaction", customId, user: { id: "owner" },
-						async deferUpdate() { decisionDeferred = true; } };
-					assert.equal(options.filter({ ...decision, user: { id: "wrong-user" } }), false,
-						"wrong user cannot satisfy confirmation collector");
-					assert.equal(options.filter(decision), true);
-					return decision;
-				},
-			};
-		},
-	};
-	await confirmationTransport.executePresentationControlInteraction(confirmationInteraction, "project-channel");
-	assert.equal(confirmationDeferredFlags, MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds,
-		"merge confirmation must remain ephemeral");
-	assert.equal(confirmationReplies[0].content, "Merge ready-task?\nLand on main and push origin/main.");
-	assert.equal(confirmationReplies[0].components[0].toJSON().components[0].label, "Merge now");
-	assert.equal(decisionDeferred, true);
-	assert.deepEqual(confirmationRequests.map(({ requestId, confirmed }) => ({ requestId, confirmed })), [
-		{ requestId: "preview-interaction", confirmed: undefined },
-		{ requestId: "confirm-interaction", confirmed: true },
-	], "only explicit confirmation advances manager action execution");
-	assert.equal(confirmationReplies.at(-1).content, "✅ @ready-task merged, pushed, and archived.");
+		async deferReply(options) { actionDeferredFlags = options.flags; },
+		async editReply(payload) { actionReplies.push(payload); },
+	}, "project-channel");
+	assert.equal(actionDeferredFlags, MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds,
+		"merge result must remain ephemeral");
+	assert.deepEqual(actionRequests, [{
+		requestId: "merge-interaction", guildId: "12345", channelId: "project-channel",
+		messageId: "summary-message", customId: `m:${"9".repeat(64)}:merge-ready`,
+	}], "first valid click must execute exactly once without confirmation interaction");
+	assert.equal(actionReplies.at(-1).content, "✅ @ready-task merged, pushed, and archived.");
 	assert.equal(isManagerPresentationButton(`m:${"9".repeat(64)}:merge-ready`), true);
-	assert.equal(isManagerPresentationButton("mc:preview-interaction:yes"), false,
-		"generic InteractionCreate dispatch must ignore collector-owned confirmation IDs");
+	assert.equal(isManagerPresentationButton("mc:merge-interaction:yes"), false);
 	let genericDispatches = 0;
-	assert.equal(dispatchManagerPresentationButton({ customId: "mc:preview-interaction:yes" }, () => genericDispatches++), false);
+	assert.equal(dispatchManagerPresentationButton({ customId: "mc:merge-interaction:yes" }, () => genericDispatches++), false);
 	assert.equal(dispatchManagerPresentationButton({ customId: `m:${"9".repeat(64)}:merge-ready` }, () => genericDispatches++), true);
-	assert.equal(genericDispatches, 1, "dispatch routes summary action once and ignores confirmation button");
-	const requestsBeforeCancel = confirmationRequests.length;
-	let cancelAcks = 0;
-	await confirmationTransport.executePresentationControlInteraction({
-		...confirmationInteraction,
-		id: "cancel-preview",
-		async editReply(payload) {
-			confirmationReplies.push(payload);
-			return { async awaitMessageComponent(options) {
-				const customId = payload.components[0].toJSON().components[1].custom_id;
-				const decision = { id: "cancel-interaction", customId, user: { id: "owner" },
-					async deferUpdate() { cancelAcks++; } };
-				assert.equal(options.filter(decision), true);
-				return decision;
-			} };
-		},
-	}, "project-channel");
-	assert.equal(cancelAcks, 1, "collector alone acknowledges cancel exactly once");
-	assert.equal(confirmationRequests.length, requestsBeforeCancel + 1,
-		"cancel performs preview only and no confirmed relay request/execution");
-	const requestsBeforeWrongUser = confirmationRequests.length;
-	await confirmationTransport.executePresentationControlInteraction({
-		...confirmationInteraction,
-		id: "wrong-user-preview",
-		async editReply(payload) {
-			confirmationReplies.push(payload);
-			return { async awaitMessageComponent(options) {
-				const customId = payload.components[0].toJSON().components[0].custom_id;
-				assert.equal(options.filter({ id: "wrong-user-confirm", customId, user: { id: "intruder" } }), false);
-				throw new Error("simulated collector timeout");
-			} };
-		},
-	}, "project-channel");
-	assert.equal(confirmationRequests.length, requestsBeforeWrongUser + 1,
-		"wrong user performs preview only and no confirmed relay request/execution");
-	assert.equal(confirmationReplies.at(-1).content, "❌ Merge confirmation expired.");
+	assert.equal(genericDispatches, 1, "dispatch routes summary action once");
 
 	const historyRevision = "a".repeat(64);
 	const historyMessages = Array.from({ length: 150 }, (_, index) => ({
@@ -2603,8 +2617,10 @@ try {
 		call.args.includes(join(managerExecutorRoot, "data", "tasks", "safe-task.md"))), true,
 	"supplied task selection must resolve only to the canonical active task path");
 	assert.deepEqual(await managerExecutor.executePresentationMerge("descriptor-merge", "descriptor-only-task"), {
-		ok: true, message: "@descriptor-only-task merged, pushed, and archived.",
-	}, "validated descriptor merge must execute with empty/stale autocomplete catalogue");
+		ok: true,
+		message: "@descriptor-only-task merged, pushed, and archived.",
+		terminal: renderMergedManagerTaskTerminal("descriptor-only-task"),
+	}, "validated descriptor merge must return canonical terminal presentation without autocomplete or Markdown parsing");
 	assert.deepEqual(managerProcessCalls.at(-1).args.slice(0, 6), [
 		join(managerExecutorRoot, "bin", "manager-supervisor-client.mjs"), "task-merge-and-archive",
 		"--root", managerExecutorRoot, "--task", join(managerExecutorRoot, "data", "tasks", "descriptor-only-task.md"),
@@ -4069,6 +4085,22 @@ try {
 	const actionGateway = new FakeGateway();
 	const actionCore = new DiscordRelayCore({ token: "token", guildId: "12345", epoch: 1 }, actionState, actionGateway);
 	await actionCore.start();
+	const actionTarget = await actionCore.prepareRegistration("action-target-client", "action-target-generation", {
+		cwd: "/presentation-action-target", projectIdentityResolved: true, sessionId: "action-target-session",
+		managerTaskSnapshotTaskId: "page-task-1",
+	});
+	await actionCore.activateRegistration(
+		"action-target-client", "action-target-generation", "action-target-session", () => true,
+		undefined, false, undefined, false, undefined, "page-task-1",
+	);
+	const unrelatedTarget = await actionCore.prepareRegistration("unrelated-target-client", "unrelated-target-generation", {
+		cwd: "/presentation-action-unrelated", projectIdentityResolved: true, sessionId: "unrelated-target-session",
+		managerTaskSnapshotTaskId: "unrelated-task",
+	});
+	await actionCore.activateRegistration(
+		"unrelated-target-client", "unrelated-target-generation", "unrelated-target-session", () => true,
+		undefined, false, undefined, false, undefined, "unrelated-task",
+	);
 	await actionCore.prepareRegistration("presentation-action-client", "presentation-action-generation", {
 		cwd: "/presentation-action-manager", projectIdentityResolved: true, sessionId: "presentation-action-session",
 	});
@@ -4080,7 +4112,11 @@ try {
 			controlIds: ["github-refresh-reconcile"],
 			execute: async (request) => {
 				actionExecutions.push(structuredClone(request));
-				return { ok: true, message: `@${request.actionControl.taskId} merged, pushed, and archived.` };
+				return {
+					ok: true,
+					message: `@${request.actionControl.taskId} merged, pushed, and archived.`,
+					terminal: renderMergedManagerTaskTerminal(request.actionControl.taskId),
+				};
 			},
 		},
 	);
@@ -4099,25 +4135,31 @@ try {
 	const actionMessage = actionMessages.find((message) => message.presentation.actionControls?.[0]?.id === "merge-page-1");
 	const otherValidPage = actionMessages.find((message) => message.id !== actionMessage.id);
 	const actionRequest = {
-		requestId: "action-merge-preview", guildId: "12345", channelId: actionMapping.channelId, messageId: actionMessage.id,
+		requestId: "action-merge-click", guildId: "12345", channelId: actionMapping.channelId, messageId: actionMessage.id,
 		customId: `m:${pagedActionPresentation.revision}:merge-page-1`,
 	};
-	assert.deepEqual(await actionCore.executeDiscordPresentationControl(actionRequest), {
-		ok: true,
-		message: "Confirmation required.",
-		confirmation: { title: "Merge page task 1?", body: "Body 1", confirmLabel: "Confirm" },
-	}, "ready direct-landing action must return manager-owned confirmation details before mutation");
-	assert.equal(actionExecutions.length, 0, "preview must not execute merge-and-archive");
 	assert.equal((await actionCore.executeDiscordPresentationControl({
-		...actionRequest, requestId: "action-wrong-message", messageId: "stale-message", confirmed: true,
+		...actionRequest, requestId: "action-wrong-message", messageId: "stale-message",
 	})).ok, false, "task action from wrong summary message must fail stale");
 	assert.equal((await actionCore.executeDiscordPresentationControl({
-		...actionRequest, requestId: "action-other-valid-page", messageId: otherValidPage.id, confirmed: true,
-	})).ok, false, "task action must reject every other valid page in the same delivered batch");
-	assert.deepEqual(await actionCore.executeDiscordPresentationControl({
-		...actionRequest, requestId: "action-merge-confirmed", confirmed: true,
-	}), { ok: true, message: "@page-task-1 merged, pushed, and archived." });
-	assert.equal(actionExecutions.length, 1, "confirmed action executes exactly once");
+		...actionRequest, requestId: "action-other-valid-page", messageId: otherValidPage.id,
+	})).ok, false, "task action must reject every other valid page in same delivered batch");
+	assert.deepEqual(await actionCore.executeDiscordPresentationControl(actionRequest), {
+		ok: true, message: "@page-task-1 merged, pushed, and archived.",
+	}, "first valid click must execute merge-and-archive without confirmation");
+	assert.deepEqual(await actionCore.executeDiscordPresentationControl(actionRequest), {
+		ok: true, message: "@page-task-1 merged, pushed, and archived.",
+	}, "duplicate interaction ID must reuse first-click result");
+	assert.equal(actionExecutions.length, 1, "first click executes exactly once");
+	await waitFor(async () => (await actionState.getSession("action-target-session"))?.managerTaskTerminal?.archived,
+		"merge action terminal delivery and exact task thread close");
+	assert.deepEqual((FakeGateway.channelMessages.get(actionTarget.threadId) ?? []).map((message) => message.text), [
+		renderMergedManagerTaskTerminal("page-task-1").content,
+	], "successful merge action must deliver canonical terminal content to exact mapped task thread");
+	assert.equal(FakeGateway.archivedThreads.has(actionTarget.threadId), true,
+		"observed ready-merge regression: exact task thread must close after terminal delivery");
+	assert.equal(FakeGateway.archivedThreads.has(unrelatedTarget.threadId), false,
+		"merge action must not close unrelated mapped thread");
 	assert.deepEqual(actionExecutions[0].actionControl, pagedActionPresentation.actionControls[0],
 		"relay forwards exact manager-owned action descriptor instead of parsing summary Markdown");
 	const replacedActionPresentation = { ...pagedActionPresentation, revision: "7".repeat(64), content: `${pagedActionPresentation.content}\nUpdated.` };
@@ -4127,7 +4169,7 @@ try {
 	await waitFor(async () => (await actionState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === replacedActionPresentation.revision,
 		"action_controls replacement delivery");
 	assert.equal((await actionCore.executeDiscordPresentationControl({
-		...actionRequest, requestId: "action-stale-revision", confirmed: true,
+		...actionRequest, requestId: "action-stale-revision",
 	})).ok, false, "replaced action_controls must fail stale revision and message authorization");
 	assert.equal(actionExecutions.length, 1);
 	await actionCore.stop();
@@ -4271,6 +4313,25 @@ try {
 	assert.equal(isClientFrame({ type: "manager_catalogue", requestId: "catalogue-rolling-client", taskCatalogue: [managerTask] }), true,
 		"older lifecycle-only manager clients must remain protocol-compatible without ask targets");
 	assert.equal(isClientFrame({ type: "manager_control_result", requestId: "manager-1", ok: true, message: "done" }), true);
+	assert.equal(isClientFrame({ type: "working", requestId: "working-1", messageId: "turn-1" }), true);
+	assert.equal(isServerFrame({ type: "working_queued", requestId: "working-1", messageId: "turn-1" }), true);
+	assert.equal(isClientFrame({
+		type: "outbound", requestId: "response-1", messageId: "assistant-1", kind: "assistant", text: "done",
+		responseTo: ["turn-1"],
+	}), true);
+	assert.equal(isClientFrame({
+		type: "outbound", requestId: "response-invalid", messageId: "assistant-2", kind: "user", text: "bad",
+		responseTo: ["turn-1"],
+	}), false, "only assistant delivery may settle exact working indicators");
+	const protocolTerminal = renderMergedManagerTaskTerminal("protocol-task");
+	assert.equal(isClientFrame({
+		type: "manager_presentation_control_result", requestId: "merge-1", ok: true, message: "done",
+		terminal: protocolTerminal,
+	}), true);
+	assert.equal(isClientFrame({
+		type: "manager_presentation_control_result", requestId: "merge-failed", ok: false, message: "failed",
+		terminal: protocolTerminal,
+	}), false, "failed Manager actions must not inject terminal presentation");
 	assert.equal(isClientFrame({ type: "release_inbound_images", requestId: "release-1", messageId: "message-1" }), true);
 	assert.equal(isServerFrame({ type: "inbound_images_released", requestId: "release-1", messageId: "message-1" }), true);
 	assert.equal(isServerFrame({ type: "control", requestId: "control-1", action: { type: "thinking", level: "high" } }), true);

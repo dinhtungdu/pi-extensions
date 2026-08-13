@@ -74,6 +74,7 @@ export interface DiscordLifecycleMessage {
 	channelId: string;
 	status: DiscordLifecycleStatus;
 	updatedAt: number;
+	workingMessageId?: string;
 }
 
 export interface OutboundChunk {
@@ -86,9 +87,11 @@ export interface OutboundChunk {
 export interface OutboundMessage {
 	id: string;
 	// "interactive" is retained only to drain state written by the short-lived 7c01263 protocol.
-	kind: "user" | "interactive" | "assistant";
+	kind: "user" | "interactive" | "assistant" | "working";
 	threadId: string;
 	chunks: OutboundChunk[];
+	inboundMessageId?: string;
+	responseTo?: string[];
 }
 
 export interface RetainedInboundImages {
@@ -145,8 +148,14 @@ function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: s
 	if (!Array.isArray(value)) throw new Error(`Discord bridge state ${file} has an invalid outbound queue`);
 	return value.map((message) => {
 		if (!isRecord(message) || typeof message.id !== "string" ||
-			(message.kind !== "user" && message.kind !== "interactive" && message.kind !== "assistant") ||
-			(message.threadId !== undefined && typeof message.threadId !== "string") || !Array.isArray(message.chunks)) {
+			(message.kind !== "user" && message.kind !== "interactive" && message.kind !== "assistant" && message.kind !== "working") ||
+			(message.threadId !== undefined && typeof message.threadId !== "string") || !Array.isArray(message.chunks) ||
+			(message.inboundMessageId !== undefined && typeof message.inboundMessageId !== "string") ||
+			(message.responseTo !== undefined && (!Array.isArray(message.responseTo) || message.responseTo.length < 1 ||
+				message.responseTo.length > 256 || !message.responseTo.every((id) => typeof id === "string") ||
+				new Set(message.responseTo).size !== message.responseTo.length)) ||
+			(message.kind === "working") !== (typeof message.inboundMessageId === "string") ||
+			(message.responseTo !== undefined && message.kind !== "assistant")) {
 			throw new Error(`Discord bridge state ${file} has an invalid outbound message`);
 		}
 		const chunks = message.chunks.map((chunk) => {
@@ -166,6 +175,8 @@ function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: s
 			kind: message.kind,
 			threadId: typeof message.threadId === "string" ? message.threadId : fallbackThreadId,
 			chunks,
+			...(typeof message.inboundMessageId === "string" ? { inboundMessageId: message.inboundMessageId } : {}),
+			...(Array.isArray(message.responseTo) ? { responseTo: [...message.responseTo] as string[] } : {}),
 		};
 	});
 }
@@ -177,7 +188,8 @@ function parseLifecycleMessages(value: unknown, file: string, fallbackUpdatedAt:
 		if (!isRecord(message) || typeof message.messageId !== "string" || typeof message.channelId !== "string" ||
 			(message.status !== "accepted" && message.status !== "thinking" && message.status !== "tool" &&
 				message.status !== "succeeded" && message.status !== "failed") ||
-			(message.updatedAt !== undefined && (!Number.isSafeInteger(message.updatedAt) || Number(message.updatedAt) < 0))) {
+			(message.updatedAt !== undefined && (!Number.isSafeInteger(message.updatedAt) || Number(message.updatedAt) < 0)) ||
+			(message.workingMessageId !== undefined && typeof message.workingMessageId !== "string")) {
 			throw new Error(`Discord bridge state ${file} has an invalid lifecycle message`);
 		}
 		return {
@@ -185,6 +197,7 @@ function parseLifecycleMessages(value: unknown, file: string, fallbackUpdatedAt:
 			channelId: message.channelId,
 			status: message.status as DiscordLifecycleStatus,
 			updatedAt: message.updatedAt === undefined ? fallbackUpdatedAt : Number(message.updatedAt),
+			...(typeof message.workingMessageId === "string" ? { workingMessageId: message.workingMessageId } : {}),
 		};
 	}).slice(-MAX_LIFECYCLE_MESSAGES_PER_SESSION);
 }
@@ -957,8 +970,19 @@ export class DiscordStateStore {
 					const retried = message.chunks[index];
 					return retried && chunk.index === retried.index && chunk.content === retried.content && chunk.nonce === retried.nonce;
 				});
-				if (!sameChunks || existing.kind !== message.kind) throw new Error(`Outbound message ${message.id} was retried with different content`);
+				const sameResponse = existing.responseTo === undefined ? message.responseTo === undefined
+					: message.responseTo !== undefined && existing.responseTo.length === message.responseTo.length &&
+						existing.responseTo.every((id, index) => id === message.responseTo![index]);
+				if (!sameChunks || existing.kind !== message.kind || existing.inboundMessageId !== message.inboundMessageId || !sameResponse) {
+					throw new Error(`Outbound message ${message.id} was retried with different content`);
+				}
 				return;
+			}
+			if (message.kind === "working") {
+				const lifecycle = session.lifecycleMessages.find((candidate) => candidate.messageId === message.inboundMessageId);
+				if (!lifecycle) throw new Error(`Discord inbound message ${message.inboundMessageId} has no lifecycle mapping`);
+				if (lifecycle.workingMessageId || session.outboundMessages.some((candidate) =>
+					candidate.kind === "working" && candidate.inboundMessageId === message.inboundMessageId)) return;
 			}
 			session.outboundMessages.push(structuredClone(message));
 		});
@@ -988,12 +1012,36 @@ export class DiscordStateStore {
 		});
 	}
 
+	async workingIndicators(
+		sessionId: string,
+		inboundMessageIds: readonly string[],
+	): Promise<Array<{ channelId: string; messageId: string }>> {
+		const session = await this.getSession(sessionId);
+		if (!session) return [];
+		return inboundMessageIds.flatMap((inboundMessageId) => {
+			const lifecycle = session.lifecycleMessages.find((candidate) => candidate.messageId === inboundMessageId);
+			return lifecycle?.workingMessageId
+				? [{ channelId: lifecycle.channelId, messageId: lifecycle.workingMessageId }]
+				: [];
+		});
+	}
+
 	async completeOutbound(sessionId: string, messageId: string): Promise<void> {
 		await this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
-			if (!session || session.outboundMessages[0]?.id !== messageId) return;
-			if (!session.outboundMessages[0].chunks.every((chunk) => chunk.discordMessageId)) return;
+			const message = session?.outboundMessages[0];
+			if (!session || message?.id !== messageId || !message.chunks.every((chunk) => chunk.discordMessageId)) return;
 			session.lastActiveAt = this.now();
+			if (message.kind === "working" && message.inboundMessageId) {
+				const lifecycle = session.lifecycleMessages.find((candidate) => candidate.messageId === message.inboundMessageId);
+				if (lifecycle) lifecycle.workingMessageId = message.chunks[0]?.discordMessageId;
+			}
+			if (message.kind === "assistant") {
+				for (const inboundMessageId of message.responseTo ?? []) {
+					const lifecycle = session.lifecycleMessages.find((candidate) => candidate.messageId === inboundMessageId);
+					if (lifecycle) delete lifecycle.workingMessageId;
+				}
+			}
 			session.outboundMessages.shift();
 		});
 	}

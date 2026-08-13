@@ -46,7 +46,11 @@ import {
 } from "./controls.js";
 import { wakeManagerSession, type ManagerWakeDescriptor } from "./manager-wake.js";
 import { isManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
-import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
+import {
+	isManagerTaskTerminal,
+	type ManagerPresentationExecutionResult,
+	type ManagerTaskTerminal,
+} from "./manager-task-terminal.js";
 import {
 	isManagerPresentationActionControl,
 	isSupportedManagerPresentationControl,
@@ -94,7 +98,7 @@ interface ActiveSession {
 	managerAsk: boolean;
 	executeManagerControl?: (request: PiManagerControlRequest) => Promise<PiSessionControlResult>;
 	executePresentationControl?: (request: { requestId: string; revision: string; controlId: string; command: string;
-		actionControl?: ManagerPresentationActionControl }) => Promise<PiSessionControlResult>;
+		actionControl?: ManagerPresentationActionControl }) => Promise<ManagerPresentationExecutionResult>;
 	inboundImages: boolean;
 }
 
@@ -689,25 +693,39 @@ export class DiscordRelayCore {
 			desired?.revision !== custom[1] || deliveredPage?.revision !== custom[1] || !descriptorMatches) {
 			return { ok: false, message: "This manager control is stale or no longer authorized." };
 		}
-		if (actionControl && request.confirmed !== true) {
-			return { ok: true, message: "Confirmation required.", confirmation: structuredClone(actionControl.confirmation) };
-		}
 		const selected = actionControl ?? control!;
 		const execution = (async () => {
 			let result: PiSessionControlResult;
+			let terminal: ManagerTaskTerminal | undefined;
 			try {
-				result = boundedControlResult(await owner.executePresentationControl!({
+				const raw = await owner.executePresentationControl!({
 					requestId: request.requestId,
 					revision: custom[1]!,
 					controlId: selected.id,
 					command: selected.command,
 					...(actionControl ? { actionControl: structuredClone(actionControl) } : {}),
-				}));
+				});
+				result = boundedControlResult(raw);
+				terminal = raw.terminal;
 			} catch (error) {
 				result = boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
 			}
 			if (this.summaryOwners.get(project.cwd) !== owner || this.activeSessions.get(owner.sessionId) !== owner) {
 				return { ok: false, message: "The manager presentation owner disconnected while the control was running." };
+			}
+			if (result.ok && terminal) {
+				if (!actionControl || terminal.taskId !== actionControl.taskId) {
+					return { ok: false, message: "Manager action returned a conflicting terminal presentation." };
+				}
+				try {
+					await this.acceptManagerTaskTerminal(terminal);
+				} catch (error) {
+					return boundedControlResult({
+						ok: false,
+						message: `Manager action succeeded, but Discord terminal delivery could not start: ${
+							error instanceof Error ? error.message : String(error)}`,
+					});
+				}
 			}
 			return result;
 		})();
@@ -805,13 +823,13 @@ export class DiscordRelayCore {
 		await this.imageStore?.remove(paths).catch(() => {});
 	}
 
-	queueLifecycleUpdate(
+	async queueLifecycleUpdate(
 		clientId: string,
 		generation: string,
 		sessionId: string,
 		messageId: string,
 		status: DiscordLifecycleStatus,
-	): void {
+	): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
 		let pendingStatus: DiscordLifecycleStatus | undefined;
 		for (let index = this.pendingLifecycleUpdates.length - 1; index >= 0; index--) {
@@ -823,7 +841,7 @@ export class DiscordRelayCore {
 		}
 		if (pendingStatus === status || this.pendingLifecycleUpdates.length >= MAX_PENDING_LIFECYCLE_UPDATES) return;
 		this.pendingLifecycleUpdates.push({ sessionId, messageId, status });
-		void this.drainLifecycleUpdates();
+		await this.drainLifecycleUpdates();
 	}
 
 	async queueProjectSummary(
@@ -886,6 +904,11 @@ export class DiscordRelayCore {
 		if (!producer.managerTaskTerminalProducer) {
 			throw new Error("Local client is not registered as a manager task-terminal producer");
 		}
+		await this.acceptManagerTaskTerminal(terminal);
+	}
+
+	private async acceptManagerTaskTerminal(terminal: ManagerTaskTerminal): Promise<void> {
+		if (!isManagerTaskTerminal(terminal)) throw new Error("Discord manager task terminal is invalid");
 		const update = await this.state.setManagerTaskTerminalDesired(terminal);
 		this.taskTerminalRevisions.set(update.sessionId, update.revision);
 		const target = this.activeSessions.get(update.sessionId);
@@ -922,6 +945,25 @@ export class DiscordRelayCore {
 		this.scheduleProjectSummaryReconciliation(active.cwd);
 	}
 
+	async queueWorking(clientId: string, generation: string, sessionId: string, inboundMessageId: string): Promise<void> {
+		this.assertClientSession(clientId, generation, sessionId);
+		const mapping = await this.state.getSession(sessionId);
+		if (!mapping) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
+		const message: OutboundMessage = {
+			id: `working:${inboundMessageId}`,
+			kind: "working",
+			threadId: mapping.threadId,
+			inboundMessageId,
+			chunks: [{
+				index: 0,
+				content: "Working...",
+				nonce: createHash("sha256").update(`working:${sessionId}:${inboundMessageId}`).digest("hex").slice(0, 25),
+			}],
+		};
+		await this.state.enqueueOutbound(sessionId, message);
+		void this.drainOutbound().catch(this.onTerminalError);
+	}
+
 	async queueOutbound(
 		clientId: string,
 		generation: string,
@@ -929,6 +971,7 @@ export class DiscordRelayCore {
 		messageId: string,
 		kind: "user" | "assistant",
 		text: string,
+		responseTo?: readonly string[],
 	): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
 		if (!text.trim()) return;
@@ -938,6 +981,7 @@ export class DiscordRelayCore {
 			id: messageId,
 			kind,
 			threadId: mapping.threadId,
+			...(kind === "assistant" && responseTo?.length ? { responseTo: [...responseTo] } : {}),
 			chunks: splitDiscordText(text).map((content, index) => ({
 				index,
 				content,
@@ -1403,6 +1447,17 @@ export class DiscordRelayCore {
 						break;
 					}
 					await this.state.markOutboundChunkSent(next.sessionId, next.message.id, chunk.index, discordMessageId);
+				}
+				if (!deliveryFailed && next.message.kind === "assistant" && next.message.responseTo?.length) {
+					try {
+						for (const indicator of await this.state.workingIndicators(next.sessionId, next.message.responseTo)) {
+							await this.transport.deleteOwnText(indicator.channelId, indicator.messageId);
+						}
+					} catch {
+						blockedSessions.add(next.sessionId);
+						this.scheduleOutboundRetry(next.sessionId);
+						deliveryFailed = true;
+					}
 				}
 				if (!deliveryFailed) {
 					await this.state.completeOutbound(next.sessionId, next.message.id);

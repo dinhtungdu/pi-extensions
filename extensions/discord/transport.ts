@@ -5,7 +5,6 @@ import {
 	ButtonStyle,
 	ChannelType,
 	Client,
-	ComponentType,
 	ContainerBuilder,
 	Events,
 	GatewayIntentBits,
@@ -62,18 +61,10 @@ export function dispatchManagerPresentationButton<T extends { customId: string }
 }
 
 export interface DiscordPresentationControlRequest {
-	requestId: string; guildId?: string; channelId: string; messageId: string; customId: string; confirmed?: true;
+	requestId: string; guildId?: string; channelId: string; messageId: string; customId: string;
 }
 
-export interface DiscordPresentationControlConfirmation {
-	title: string;
-	body: string;
-	confirmLabel: string;
-}
-
-export type DiscordPresentationControlResult = PiSessionControlResult & {
-	confirmation?: DiscordPresentationControlConfirmation;
-};
+export type DiscordPresentationControlResult = PiSessionControlResult;
 
 export interface DiscordInboundMessage {
 	id: string;
@@ -403,7 +394,6 @@ export class DiscordJsTransport implements DiscordTransport {
 		client.on(Events.InteractionCreate, (interaction) => {
 			const channelId = interactionChannels.resolve(interaction);
 			if (interaction.isButton()) {
-				// Ephemeral mc:* confirmation buttons are owned and acknowledged only by their message collector.
 				dispatchManagerPresentationButton(interaction, (button) => {
 					void this.executePresentationControlInteraction(button, channelId);
 				});
@@ -828,46 +818,6 @@ export class DiscordJsTransport implements DiscordTransport {
 				messageId: interaction.message.id,
 				customId: interaction.customId,
 			}) : { ok: false, message: "Discord relay is not ready for manager presentation controls." };
-			if (result.confirmation) {
-				const confirmation = result.confirmation;
-				const confirmId = `mc:${interaction.id}:yes`;
-				const cancelId = `mc:${interaction.id}:no`;
-				const reply = await interaction.editReply({
-					content: `${confirmation.title}\n${confirmation.body}`,
-					components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-						new ButtonBuilder().setCustomId(confirmId).setLabel(confirmation.confirmLabel).setStyle(ButtonStyle.Danger),
-						new ButtonBuilder().setCustomId(cancelId).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
-					)],
-					allowedMentions: { parse: [] },
-					flags: MessageFlags.SuppressEmbeds,
-				});
-				let decision: import("discord.js").ButtonInteraction;
-				try {
-					decision = await reply.awaitMessageComponent({
-						componentType: ComponentType.Button,
-						filter: (candidate) => candidate.user.id === interaction.user.id &&
-							(candidate.customId === confirmId || candidate.customId === cancelId),
-						time: 60_000,
-					});
-				} catch {
-					await interaction.editReply({ content: "❌ Merge confirmation expired.", components: [] }).catch(() => {});
-					return;
-				}
-				await decision.deferUpdate().catch(() => {});
-				if (decision.customId === cancelId) {
-					await interaction.editReply({ content: "Merge canceled.", components: [] }).catch(() => {});
-					return;
-				}
-				await interaction.editReply({ content: "Running manager control…", components: [] }).catch(() => {});
-				result = await listener!({
-					requestId: decision.id,
-					...(interaction.guildId ? { guildId: interaction.guildId } : {}),
-					channelId,
-					messageId: interaction.message.id,
-					customId: interaction.customId,
-					confirmed: true,
-				});
-			}
 		} catch (error) {
 			result = { ok: false, message: error instanceof Error ? error.message : String(error) };
 		}

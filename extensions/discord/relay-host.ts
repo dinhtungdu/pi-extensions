@@ -13,6 +13,7 @@ import {
 	type PiSessionControlResult,
 } from "./controls.js";
 import { MANAGER_PRESENTATION_SCHEMA_VERSION, SUPPORTED_MANAGER_PRESENTATION_CONTROLS } from "./manager-presentation.js";
+import type { ManagerPresentationExecutionResult } from "./manager-task-terminal.js";
 
 export interface RelayHostOptions {
 	paths: RelayPaths;
@@ -38,7 +39,7 @@ interface SocketState {
 	queuedInputBytes: number;
 	writer: BoundedSocketWriter;
 	pendingControls: Map<string, {
-		resolve(result: PiSessionControlResult): void;
+		resolve(result: ManagerPresentationExecutionResult): void;
 		reject(error: Error): void;
 		timer: ReturnType<typeof setTimeout>;
 		resultType: "control_result" | "manager_control_result" | "manager_presentation_control_result";
@@ -351,7 +352,12 @@ export class LocalRelayHost {
 			if (!pending || pending.resultType !== parsed.type) return;
 			clearTimeout(pending.timer);
 			state.pendingControls.delete(parsed.requestId);
-			pending.resolve({ ok: parsed.ok, message: parsed.message });
+			pending.resolve({
+				ok: parsed.ok,
+				message: parsed.message,
+				...(parsed.type === "manager_presentation_control_result" && parsed.terminal
+					? { terminal: structuredClone(parsed.terminal) } : {}),
+			});
 			return;
 		}
 		if (parsed.type === "manager_presentation") {
@@ -427,7 +433,7 @@ export class LocalRelayHost {
 			return;
 		}
 		if (parsed.type === "lifecycle") {
-			this.options.core.queueLifecycleUpdate(clientId, generation, sessionId, parsed.messageId, parsed.status);
+			await this.options.core.queueLifecycleUpdate(clientId, generation, sessionId, parsed.messageId, parsed.status);
 			return;
 		}
 		if (parsed.type === "project_summary") {
@@ -440,9 +446,21 @@ export class LocalRelayHost {
 			this.write(state, { type: "project_summary_queued", requestId: parsed.requestId });
 			return;
 		}
+		if (parsed.type === "working") {
+			try {
+				await this.options.core.queueWorking(clientId, generation, sessionId, parsed.messageId);
+			} catch (error) {
+				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
+				return;
+			}
+			this.write(state, { type: "working_queued", requestId: parsed.requestId, messageId: parsed.messageId });
+			return;
+		}
 		if (parsed.type === "outbound") {
 			try {
-				await this.options.core.queueOutbound(clientId, generation, sessionId, parsed.messageId, parsed.kind, parsed.text);
+				await this.options.core.queueOutbound(
+					clientId, generation, sessionId, parsed.messageId, parsed.kind, parsed.text, parsed.responseTo,
+				);
 			} catch (error) {
 				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
 				return;
@@ -460,7 +478,7 @@ export class LocalRelayHost {
 	private requestPresentationControl(
 		state: SocketState,
 		request: Omit<Extract<ServerFrame, { type: "manager_presentation_control" }>, "type">,
-	): Promise<PiSessionControlResult> {
+	): Promise<ManagerPresentationExecutionResult> {
 		return this.requestClientControl(state, { type: "manager_presentation_control", ...request }, MANAGER_CONTROL_IPC_TIMEOUT_MS);
 	}
 

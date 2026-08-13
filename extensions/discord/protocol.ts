@@ -44,7 +44,8 @@ export type ClientFrame =
 		managerTaskSnapshotTaskId?: string;
 		inboundImages?: true;
 	} & RelaySessionRegistration)
-	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string }
+	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string; responseTo?: string[] }
+	| { type: "working"; requestId: string; messageId: string }
 	| { type: "project_summary"; requestId: string; text: string }
 	| { type: "manager_presentation"; requestId: string; presentation: ManagerPresentation }
 	| { type: "manager_task_snapshot"; requestId: string; snapshot: ManagerTaskSnapshot }
@@ -55,7 +56,7 @@ export type ClientFrame =
 	| { type: "control_result"; requestId: string; ok: boolean; message: string }
 	| { type: "manager_catalogue"; requestId: string; taskCatalogue: ManagerTaskCatalogueEntry[]; projectCatalogue?: ManagerProjectCatalogueEntry[] }
 	| { type: "manager_control_result"; requestId: string; ok: boolean; message: string }
-	| { type: "manager_presentation_control_result"; requestId: string; ok: boolean; message: string }
+	| { type: "manager_presentation_control_result"; requestId: string; ok: boolean; message: string; terminal?: ManagerTaskTerminal }
 	| { type: "unregister" }
 	| { type: "ping" };
 
@@ -81,6 +82,7 @@ export type ServerFrame =
 	| { type: "inbound_acked"; requestId: string; messageId: string }
 	| { type: "inbound_images_released"; requestId: string; messageId: string }
 	| { type: "outbound_queued"; requestId: string; messageId: string }
+	| { type: "working_queued"; requestId: string; messageId: string }
 	| { type: "project_summary_queued"; requestId: string }
 	| { type: "manager_presentation_queued"; requestId: string }
 	| { type: "manager_task_snapshot_queued"; requestId: string }
@@ -143,7 +145,13 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 	}
 	if (frame.type === "outbound") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string" && typeof frame.text === "string" &&
-			(frame.kind === "user" || frame.kind === "assistant");
+			(frame.kind === "user" || frame.kind === "assistant") &&
+			(frame.responseTo === undefined || frame.kind === "assistant" && Array.isArray(frame.responseTo) &&
+				frame.responseTo.length >= 1 && frame.responseTo.length <= 256 &&
+				new Set(frame.responseTo).size === frame.responseTo.length && frame.responseTo.every((id) => typeof id === "string"));
+	}
+	if (frame.type === "working") {
+		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	}
 	if (frame.type === "ack_inbound" || frame.type === "release_inbound_images") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
@@ -167,7 +175,9 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 	}
 	if (frame.type === "control_result" || frame.type === "manager_control_result" || frame.type === "manager_presentation_control_result") {
 		return typeof frame.requestId === "string" && typeof frame.ok === "boolean" &&
-			typeof frame.message === "string" && frame.message.length <= 2_000;
+			typeof frame.message === "string" && frame.message.length <= 2_000 &&
+			(frame.type !== "manager_presentation_control_result" || frame.terminal === undefined ||
+				frame.ok === true && isManagerTaskTerminal(frame.terminal));
 	}
 	if (frame.type === "manager_catalogue") {
 		return typeof frame.requestId === "string" && isManagerTaskCatalogue(frame.taskCatalogue) &&
@@ -205,7 +215,9 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 	if (frame.type === "inbound_acked" || frame.type === "inbound_images_released") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	}
-	if (frame.type === "outbound_queued") return typeof frame.requestId === "string" && typeof frame.messageId === "string";
+	if (frame.type === "outbound_queued" || frame.type === "working_queued") {
+		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
+	}
 	if (frame.type === "project_summary_queued" || frame.type === "manager_presentation_queued" ||
 		frame.type === "manager_task_snapshot_queued" || frame.type === "manager_task_terminal_queued" ||
 		frame.type === "manager_catalogue_updated") {

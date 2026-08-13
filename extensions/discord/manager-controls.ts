@@ -10,6 +10,10 @@ import {
 	type PiSessionControlResult,
 } from "./controls.js";
 import { managerProjectCatalogue, managerTaskCatalogue } from "./manager-task-summary.js";
+import {
+	renderMergedManagerTaskTerminal,
+	type ManagerPresentationExecutionResult,
+} from "./manager-task-terminal.js";
 
 const STATUS_TIMEOUT_MS = 2_000;
 const VALIDATE_TIMEOUT_MS = 30_000;
@@ -254,7 +258,7 @@ export class ManagerControlExecutor {
 		return executor;
 	}
 
-	async executePresentationMerge(_requestId: string, taskId: string): Promise<PiSessionControlResult> {
+	async executePresentationMerge(_requestId: string, taskId: string): Promise<ManagerPresentationExecutionResult> {
 		if (!MANAGER_TASK_ID.test(taskId)) return { ok: false, message: "Manager action task ID is invalid." };
 		try {
 			await this.validateRuntime();
@@ -274,7 +278,11 @@ export class ManagerControlExecutor {
 				typeof output.replay !== "boolean") {
 				return { ok: false, message: "merge-and-archive returned conflicting manager output." };
 			}
-			return { ok: true, message: `@${taskId} merged, pushed, and archived.` };
+			return {
+				ok: true,
+				message: `@${taskId} merged, pushed, and archived.`,
+				terminal: renderMergedManagerTaskTerminal(taskId),
+			};
 		} catch (error) {
 			return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
 		}

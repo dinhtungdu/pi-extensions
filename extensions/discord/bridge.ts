@@ -17,7 +17,10 @@ import {
 import type { ManagerPresentation, ManagerPresentationActionControl } from "./manager-presentation.js";
 import type { ManagerWakeDescriptor } from "./manager-wake.js";
 import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
-import type { ManagerTaskTerminal } from "./manager-task-terminal.js";
+import type {
+	ManagerPresentationExecutionResult,
+	ManagerTaskTerminal,
+} from "./manager-task-terminal.js";
 
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
@@ -49,7 +52,7 @@ export interface BridgeCallbacks {
 		request: { requestId: string; revision: string; controlId: string; command: string;
 			actionControl?: ManagerPresentationActionControl },
 		signal: AbortSignal,
-	): Promise<PiSessionControlResult>;
+	): Promise<ManagerPresentationExecutionResult>;
 }
 
 export interface BridgeStatus extends RelayClientStatus {}
@@ -216,14 +219,13 @@ export class DiscordBridge {
 		this.activeInboundId = messageId;
 	}
 
-	agentStarted(): void {
-		if (!this.initialInboundId) return;
-		this.associateInbound(this.initialInboundId);
+	async agentStarted(): Promise<void> {
+		if (this.initialInboundId) await this.associateInbound(this.initialInboundId);
 	}
 
-	userMessageStarted(messageId?: string): void {
+	async userMessageStarted(messageId?: string): Promise<void> {
 		this.activeInboundId = messageId;
-		if (messageId) this.associateInbound(messageId);
+		if (messageId) await this.associateInbound(messageId);
 	}
 
 	toolStarted(): void {
@@ -248,17 +250,20 @@ export class DiscordBridge {
 
 	async enqueueAssistantMessage(messageId: string, text: string): Promise<void> {
 		if (!this.acceptingAssistantMessages) throw new Error("Discord bridge is not accepting assistant messages");
-		const pending = this.assistantPersistence.then(() => this.relay.sendAssistantText(messageId, text));
+		const responseTo = [...this.runInboundIds];
+		const pending = this.assistantPersistence.then(() => this.relay.sendAssistantText(messageId, text, responseTo));
 		this.assistantPersistence = pending.catch((error) => {
 			this.assistantPersistenceFailure ??= error instanceof Error ? error : new Error(String(error));
 		});
 		return pending;
 	}
 
-	private associateInbound(messageId: string): void {
+	private async associateInbound(messageId: string): Promise<void> {
 		this.activeInboundId = messageId;
+		const firstAssociation = !this.runInboundIds.has(messageId);
 		this.runInboundIds.add(messageId);
 		this.relay.updateLifecycle(messageId, "thinking");
+		if (firstAssociation) await this.relay.startWorking(messageId);
 	}
 
 	private resetAgentRun(): void {

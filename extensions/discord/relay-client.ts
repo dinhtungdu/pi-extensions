@@ -28,7 +28,10 @@ import {
 	type ManagerPresentationActionControl,
 } from "./manager-presentation.js";
 import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
-import type { ManagerTaskTerminal } from "./manager-task-terminal.js";
+import type {
+	ManagerPresentationExecutionResult,
+	ManagerTaskTerminal,
+} from "./manager-task-terminal.js";
 
 const CONNECT_RETRY_MIN_MS = 25;
 const CONNECT_RETRY_MAX_MS = 500;
@@ -64,7 +67,7 @@ export interface RelayClientCallbacks {
 	onManagerPresentationControl?(
 		request: { requestId: string; revision: string; controlId: string; command: string; actionControl?: ManagerPresentationActionControl },
 		signal: AbortSignal,
-	): Promise<PiSessionControlResult>;
+	): Promise<ManagerPresentationExecutionResult>;
 }
 
 export interface RelayClientDependencies {
@@ -209,8 +212,12 @@ export class LocalRelayClient {
 		for (const chunk of interactiveUserChunks(text)) await this.queueOutbound("user", chunk);
 	}
 
-	async sendAssistantText(messageId: string, text: string): Promise<void> {
-		await this.queueOutbound("assistant", text, messageId);
+	async sendAssistantText(messageId: string, text: string, responseTo: readonly string[] = []): Promise<void> {
+		await this.queueOutbound("assistant", text, messageId, responseTo);
+	}
+
+	async startWorking(messageId: string): Promise<void> {
+		await this.sendRequest({ type: "working", requestId: randomUUID(), messageId }, REQUEST_TIMEOUT_MS);
 	}
 
 	async sendProjectSummary(text: string): Promise<boolean> {
@@ -530,17 +537,21 @@ export class LocalRelayClient {
 		if (frame.type === "manager_presentation_control") {
 			const abort = new AbortController();
 			this.presentationControlAborts.set(frame.requestId, abort);
-			let result: PiSessionControlResult;
+			let result: ManagerPresentationExecutionResult;
 			try {
-				result = this.callbacks.onManagerPresentationControl
-					? boundedControlResult(await this.callbacks.onManagerPresentationControl({
+				const raw = this.callbacks.onManagerPresentationControl
+					? await this.callbacks.onManagerPresentationControl({
 						requestId: frame.requestId,
 						revision: frame.revision,
 						controlId: frame.controlId,
 						command: frame.command,
 						...(frame.actionControl ? { actionControl: structuredClone(frame.actionControl) } : {}),
-					}, abort.signal))
+					}, abort.signal)
 					: { ok: false, message: "This Pi client does not support manager presentation controls." };
+				result = {
+					...boundedControlResult(raw),
+					...(raw.ok && raw.terminal ? { terminal: structuredClone(raw.terminal) } : {}),
+				};
 			} catch (error) {
 				result = boundedControlResult({ ok: false, message: asError(error).message });
 			} finally {
@@ -580,7 +591,7 @@ export class LocalRelayClient {
 			return;
 		}
 		if (frame.type === "inbound_acked" || frame.type === "inbound_images_released" ||
-			frame.type === "outbound_queued" || frame.type === "project_summary_queued" ||
+			frame.type === "outbound_queued" || frame.type === "working_queued" || frame.type === "project_summary_queued" ||
 			frame.type === "manager_presentation_queued" || frame.type === "manager_task_snapshot_queued" ||
 			frame.type === "manager_task_terminal_queued" || frame.type === "manager_catalogue_updated") {
 			const pending = this.pendingRequests.get(frame.requestId);
@@ -592,12 +603,24 @@ export class LocalRelayClient {
 		}
 	}
 
-	private async queueOutbound(kind: "user" | "assistant", text: string, messageId: string = randomUUID()): Promise<void> {
+	private async queueOutbound(
+		kind: "user" | "assistant",
+		text: string,
+		messageId: string = randomUUID(),
+		responseTo: readonly string[] = [],
+	): Promise<void> {
 		if (!text.trim()) return;
 		for (;;) {
 			if (this.stopped) throw new Error("Local Discord relay client is stopped");
 			try {
-				await this.sendRequest({ type: "outbound", requestId: randomUUID(), messageId, kind, text }, REQUEST_TIMEOUT_MS);
+				await this.sendRequest({
+					type: "outbound",
+					requestId: randomUUID(),
+					messageId,
+					kind,
+					text,
+					...(kind === "assistant" && responseTo.length ? { responseTo: [...responseTo] } : {}),
+				}, REQUEST_TIMEOUT_MS);
 				return;
 			} catch (error) {
 				if (this.stopped || error instanceof RelayRequestError) throw error;

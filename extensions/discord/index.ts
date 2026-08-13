@@ -467,12 +467,19 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 						onManagerPresentationControl: async (request) => {
 							if (request.command === "task-merge-and-archive" && request.actionControl) {
 								if (!managerExecutor) return { ok: false, message: "Manager lifecycle controls are unavailable." };
-								const result = boundedControlResult(await managerExecutor.executePresentationMerge(
+								const execution = await managerExecutor.executePresentationMerge(
 									request.requestId, request.actionControl.taskId,
-								));
+								);
+								const result = {
+									...boundedControlResult(execution),
+									...(execution.terminal ? { terminal: structuredClone(execution.terminal) } : {}),
+								};
 								try {
 									pi.appendEntry<ManagerControlResultEntryData>(MANAGER_CONTROL_RESULT_ENTRY, {
-										action: "merge-and-archive", taskId: request.actionControl.taskId, ...result,
+										action: "merge-and-archive",
+										taskId: request.actionControl.taskId,
+										ok: result.ok,
+										message: result.message,
 									});
 								} catch {
 									// Session history is best-effort and must not alter the Discord result.
@@ -646,16 +653,24 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			bridge?.beginAgentRun(inboundMessageId(event.prompt));
 		});
 
-		pi.on("agent_start", () => {
-			bridge?.agentStarted();
+		pi.on("agent_start", async (_event, ctx) => {
+			try {
+				await bridge?.agentStarted();
+			} catch (error) {
+				ctx.ui.notify(`Discord working indicator deferred: ${errorMessage(error)}`, "warning");
+			}
 		});
 
-		pi.on("message_start", (event) => {
+		pi.on("message_start", async (event, ctx) => {
 			if (event.message.role !== "user") return;
 			const text = typeof event.message.content === "string"
 				? event.message.content
 				: event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-			bridge?.userMessageStarted(inboundMessageId(text));
+			try {
+				await bridge?.userMessageStarted(inboundMessageId(text));
+			} catch (error) {
+				ctx.ui.notify(`Discord working indicator deferred: ${errorMessage(error)}`, "warning");
+			}
 		});
 
 		pi.on("tool_execution_start", () => {
