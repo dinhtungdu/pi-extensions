@@ -24,6 +24,7 @@ export interface RelayPaths {
 	authToken: string;
 	configIntent: string;
 	attachments: string;
+	outboundAttachments: string;
 }
 
 export function relayPaths(directory = DISCORD_BRIDGE_DIR): RelayPaths {
@@ -37,6 +38,7 @@ export function relayPaths(directory = DISCORD_BRIDGE_DIR): RelayPaths {
 		authToken: join(directory, "relay-token"),
 		configIntent: join(directory, "relay-config-intent.json"),
 		attachments: join(directory, "attachments"),
+		outboundAttachments: join(directory, "outbound-attachments"),
 	};
 }
 

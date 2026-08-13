@@ -56,8 +56,8 @@ import {
 import { paginateManagerPresentation } from "./manager-summary-pages.js";
 import {
 	appendOutboundImageWarning,
-	loadOutboundImages,
-	prepareOutboundImages,
+	outboundLogicalHash,
+	OutboundImageStore,
 } from "./outbound-images.js";
 
 export interface RelaySessionRegistration {
@@ -223,11 +223,13 @@ export class DiscordRelayCore {
 		private readonly onTerminalError: (error: Error) => void = () => {},
 		private readonly imageStore?: InboundImageStore,
 		private readonly dependencies: DiscordRelayCoreDependencies = { scheduleStateCompaction },
+		private readonly outboundImageStore?: OutboundImageStore,
 	) {}
 
 	async start(): Promise<void> {
 		if (this.started) return;
 		if (this.imageStore) await this.imageStore.initialize(await this.state.pendingImagePaths());
+		if (this.outboundImageStore) await this.outboundImageStore.initialize(await this.state.pendingOutboundSnapshots());
 		await this.transport.connect(this.config);
 		this.unsubscribeTerminal = this.transport.onTerminalError(this.onTerminalError);
 		this.unsubscribe = this.transport.onMessage((message) => {
@@ -962,8 +964,12 @@ export class DiscordRelayCore {
 	): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
 		if (!text.trim() && imagePaths.length === 0) return;
+		const responses = kind === "assistant" ? [...(responseTo ?? [])] : [], logicalHash = outboundLogicalHash(text, responses, imagePaths);
+		const identity = await this.state.outboundIdentity(sessionId, messageId, logicalHash); if (identity === "same") return;
+		if (identity === "conflict") throw new Error(`Outbound message ${messageId} was retried with different content`);
 		const active = this.activeSessions.get(sessionId)!;
-		const preparedImages = imagePaths.length ? await prepareOutboundImages(active.outputRoot, imagePaths) : { images: [] };
+		const preparedImages = imagePaths.length && this.outboundImageStore ? await this.outboundImageStore.prepare(active.outputRoot, imagePaths)
+			: { images: [], omitted: imagePaths.length };
 		const mapping = await this.state.getSession(sessionId);
 		if (!mapping) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
 		const chunks = splitDiscordText(text);
@@ -971,19 +977,20 @@ export class DiscordRelayCore {
 			id: messageId,
 			kind,
 			threadId: mapping.threadId,
-			...(kind === "assistant" && responseTo?.length ? { responseTo: [...responseTo] } : {}),
-			...(preparedImages.images.length ? {
-				images: preparedImages.images,
-				imageRoot: active.outputRoot,
-			} : {}),
-			...(preparedImages.warning ? { imageWarning: preparedImages.warning } : {}),
+			...(responses.length ? { responseTo: responses } : {}),
+			logicalHash,
+			...(preparedImages.images.length ? { images: preparedImages.images } : {}),
+			...(preparedImages.omitted ? { imageOmissions: preparedImages.omitted } : {}),
 			chunks: (chunks.length ? chunks : [""]).map((content, index) => ({
 				index,
 				content,
 				nonce: createHash("sha256").update(`${messageId}:${index}`).digest("hex").slice(0, 25),
 			})),
 		};
-		await this.state.enqueueOutbound(sessionId, message);
+		try {
+			if (!await this.state.enqueueOutbound(sessionId, message))
+				await this.outboundImageStore?.remove(preparedImages.images.map((image) => image.snapshot));
+		} catch (error) { await this.outboundImageStore?.remove(preparedImages.images.map((image) => image.snapshot)); throw error; }
 		void this.drainOutbound().catch(this.onTerminalError);
 	}
 
@@ -1429,34 +1436,31 @@ export class DiscordRelayCore {
 				const eligibleSessions = new Set([...this.activeSessions.keys(), ...this.taskTerminalRevisions.keys()]);
 				const next = await this.state.nextOutbound(eligibleSessions, blockedSessions);
 				if (!next) return;
-				let deliveryFailed = false;
+				if (next.message.multipartAttempted) {
+					const snapshots = await this.state.abandonOutbound(next.sessionId, next.message.id);
+					await this.outboundImageStore?.remove(snapshots); this.clearOutboundRetry(next.sessionId); continue;
+				}
+				let deliveryFailed = false, deliveryAbandoned = false;
 				for (const chunk of next.message.chunks) {
 					if (chunk.discordMessageId) continue;
 					const firstChunk = chunk.index === 0;
 					let discordMessageId: string;
 					try {
-						if (firstChunk && next.message.images?.length && !next.message.imageDeliveryFailed) {
-							try {
-								const files = await loadOutboundImages(next.message.imageRoot!, next.message.images);
-								discordMessageId = await this.transport.sendImages(
-									next.message.threadId,
-									appendOutboundImageWarning(chunk.content, next.message.imageWarning),
-									files,
-									chunk.nonce,
-								);
-							} catch {
-								await this.state.markOutboundImagesFailed(next.sessionId, next.message.id);
-								next.message.imageDeliveryFailed = true;
-								discordMessageId = await this.transport.sendText(
-									next.message.threadId,
-									appendOutboundImageWarning(chunk.content, next.message.imageWarning, true),
-									chunk.nonce,
-								);
-							}
+						if (firstChunk && next.message.images?.length) {
+							const loaded = this.outboundImageStore ? await this.outboundImageStore.load(next.message.images)
+								: { files: [], omitted: next.message.images.length };
+							const content = appendOutboundImageWarning(chunk.content, (next.message.imageOmissions ?? 0) + loaded.omitted);
+							if (loaded.files.length) {
+								try {
+									await this.state.markOutboundMultipartAttempted(next.sessionId, next.message.id);
+									discordMessageId = await this.transport.sendImages(next.message.threadId, content, loaded.files, chunk.nonce);
+								} catch {
+									const snapshots = await this.state.abandonOutbound(next.sessionId, next.message.id);
+									await this.outboundImageStore?.remove(snapshots); this.clearOutboundRetry(next.sessionId); deliveryAbandoned = true; break;
+								}
+							} else discordMessageId = await this.transport.sendText(next.message.threadId, content, chunk.nonce);
 						} else {
-							const content = firstChunk
-								? appendOutboundImageWarning(chunk.content, next.message.imageWarning, next.message.imageDeliveryFailed)
-								: chunk.content;
+							const content = firstChunk ? appendOutboundImageWarning(chunk.content, next.message.imageOmissions) : chunk.content;
 							discordMessageId = await this.transport.sendText(next.message.threadId, content, chunk.nonce);
 						}
 					} catch {
@@ -1467,6 +1471,7 @@ export class DiscordRelayCore {
 					}
 					await this.state.markOutboundChunkSent(next.sessionId, next.message.id, chunk.index, discordMessageId);
 				}
+				if (deliveryAbandoned) continue;
 				if (!deliveryFailed && next.message.kind === "assistant" && next.message.responseTo?.length) {
 					try {
 						for (const indicator of await this.state.workingIndicators(next.sessionId, next.message.responseTo)) {
@@ -1479,7 +1484,8 @@ export class DiscordRelayCore {
 					}
 				}
 				if (!deliveryFailed) {
-					await this.state.completeOutbound(next.sessionId, next.message.id);
+					const snapshots = await this.state.completeOutbound(next.sessionId, next.message.id);
+					await this.outboundImageStore?.remove(snapshots);
 					this.clearOutboundRetry(next.sessionId);
 					if (this.taskTerminalRevisions.has(next.sessionId)) {
 						this.scheduleManagerTaskTerminalReconciliation(next.sessionId);

@@ -1,17 +1,23 @@
-import { open, lstat, readFile, realpath } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open, readdir, realpath, unlink } from "node:fs/promises";
 import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { marked } from "marked";
 
 export const MAX_OUTBOUND_IMAGE_REFERENCES = 16;
 export const MAX_OUTBOUND_IMAGES = 4;
 export const MAX_OUTBOUND_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_OUTBOUND_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024;
 export const MAX_OUTBOUND_IMAGE_PATH_LENGTH = 4_096;
+const MAX_OUTBOUND_SNAPSHOT_ENTRIES = 2_000;
+const LOGICAL_HASH_VERSION = "discord-outbound-v1";
 
 export const OUTBOUND_IMAGE_MIME_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
 export type OutboundImageMimeType = typeof OUTBOUND_IMAGE_MIME_TYPES[number];
 
 export interface OutboundImageDescriptor {
-	localPath: string;
+	snapshot: string;
+	digest: string;
 	mimeType: OutboundImageMimeType;
 	size: number;
 	filename: string;
@@ -25,10 +31,8 @@ export interface DiscordOutboundAttachment {
 
 export interface PreparedOutboundImages {
 	images: OutboundImageDescriptor[];
-	warning?: string;
+	omitted: number;
 }
-
-type Rejection = "count" | "duplicate" | "missing" | "oversized" | "unsafe" | "unsupported";
 
 const EXTENSION_MIME_TYPES = new Map<string, OutboundImageMimeType>([
 	[".gif", "image/gif"],
@@ -63,24 +67,6 @@ function generatedFilename(path: string, mimeType: OutboundImageMimeType, index:
 	return `${stem}-${index + 1}${extension}`;
 }
 
-function warning(rejections: ReadonlyMap<Rejection, number>): string | undefined {
-	if (rejections.size === 0) return undefined;
-	const labels: Record<Rejection, string> = {
-		count: "count limit",
-		duplicate: "duplicate",
-		missing: "missing",
-		oversized: "oversized",
-		unsafe: "unsafe path",
-		unsupported: "unsupported type",
-	};
-	const detail = [...rejections].map(([reason, count]) => `${labels[reason]} ${count}`).join(", ");
-	return `⚠️ Images omitted: ${detail}.`.slice(0, 96);
-}
-
-function reject(rejections: Map<Rejection, number>, reason: Rejection): void {
-	rejections.set(reason, (rejections.get(reason) ?? 0) + 1);
-}
-
 function normalizedReference(reference: string): string | undefined {
 	if (!reference || reference.length > MAX_OUTBOUND_IMAGE_PATH_LENGTH || reference.includes("\0") || /^[a-z][a-z0-9+.-]*:/i.test(reference)) {
 		return undefined;
@@ -92,34 +78,29 @@ function normalizedReference(reference: string): string | undefined {
 	}
 }
 
-async function signature(path: string): Promise<Buffer> {
-	const handle = await open(path, "r");
-	try {
-		const header = Buffer.alloc(16);
-		const { bytesRead } = await handle.read(header, 0, header.length, 0);
-		return header.subarray(0, bytesRead);
-	} finally {
-		await handle.close();
-	}
+export function assistantImagePaths(text: string): string[] {
+	const paths: string[] = [], visited = new WeakSet<object>();
+	const visit = (node: unknown): void => {
+		if (!node || typeof node !== "object" || visited.has(node)) return; visited.add(node);
+		if (Array.isArray(node)) { for (const child of node) visit(child); return; }
+		const token = node as Record<string, unknown>;
+		if (token.type === "image" && typeof token.href === "string") paths.push(token.href);
+		for (const value of Object.values(token)) visit(value);
+	};
+	try { visit(marked.lexer(text)); } catch { return []; } return paths.slice(0, MAX_OUTBOUND_IMAGE_REFERENCES);
 }
 
-export function assistantImagePaths(text: string): string[] {
-	const paths: string[] = [];
-	const pattern = /!\[[^\]\r\n]{0,512}\]\((?:<([^>\r\n]{1,4096})>|([^()\r\n]{1,4096}))\)/g;
-	for (const match of text.matchAll(pattern)) {
-		if (paths.length >= MAX_OUTBOUND_IMAGE_REFERENCES) break;
-		const path = (match[1] ?? match[2] ?? "").trim();
-		if (path) paths.push(path);
-	}
-	return paths;
+export function outboundLogicalHash(text: string, responseTo: readonly string[], references: readonly string[]): string {
+	return createHash("sha256").update(LOGICAL_HASH_VERSION).update("\0")
+		.update(JSON.stringify([text, responseTo, references])).digest("hex");
 }
 
 export function isOutboundImageDescriptor(value: unknown): value is OutboundImageDescriptor {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const image = value as Record<string, unknown>;
 	const mimeType = image.mimeType as OutboundImageMimeType;
-	return typeof image.localPath === "string" && image.localPath.length > 0 &&
-		image.localPath.length <= MAX_OUTBOUND_IMAGE_PATH_LENGTH && isAbsolute(image.localPath) &&
+	return typeof image.snapshot === "string" && /^[0-9a-f-]{36}\.image$/.test(image.snapshot) &&
+		typeof image.digest === "string" && /^[a-f0-9]{64}$/.test(image.digest) &&
 		OUTBOUND_IMAGE_MIME_TYPES.includes(mimeType) && Number.isSafeInteger(image.size) &&
 		Number(image.size) > 0 && Number(image.size) <= MAX_OUTBOUND_IMAGE_BYTES &&
 		typeof image.filename === "string" && /^[A-Za-z0-9._-]{1,100}$/.test(image.filename) &&
@@ -132,94 +113,71 @@ export function isOutboundImageDescriptorList(value: unknown): value is Outbound
 		value.reduce((total, image) => total + image.size, 0) <= MAX_OUTBOUND_IMAGE_TOTAL_BYTES;
 }
 
-export async function prepareOutboundImages(root: string, references: readonly string[]): Promise<PreparedOutboundImages> {
-	const canonicalRoot = await realpath(resolve(root));
-	const images: OutboundImageDescriptor[] = [];
-	const canonicalPaths = new Set<string>();
-	const rejections = new Map<Rejection, number>();
-	let totalBytes = 0;
-	for (const rawReference of references.slice(0, MAX_OUTBOUND_IMAGE_REFERENCES)) {
-		if (images.length >= MAX_OUTBOUND_IMAGES) {
-			reject(rejections, "count");
-			continue;
-		}
-		const reference = normalizedReference(rawReference);
-		if (!reference) {
-			reject(rejections, "unsafe");
-			continue;
-		}
-		const lexicalPath = resolve(root, reference);
-		let fileStat;
-		let canonicalPath: string;
-		try {
-			fileStat = await lstat(lexicalPath);
-			canonicalPath = await realpath(lexicalPath);
-		} catch {
-			reject(rejections, "missing");
-			continue;
-		}
-		if (!isDescendant(canonicalRoot, canonicalPath) || !fileStat.isFile() || fileStat.isSymbolicLink()) {
-			reject(rejections, "unsafe");
-			continue;
-		}
-		if (canonicalPaths.has(canonicalPath)) {
-			reject(rejections, "duplicate");
-			continue;
-		}
-		const mimeType = EXTENSION_MIME_TYPES.get(extname(canonicalPath).toLowerCase());
-		if (!mimeType) {
-			reject(rejections, "unsupported");
-			continue;
-		}
-		if (fileStat.size <= 0 || fileStat.size > MAX_OUTBOUND_IMAGE_BYTES || totalBytes + fileStat.size > MAX_OUTBOUND_IMAGE_TOTAL_BYTES) {
-			reject(rejections, "oversized");
-			continue;
-		}
-		if (detectedMimeType(await signature(canonicalPath)) !== mimeType) {
-			reject(rejections, "unsupported");
-			continue;
-		}
-		canonicalPaths.add(canonicalPath);
-		totalBytes += fileStat.size;
-		images.push({
-			localPath: canonicalPath,
-			mimeType,
-			size: fileStat.size,
-			filename: generatedFilename(canonicalPath, mimeType, images.length),
-		});
-	}
-	if (references.length > MAX_OUTBOUND_IMAGE_REFERENCES) {
-		rejections.set("count", (rejections.get("count") ?? 0) + references.length - MAX_OUTBOUND_IMAGE_REFERENCES);
-	}
-	const rejectionWarning = warning(rejections);
-	return { images, ...(rejectionWarning ? { warning: rejectionWarning } : {}) };
-}
-
-export async function loadOutboundImages(root: string, images: readonly OutboundImageDescriptor[]): Promise<DiscordOutboundAttachment[]> {
-	if (!isOutboundImageDescriptorList(images)) throw new Error("Discord outbound image metadata is invalid");
-	const canonicalRoot = await realpath(resolve(root));
-	const result: DiscordOutboundAttachment[] = [];
-	let totalBytes = 0;
-	for (const image of images) {
-		const fileStat = await lstat(image.localPath);
-		const canonicalPath = await realpath(image.localPath);
-		if (!isDescendant(canonicalRoot, canonicalPath) || !fileStat.isFile() || fileStat.isSymbolicLink() ||
-			fileStat.size !== image.size || fileStat.size > MAX_OUTBOUND_IMAGE_BYTES) {
-			throw new Error("Discord outbound image file no longer matches validated metadata");
-		}
-		totalBytes += fileStat.size;
-		if (totalBytes > MAX_OUTBOUND_IMAGE_TOTAL_BYTES) throw new Error("Discord outbound images exceed total byte limit");
-		const data = await readFile(canonicalPath);
-		if (data.byteLength !== image.size || detectedMimeType(data.subarray(0, 16)) !== image.mimeType) {
-			throw new Error("Discord outbound image content no longer matches validated metadata");
-		}
-		result.push({ data, mimeType: image.mimeType, filename: image.filename });
-	}
-	return result;
-}
-
-export function appendOutboundImageWarning(text: string, warningText?: string, failed = false): string {
-	const notice = failed ? "⚠️ Discord omitted image attachments: file validation or upload failed." : warningText;
-	if (!notice) return text;
+export function appendOutboundImageWarning(text: string, omitted = 0): string {
+	if (omitted <= 0) return text;
+	const notice = `⚠️ Discord omitted ${omitted} image attachment${omitted === 1 ? "" : "s"}.`;
 	return text ? `${text}\n\n${notice}` : notice;
+}
+
+export class OutboundImageStore {
+	constructor(readonly directory: string) {}
+
+	async initialize(referenced: ReadonlySet<string>): Promise<void> {
+		await mkdir(this.directory, { recursive: true, mode: 0o700 }); await chmod(this.directory, 0o700);
+		const entries = await readdir(this.directory, { withFileTypes: true });
+		if (entries.length > MAX_OUTBOUND_SNAPSHOT_ENTRIES) throw new Error("Discord outbound image snapshot directory is full");
+		for (const entry of entries) if (entry.isFile() && /^[0-9a-f-]{36}\.image$/.test(entry.name) && !referenced.has(entry.name))
+			await unlink(resolve(this.directory, entry.name)).catch(() => {});
+	}
+
+	async prepare(root: string, references: readonly string[]): Promise<PreparedOutboundImages> {
+		if ((await readdir(this.directory)).length + Math.min(references.length, MAX_OUTBOUND_IMAGES) > MAX_OUTBOUND_SNAPSHOT_ENTRIES) return { images: [], omitted: references.length };
+		let canonicalRoot; try { canonicalRoot = await realpath(resolve(root)); } catch { return { images: [], omitted: references.length }; }
+		const images: OutboundImageDescriptor[] = [], identities = new Set<string>();
+		let omitted = Math.max(0, references.length - MAX_OUTBOUND_IMAGE_REFERENCES), totalBytes = 0;
+		for (const rawReference of references.slice(0, MAX_OUTBOUND_IMAGE_REFERENCES)) {
+			if (images.length >= MAX_OUTBOUND_IMAGES) { omitted++; continue; }
+			let source, snapshot;
+			const snapshotName = `${randomUUID()}.image`;
+			try {
+				const reference = normalizedReference(rawReference); if (!reference) throw new Error("unsafe reference");
+				const lexicalPath = resolve(root, reference), lexicalStat = await lstat(lexicalPath), canonicalPath = await realpath(lexicalPath);
+				if (lexicalStat.isSymbolicLink() || !isDescendant(canonicalRoot, canonicalPath)) throw new Error("unsafe reference");
+				const mimeType = EXTENSION_MIME_TYPES.get(extname(canonicalPath).toLowerCase()); if (!mimeType) throw new Error("unsupported image");
+				source = await open(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+				const sourceStat = await source.stat(), pathStat = await lstat(canonicalPath);
+				if (!sourceStat.isFile() || pathStat.isSymbolicLink() || sourceStat.dev !== pathStat.dev || sourceStat.ino !== pathStat.ino ||
+					sourceStat.size <= 0 || sourceStat.size > MAX_OUTBOUND_IMAGE_BYTES) throw new Error("invalid image identity");
+				const data = await source.readFile(); if (data.byteLength !== sourceStat.size ||
+					detectedMimeType(data.subarray(0, 16)) !== mimeType) throw new Error("invalid image content");
+				const digest = createHash("sha256").update(data).digest("hex"), identity = `${digest}:${data.byteLength}`;
+				if (identities.has(identity) || totalBytes + data.byteLength > MAX_OUTBOUND_IMAGE_TOTAL_BYTES) throw new Error("duplicate or oversized");
+				await mkdir(this.directory, { recursive: true, mode: 0o700 });
+				snapshot = await open(resolve(this.directory, snapshotName), "wx", 0o600); await snapshot.writeFile(data);
+				identities.add(identity); totalBytes += data.byteLength;
+				images.push({ snapshot: snapshotName, digest, mimeType, size: data.byteLength,
+					filename: generatedFilename(reference, mimeType, images.length) });
+			} catch { omitted++; await unlink(resolve(this.directory, snapshotName)).catch(() => {}); }
+			finally { await source?.close().catch(() => {}); await snapshot?.close().catch(() => {}); }
+		}
+		return { images, omitted };
+	}
+
+	async load(images: readonly OutboundImageDescriptor[]): Promise<{ files: DiscordOutboundAttachment[]; omitted: number }> {
+		if (!isOutboundImageDescriptorList(images)) throw new Error("Discord outbound image metadata is invalid");
+		const files: DiscordOutboundAttachment[] = []; let omitted = 0;
+		for (const image of images) try {
+			const path = resolve(this.directory, image.snapshot), fileStat = await lstat(path);
+			if (!fileStat.isFile() || fileStat.isSymbolicLink() || fileStat.size !== image.size) throw new Error("invalid snapshot");
+			const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW), data = await handle.readFile().finally(() => handle.close());
+			if (createHash("sha256").update(data).digest("hex") !== image.digest || detectedMimeType(data.subarray(0, 16)) !== image.mimeType)
+				throw new Error("invalid snapshot");
+			files.push({ data, mimeType: image.mimeType, filename: image.filename });
+		} catch { omitted++; }
+		return { files, omitted };
+	}
+
+	async remove(names: readonly string[]): Promise<void> {
+		for (const name of names) if (/^[0-9a-f-]{36}\.image$/.test(name)) await unlink(resolve(this.directory, name)).catch(() => {});
+	}
 }

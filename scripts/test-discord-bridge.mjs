@@ -509,10 +509,9 @@ try {
 	} = await importBuilt("extensions/discord/inbound-images.js");
 	const {
 		MAX_OUTBOUND_IMAGE_BYTES,
-		appendOutboundImageWarning,
+		OutboundImageStore,
 		assistantImagePaths,
-		loadOutboundImages,
-		prepareOutboundImages,
+		outboundLogicalHash,
 	} = await importBuilt("extensions/discord/outbound-images.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
@@ -3140,6 +3139,7 @@ try {
 		sessionId: "legacy-linked-session",
 	});
 	assert.equal(legacyLinkedRegistration.channelId, legacyMainRegistration.channelId, "a new relay must canonicalize registrations from rolling older clients");
+	assert.deepEqual([legacyLinkedRegistration.cwd, legacyLinkedRegistration.outputRoot], [canonicalMainCheckout, await realpath(linkedWorktree)], "project routing and worktree output ownership stay separate");
 	assert.notEqual(legacyLinkedRegistration.threadId, legacyMainRegistration.threadId);
 	assert.equal(Object.keys((await rollingIdentityState.load()).projects).length, 1);
 	await rollingIdentityCore.activateRegistration("legacy-main-client", "legacy-main-generation", "legacy-main-session", () => true);
@@ -4440,8 +4440,10 @@ try {
 	assert.deepEqual(assistantImagePaths("caption ![chart](images/chart.png) then ![space](<images/chart two.png>)"), [
 		"images/chart.png", "images/chart two.png",
 	]);
-	assert.deepEqual(assistantImagePaths("plain `images/chart.png` and [link](images/chart.png)"), [],
-		"only explicit Markdown image references may request outbound upload");
+	assert.deepEqual(assistantImagePaths("`![code](code.png)` [link](link.png)\n```md\n![fenced](fenced.png)\n```\n\\![escaped](escaped.png) ![bad](broken.png"),
+		[], "code, fences, escapes, links, and malformed syntax are not image AST nodes");
+	assert.notEqual(outboundLogicalHash("same", ["turn"], ["a.png", "b.png"]),
+		outboundLogicalHash("same", ["turn"], ["b.png", "a.png"]), "logical hash binds ordered raw references");
 	const outboundUnitRoot = join(dataDir, "outbound-image-unit");
 	await mkdir(join(outboundUnitRoot, "images"), { recursive: true });
 	const outboundValidPath = join(outboundUnitRoot, "images", "unsafe name.png");
@@ -4456,7 +4458,9 @@ try {
 	await oversizedHandle.truncate(MAX_OUTBOUND_IMAGE_BYTES + 1);
 	await oversizedHandle.close();
 	await symlink(outboundValidPath, join(outboundUnitRoot, "images", "linked.png"));
-	const preparedOutbound = await prepareOutboundImages(outboundUnitRoot, [
+	const outboundSnapshotDirectory = join(dataDir, "outbound-image-snapshots"), outboundStore = new OutboundImageStore(outboundSnapshotDirectory);
+	await outboundStore.initialize(new Set());
+	const preparedOutbound = await outboundStore.prepare(outboundUnitRoot, [
 		"images/unsafe name.png",
 		"images/unsafe name.png",
 		"images/missing.png",
@@ -4466,28 +4470,27 @@ try {
 		"images/oversized.png",
 	]);
 	assert.equal(preparedOutbound.images.length, 1, "mixed image references must retain only valid unique files");
+	assert.equal(preparedOutbound.omitted, 6, "all rejected sources collapse into one bounded path-free count");
 	assert.match(preparedOutbound.images[0].filename, /^[A-Za-z0-9._-]+\.png$/);
-	assert.match(preparedOutbound.warning, /duplicate 1/);
-	assert.match(preparedOutbound.warning, /missing 1/);
-	assert.match(preparedOutbound.warning, /unsafe path 2/);
-	assert.match(preparedOutbound.warning, /unsupported type 1/);
-	assert.match(preparedOutbound.warning, /oversized 1/);
-	assert.doesNotMatch(preparedOutbound.warning, /outbound|unsafe name|\.\.\//,
-		"visible rejection warnings must not leak local paths");
+	assert.equal("localPath" in preparedOutbound.images[0], false, "persisted metadata must never contain mutable source paths");
+	assert.equal((await stat(join(outboundSnapshotDirectory, preparedOutbound.images[0].snapshot))).mode & 0o777, 0o600,
+		"private snapshots must be mode 0600");
 	const countPaths = [];
 	for (let index = 0; index < 5; index++) {
 		const relativePath = `images/count-${index}.png`;
-		await writeFile(join(outboundUnitRoot, relativePath), pngBytes);
+		await writeFile(join(outboundUnitRoot, relativePath), Buffer.concat([pngBytes, Buffer.from([index])]));
 		countPaths.push(relativePath);
 	}
-	const countLimited = await prepareOutboundImages(outboundUnitRoot, countPaths);
+	const countLimited = await outboundStore.prepare(outboundUnitRoot, countPaths);
 	assert.equal(countLimited.images.length, 4);
-	assert.match(countLimited.warning, /count limit 1/, "outbound image count rejection must be visible and bounded");
-	assert.deepEqual((await loadOutboundImages(outboundUnitRoot, preparedOutbound.images))[0].data, pngBytes);
+	assert.equal(countLimited.omitted, 1, "outbound image count rejection must remain bounded");
 	await writeFile(outboundValidPath, Buffer.from("mutated!"));
-	await assert.rejects(() => loadOutboundImages(outboundUnitRoot, preparedOutbound.images), /no longer matches/,
-		"upload-time validation must reject files changed after queue validation");
-	assert.equal(appendOutboundImageWarning("caption", "warning"), "caption\n\nwarning");
+	assert.deepEqual((await outboundStore.load(preparedOutbound.images)).files[0].data, pngBytes,
+		"queued delivery must use immutable snapshot despite source mutation");
+	await writeFile(join(outboundSnapshotDirectory, countLimited.images[0].snapshot), Buffer.from("corrupt"));
+	const partialSnapshots = await outboundStore.load(countLimited.images);
+	assert.equal(partialSnapshots.files.length, 3, "one corrupt snapshot must not block valid siblings");
+	assert.equal(partialSnapshots.omitted, 1);
 
 	const outboundIntegrationRoot = join(dataDir, "outbound-image-integration");
 	await mkdir(outboundIntegrationRoot, { recursive: true });
@@ -4495,10 +4498,10 @@ try {
 	await writeFile(outboundIntegrationPath, pngBytes);
 	const outboundImageState = new DiscordStateStore(join(dataDir, "outbound-image-state.json"));
 	const outboundImageGateway = new FakeGateway();
+	const outboundIntegrationStore = new OutboundImageStore(join(dataDir, "outbound-integration-snapshots"));
 	const outboundImageCore = new DiscordRelayCore(
-		{ token: "token", guildId: "12345", epoch: 1 },
-		outboundImageState,
-		outboundImageGateway,
+		{ token: "token", guildId: "12345", epoch: 1 }, outboundImageState, outboundImageGateway,
+		undefined, undefined, undefined, outboundIntegrationStore,
 	);
 	await outboundImageCore.start();
 	const outboundImageRegistration = { cwd: outboundIntegrationRoot, sessionId: "outbound-image-session" };
@@ -4515,7 +4518,7 @@ try {
 		"outbound-image-partial", "assistant", partialImageText, undefined,
 		["result.png", "missing.png"],
 	);
-	await waitFor(() => FakeGateway.imageUploadAttempts.get(`${partialImageText}\n\n⚠️ Images omitted: missing 1.`) === 1,
+	await waitFor(() => FakeGateway.imageUploadAttempts.get(`${partialImageText}\n\n⚠️ Discord omitted 1 image attachment.`) === 1,
 		"partial outbound image delivery");
 	const partialImageMessage = outboundImageGateway.sent.find((message) => message.text.startsWith(partialImageText));
 	assert.equal(partialImageMessage.channelId, outboundImagePrepared.threadId, "outbound images must use exact mapped session thread");
@@ -4548,6 +4551,7 @@ try {
 		"outbound-image-dedupe", "assistant", "dedupe image", undefined, ["result.png"],
 	);
 	await dedupedImageStart;
+	await writeFile(outboundIntegrationPath, Buffer.from("source changed"));
 	await outboundImageCore.queueOutbound(
 		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
 		"outbound-image-dedupe", "assistant", "dedupe image", undefined, ["result.png"],
@@ -4555,7 +4559,14 @@ try {
 	releaseDedupedImage();
 	await waitFor(() => FakeGateway.imageUploadAttempts.get("dedupe image") === 1, "deduplicated image upload");
 	assert.equal(outboundImageGateway.sent.filter((message) => message.text === "dedupe image").length, 1);
+	await outboundImageCore.queueOutbound("outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-image-dedupe", "assistant", "dedupe image", undefined, ["result.png"]);
+	assert.equal(FakeGateway.imageUploadAttempts.get("dedupe image"), 1, "recent same ID/hash skips mutated source");
+	await assert.rejects(() => outboundImageCore.queueOutbound("outbound-image-client", "outbound-image-generation",
+		outboundImageRegistration.sessionId, "outbound-image-dedupe", "assistant", "changed payload", undefined, ["result.png"]),
+	/different content/, "same ID with different logical payload conflicts");
 	outboundImageGateway.sendImages = originalSendImages;
+	await writeFile(outboundIntegrationPath, pngBytes);
 
 	const failedImageText = "upload failure caption";
 	FakeGateway.failImageUploads.add(failedImageText);
@@ -4563,9 +4574,10 @@ try {
 		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
 		"outbound-image-failure", "assistant", failedImageText, undefined, ["result.png"],
 	);
-	await waitFor(() => outboundImageGateway.sent.some((message) => message.text.startsWith(failedImageText) &&
-		message.text.includes("upload failed")), "outbound upload failure fallback");
-	assert.equal(FakeGateway.imageUploadAttempts.get(failedImageText), 1, "failed image upload must not retry");
+	await waitFor(async () => (await outboundImageState.getSession(outboundImageRegistration.sessionId)).outboundMessages.length === 0,
+		"uncertain multipart attempt abandonment");
+	assert.equal(FakeGateway.imageUploadAttempts.get(failedImageText), 1, "uncertain upload stays at-most-once");
+	assert.equal(outboundImageGateway.sent.some((message) => message.text.startsWith(failedImageText)), false, "no duplicate text fallback");
 	await outboundImageCore.queueOutbound(
 		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
 		"outbound-after-image-failure", "assistant", "later reply progresses",
@@ -5220,7 +5232,7 @@ try {
 	await compatibilityClient.sendAssistantText("compat-image", "![image](secret.png)", [], ["secret.png"]);
 	const compatibilityImageFrame = previousHostFrames.find((frame) => frame.messageId === "compat-image");
 	assert.equal(compatibilityImageFrame.imagePaths, undefined, "old relays must never receive local image paths");
-	assert.match(compatibilityImageFrame.text, /^!\[image\]\(secret\.png\)\n\n⚠️ Discord omitted image attachments: relay upgrade required\.$/);
+	assert.match(compatibilityImageFrame.text, /^!\[image\]\(secret\.png\)\n\n⚠️ Discord omitted 1 image attachment\.$/);
 	assert.equal(compatibilityErrors.length, 0);
 	rejectOutbound = true;
 	const rejectionStarted = Date.now();

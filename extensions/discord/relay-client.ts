@@ -221,7 +221,7 @@ export class LocalRelayClient {
 		await this.queueOutbound(
 			"assistant",
 			imagePaths.length && !supported
-				? appendOutboundImageWarning(text, "⚠️ Discord omitted image attachments: relay upgrade required.")
+				? appendOutboundImageWarning(text, imagePaths.length)
 				: text,
 			messageId,
 			responseTo,

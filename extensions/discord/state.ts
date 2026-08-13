@@ -1,12 +1,13 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute } from "node:path";
+import { dirname } from "node:path";
 import { DISCORD_STATE_FILE } from "./config.js";
 import { collidingProjectChannelName, normalizeCwd, projectChannelName } from "./text.js";
 import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reactions.js";
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
 import {
 	isOutboundImageDescriptorList,
+	MAX_OUTBOUND_IMAGE_REFERENCES,
 	type OutboundImageDescriptor,
 } from "./outbound-images.js";
 import {
@@ -46,6 +47,13 @@ function projectSummaryNonce(): string {
 function isValidDiscordNonce(nonce: string): boolean {
 	return nonce.length > 0 && nonce.length <= MAX_DISCORD_NONCE_LENGTH;
 }
+
+function outboundReceiptPrefix(sessionId: string, messageId: string): string {
+	return `outbound:${createHash("sha256").update(`${sessionId}\0${messageId}`).digest("hex")}:`; }
+
+function recordOutboundReceipt(state: DiscordBridgeState, sessionId: string, message: OutboundMessage): void {
+	if (message.logicalHash) state.recentMessageIds.push(`${outboundReceiptPrefix(sessionId, message.id)}${message.logicalHash}`);
+	state.recentMessageIds = state.recentMessageIds.slice(-MAX_RECENT_MESSAGE_IDS); }
 
 export interface ProjectSummaryState {
 	desiredText: string;
@@ -100,10 +108,10 @@ export interface OutboundMessage {
 	chunks: OutboundChunk[];
 	inboundMessageId?: string;
 	responseTo?: string[];
+	logicalHash?: string;
 	images?: OutboundImageDescriptor[];
-	imageRoot?: string;
-	imageWarning?: string;
-	imageDeliveryFailed?: true;
+	imageOmissions?: number;
+	multipartAttempted?: true;
 }
 
 export interface RetainedInboundImages {
@@ -166,17 +174,15 @@ function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: s
 			(message.responseTo !== undefined && (!Array.isArray(message.responseTo) || message.responseTo.length < 1 ||
 				message.responseTo.length > 256 || !message.responseTo.every((id) => typeof id === "string") ||
 				new Set(message.responseTo).size !== message.responseTo.length)) ||
+			(message.logicalHash !== undefined && (typeof message.logicalHash !== "string" || !/^[a-f0-9]{64}$/.test(message.logicalHash))) ||
 			(message.images !== undefined && !isOutboundImageDescriptorList(message.images)) ||
-			(message.imageRoot !== undefined && (typeof message.imageRoot !== "string" || message.imageRoot.length > 4_096 ||
-				!isAbsolute(message.imageRoot))) ||
-			(message.imageWarning !== undefined && (typeof message.imageWarning !== "string" || message.imageWarning.length > 96)) ||
-			(message.imageDeliveryFailed !== undefined && message.imageDeliveryFailed !== true) ||
+			(message.imageOmissions !== undefined && (!Number.isSafeInteger(message.imageOmissions) || Number(message.imageOmissions) < 1 ||
+				Number(message.imageOmissions) > MAX_OUTBOUND_IMAGE_REFERENCES)) ||
+			(message.multipartAttempted !== undefined && message.multipartAttempted !== true) ||
 			(message.kind === "working") !== (typeof message.inboundMessageId === "string") ||
 			(message.responseTo !== undefined && message.kind !== "assistant") ||
-			(message.images !== undefined && (message.kind !== "assistant" || typeof message.imageRoot !== "string")) ||
-			((message.imageRoot !== undefined || message.imageWarning !== undefined || message.imageDeliveryFailed !== undefined) &&
-				message.kind !== "assistant") ||
-			(message.imageDeliveryFailed === true && message.images === undefined)) {
+			((message.images !== undefined || message.imageOmissions !== undefined || message.multipartAttempted !== undefined) &&
+				message.kind !== "assistant") || (message.multipartAttempted === true && message.images === undefined)) {
 			throw new Error(`Discord bridge state ${file} has an invalid outbound message`);
 		}
 		const chunks = message.chunks.map((chunk) => {
@@ -198,12 +204,12 @@ function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: s
 			chunks,
 			...(typeof message.inboundMessageId === "string" ? { inboundMessageId: message.inboundMessageId } : {}),
 			...(Array.isArray(message.responseTo) ? { responseTo: [...message.responseTo] as string[] } : {}),
+			...(typeof message.logicalHash === "string" ? { logicalHash: message.logicalHash } : {}),
 			...(Array.isArray(message.images) ? {
 				images: (message.images as OutboundImageDescriptor[]).map((image) => ({ ...image })),
 			} : {}),
-			...(typeof message.imageRoot === "string" ? { imageRoot: message.imageRoot } : {}),
-			...(typeof message.imageWarning === "string" ? { imageWarning: message.imageWarning } : {}),
-			...(message.imageDeliveryFailed === true ? { imageDeliveryFailed: true as const } : {}),
+			...(Number.isSafeInteger(message.imageOmissions) ? { imageOmissions: Number(message.imageOmissions) } : {}),
+			...(message.multipartAttempted === true ? { multipartAttempted: true as const } : {}),
 		};
 	});
 }
@@ -989,8 +995,20 @@ export class DiscordStateStore {
 		]));
 	}
 
-	async enqueueOutbound(sessionId: string, message: OutboundMessage): Promise<void> {
-		await this.mutate(async (state) => {
+	async outboundIdentity(sessionId: string, messageId: string, logicalHash: string): Promise<"new" | "same" | "conflict"> {
+		const state = await this.load(), queued = state.sessions[sessionId]?.outboundMessages.find((message) => message.id === messageId);
+		const prefix = outboundReceiptPrefix(sessionId, messageId);
+		const existingHash = queued?.logicalHash ?? state.recentMessageIds.find((id) => id.startsWith(prefix))?.slice(prefix.length);
+		return existingHash === undefined ? "new" : existingHash === logicalHash ? "same" : "conflict";
+	}
+
+	async pendingOutboundSnapshots(): Promise<Set<string>> {
+		return new Set(Object.values((await this.load()).sessions).flatMap((session) => session.outboundMessages
+			.flatMap((message) => message.images?.map((image) => image.snapshot) ?? [])));
+	}
+
+	async enqueueOutbound(sessionId: string, message: OutboundMessage): Promise<boolean> {
+		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			if (!session) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
 			const existing = session.outboundMessages.find((candidate) => candidate.id === message.id);
@@ -999,29 +1017,28 @@ export class DiscordStateStore {
 			}
 			session.lastActiveAt = this.now();
 			if (existing) {
-				const sameChunks = existing.chunks.length === message.chunks.length && existing.chunks.every((chunk, index) => {
-					const retried = message.chunks[index];
-					return retried && chunk.index === retried.index && chunk.content === retried.content && chunk.nonce === retried.nonce;
-				});
-				const sameResponse = existing.responseTo === undefined ? message.responseTo === undefined
-					: message.responseTo !== undefined && existing.responseTo.length === message.responseTo.length &&
-						existing.responseTo.every((id, index) => id === message.responseTo![index]);
-				const sameImages = existing.images === undefined ? message.images === undefined
-					: message.images !== undefined && existing.images.length === message.images.length &&
-						existing.images.every((image, index) => JSON.stringify(image) === JSON.stringify(message.images![index]));
-				if (!sameChunks || existing.kind !== message.kind || existing.inboundMessageId !== message.inboundMessageId || !sameResponse ||
-					!sameImages || existing.imageRoot !== message.imageRoot || existing.imageWarning !== message.imageWarning) {
+				const legacySame = existing.logicalHash === undefined && message.images === undefined && message.imageOmissions === undefined &&
+					existing.kind === message.kind && existing.chunks.length === message.chunks.length && existing.chunks.every((chunk, index) =>
+					chunk.index === message.chunks[index]?.index && chunk.content === message.chunks[index]?.content &&
+					chunk.nonce === message.chunks[index]?.nonce) && JSON.stringify(existing.responseTo) === JSON.stringify(message.responseTo);
+				if (!legacySame && (!message.logicalHash || existing.logicalHash !== message.logicalHash)) {
 					throw new Error(`Outbound message ${message.id} was retried with different content`);
 				}
-				return;
+				return false;
 			}
+			const prefix = outboundReceiptPrefix(sessionId, message.id);
+			const recentHash = state.recentMessageIds.find((id) => id.startsWith(prefix))?.slice(prefix.length);
+			if (recentHash && (!message.logicalHash || recentHash !== message.logicalHash))
+				throw new Error(`Outbound message ${message.id} was retried with different content`);
+			if (recentHash) return false;
 			if (message.kind === "working") {
 				const lifecycle = session.lifecycleMessages.find((candidate) => candidate.messageId === message.inboundMessageId);
 				if (!lifecycle) throw new Error(`Discord inbound message ${message.inboundMessageId} has no lifecycle mapping`);
 				if (lifecycle.workingMessageId || session.outboundMessages.some((candidate) =>
-					candidate.kind === "working" && candidate.inboundMessageId === message.inboundMessageId)) return;
+					candidate.kind === "working" && candidate.inboundMessageId === message.inboundMessageId)) return false;
 			}
 			session.outboundMessages.push(structuredClone(message));
+			return true;
 		});
 	}
 
@@ -1049,14 +1066,10 @@ export class DiscordStateStore {
 		});
 	}
 
-	async markOutboundImagesFailed(sessionId: string, messageId: string): Promise<void> {
-		await this.mutate(async (state) => {
-			const session = state.sessions[sessionId];
-			const message = session?.outboundMessages.find((candidate) => candidate.id === messageId);
-			if (!session || !message?.images?.length) throw new Error(`Outbound images ${messageId} are missing`);
-			session.lastActiveAt = this.now();
-			message.imageDeliveryFailed = true;
-		});
+	async markOutboundMultipartAttempted(sessionId: string, messageId: string): Promise<void> {
+		await this.mutate(async (state) => { const message = state.sessions[sessionId]?.outboundMessages[0];
+			if (!message || message.id !== messageId || !message.images?.length) throw new Error(`Outbound images ${messageId} are missing`);
+			message.multipartAttempted = true; });
 	}
 
 	async workingIndicators(
@@ -1073,11 +1086,11 @@ export class DiscordStateStore {
 		});
 	}
 
-	async completeOutbound(sessionId: string, messageId: string): Promise<void> {
-		await this.mutate(async (state) => {
+	async completeOutbound(sessionId: string, messageId: string): Promise<string[]> {
+		return this.mutate(async (state) => {
 			const session = state.sessions[sessionId];
 			const message = session?.outboundMessages[0];
-			if (!session || message?.id !== messageId || !message.chunks.every((chunk) => chunk.discordMessageId)) return;
+			if (!session || message?.id !== messageId || !message.chunks.every((chunk) => chunk.discordMessageId)) return [];
 			session.lastActiveAt = this.now();
 			if (message.kind === "working" && message.inboundMessageId) {
 				const lifecycle = session.lifecycleMessages.find((candidate) => candidate.messageId === message.inboundMessageId);
@@ -1089,7 +1102,17 @@ export class DiscordStateStore {
 					if (lifecycle) delete lifecycle.workingMessageId;
 				}
 			}
+			recordOutboundReceipt(state, sessionId, message);
 			session.outboundMessages.shift();
+			return message.images?.map((image) => image.snapshot) ?? [];
+		});
+	}
+
+	async abandonOutbound(sessionId: string, messageId: string): Promise<string[]> {
+		return this.mutate(async (state) => { const session = state.sessions[sessionId], message = session?.outboundMessages[0];
+			if (!session || message?.id !== messageId) return [];
+			recordOutboundReceipt(state, sessionId, message); session.lastActiveAt = this.now(); session.outboundMessages.shift();
+			return message.images?.map((image) => image.snapshot) ?? [];
 		});
 	}
 
