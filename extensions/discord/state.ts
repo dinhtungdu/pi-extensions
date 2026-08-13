@@ -6,8 +6,8 @@ import { collidingProjectChannelName, normalizeCwd, projectChannelName } from ".
 import { canAdvanceLifecycleStatus, type DiscordLifecycleStatus } from "./reactions.js";
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
 import {
+	isLegacyOutboundImageDescriptorList,
 	isOutboundImageDescriptorList,
-	MAX_OUTBOUND_IMAGE_REFERENCES,
 	type OutboundImageDescriptor,
 } from "./outbound-images.js";
 import {
@@ -110,7 +110,6 @@ export interface OutboundMessage {
 	responseTo?: string[];
 	logicalHash?: string;
 	images?: OutboundImageDescriptor[];
-	imageOmissions?: number;
 	multipartAttempted?: true;
 }
 
@@ -163,10 +162,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: string): OutboundMessage[] {
+function parseOutboundMessages(
+	value: unknown, file: string, fallbackThreadId: string, abandonLegacy: (messageId: string, logicalHash: string) => void = () => {},
+): OutboundMessage[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) throw new Error(`Discord bridge state ${file} has an invalid outbound queue`);
-	return value.map((message) => {
+	return value.flatMap((message): OutboundMessage[] => {
+		const currentImages = isRecord(message) && isOutboundImageDescriptorList(message.images);
+		const legacyImages = isRecord(message) && isLegacyOutboundImageDescriptorList(message.images);
 		if (!isRecord(message) || typeof message.id !== "string" ||
 			(message.kind !== "user" && message.kind !== "interactive" && message.kind !== "assistant" && message.kind !== "working") ||
 			(message.threadId !== undefined && typeof message.threadId !== "string") || !Array.isArray(message.chunks) ||
@@ -175,14 +178,13 @@ function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: s
 				message.responseTo.length > 256 || !message.responseTo.every((id) => typeof id === "string") ||
 				new Set(message.responseTo).size !== message.responseTo.length)) ||
 			(message.logicalHash !== undefined && (typeof message.logicalHash !== "string" || !/^[a-f0-9]{64}$/.test(message.logicalHash))) ||
-			(message.images !== undefined && !isOutboundImageDescriptorList(message.images)) ||
-			(message.imageOmissions !== undefined && (!Number.isSafeInteger(message.imageOmissions) || Number(message.imageOmissions) < 1 ||
-				Number(message.imageOmissions) > MAX_OUTBOUND_IMAGE_REFERENCES)) ||
+			(message.images !== undefined && !currentImages && !legacyImages) ||
+			(message.imageOmissions !== undefined && (!legacyImages || !Number.isSafeInteger(message.imageOmissions) || Number(message.imageOmissions) < 1)) ||
 			(message.multipartAttempted !== undefined && message.multipartAttempted !== true) ||
 			(message.kind === "working") !== (typeof message.inboundMessageId === "string") ||
 			(message.responseTo !== undefined && message.kind !== "assistant") ||
-			((message.images !== undefined || message.imageOmissions !== undefined || message.multipartAttempted !== undefined) &&
-				message.kind !== "assistant") || (message.multipartAttempted === true && message.images === undefined)) {
+			((message.images !== undefined || message.imageOmissions !== undefined || message.multipartAttempted !== undefined) && message.kind !== "assistant") ||
+			(message.multipartAttempted === true && message.images === undefined)) {
 			throw new Error(`Discord bridge state ${file} has an invalid outbound message`);
 		}
 		const chunks = message.chunks.map((chunk) => {
@@ -190,27 +192,21 @@ function parseOutboundMessages(value: unknown, file: string, fallbackThreadId: s
 				(chunk.discordMessageId !== undefined && typeof chunk.discordMessageId !== "string")) {
 				throw new Error(`Discord bridge state ${file} has an invalid outbound chunk`);
 			}
-			return {
-				index: chunk.index,
-				content: chunk.content,
-				nonce: chunk.nonce,
-				...(typeof chunk.discordMessageId === "string" ? { discordMessageId: chunk.discordMessageId } : {}),
-			};
+			return { index: chunk.index, content: chunk.content, nonce: chunk.nonce,
+				...(typeof chunk.discordMessageId === "string" ? { discordMessageId: chunk.discordMessageId } : {}) };
 		});
-		return {
-			id: message.id,
-			kind: message.kind,
-			threadId: typeof message.threadId === "string" ? message.threadId : fallbackThreadId,
-			chunks,
+		// DOI-001..004 path-based queues never upload after upgrade. Unattempted text drains; uncertain multipart is receipted and abandoned.
+		if (legacyImages && message.multipartAttempted === true) {
+			if (typeof message.logicalHash === "string") abandonLegacy(message.id, message.logicalHash);
+			return [];
+		}
+		return [{ id: message.id, kind: message.kind,
+			threadId: typeof message.threadId === "string" ? message.threadId : fallbackThreadId, chunks,
 			...(typeof message.inboundMessageId === "string" ? { inboundMessageId: message.inboundMessageId } : {}),
 			...(Array.isArray(message.responseTo) ? { responseTo: [...message.responseTo] as string[] } : {}),
 			...(typeof message.logicalHash === "string" ? { logicalHash: message.logicalHash } : {}),
-			...(Array.isArray(message.images) ? {
-				images: (message.images as OutboundImageDescriptor[]).map((image) => ({ ...image })),
-			} : {}),
-			...(Number.isSafeInteger(message.imageOmissions) ? { imageOmissions: Number(message.imageOmissions) } : {}),
-			...(message.multipartAttempted === true ? { multipartAttempted: true as const } : {}),
-		};
+			...(currentImages ? { images: (message.images as OutboundImageDescriptor[]).map((image) => ({ ...image })) } : {}),
+			...(currentImages && message.multipartAttempted === true ? { multipartAttempted: true as const } : {}) }];
 	});
 }
 
@@ -403,7 +399,7 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 		};
 	}
 
-	const sessions: Record<string, SessionThreadMapping> = {};
+	const sessions: Record<string, SessionThreadMapping> = {}, legacyOutboundReceipts: string[] = [];
 	for (const [sessionId, mapping] of Object.entries(value.sessions)) {
 		if (
 			!isRecord(mapping) ||
@@ -445,7 +441,8 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 			threadCursors,
 			pendingMessages: parsePendingMessages(mapping.pendingMessages, file),
 			retainedImages: parseRetainedImages(mapping.retainedImages, file),
-			outboundMessages: parseOutboundMessages(mapping.outboundMessages, file, mapping.threadId),
+			outboundMessages: parseOutboundMessages(mapping.outboundMessages, file, mapping.threadId, (messageId, hash) =>
+				legacyOutboundReceipts.push(`${outboundReceiptPrefix(sessionId, messageId)}${hash}`)),
 			lifecycleMessages: parseLifecycleMessages(mapping.lifecycleMessages, file, fallbackActivityAt),
 			...(mapping.managerWake === null ? { managerWake: null } :
 				isManagerWakeDescriptor(mapping.managerWake) ? { managerWake: { ...mapping.managerWake } } : {}),
@@ -463,7 +460,7 @@ function parseState(value: unknown, file: string, fallbackActivityAt: number): D
 		version: STATE_VERSION,
 		projects,
 		sessions,
-		recentMessageIds: (value.recentMessageIds as string[]).slice(-MAX_RECENT_MESSAGE_IDS),
+		recentMessageIds: [...new Set([...value.recentMessageIds as string[], ...legacyOutboundReceipts])].slice(-MAX_RECENT_MESSAGE_IDS),
 	};
 }
 
@@ -1017,7 +1014,7 @@ export class DiscordStateStore {
 			}
 			session.lastActiveAt = this.now();
 			if (existing) {
-				const legacySame = existing.logicalHash === undefined && message.images === undefined && message.imageOmissions === undefined &&
+				const legacySame = existing.logicalHash === undefined && message.images === undefined &&
 					existing.kind === message.kind && existing.chunks.length === message.chunks.length && existing.chunks.every((chunk, index) =>
 					chunk.index === message.chunks[index]?.index && chunk.content === message.chunks[index]?.content &&
 					chunk.nonce === message.chunks[index]?.nonce) && JSON.stringify(existing.responseTo) === JSON.stringify(message.responseTo);

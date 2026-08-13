@@ -1,21 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readdir, realpath, unlink } from "node:fs/promises";
-import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
-import { marked } from "marked";
+import { chmod, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
+import { resolve } from "node:path";
 
-export const MAX_OUTBOUND_IMAGE_REFERENCES = 16;
 export const MAX_OUTBOUND_IMAGES = 4;
 export const MAX_OUTBOUND_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_OUTBOUND_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024;
-export const MAX_OUTBOUND_IMAGE_PATH_LENGTH = 4_096;
 const MAX_OUTBOUND_SNAPSHOT_ENTRIES = 2_000;
-const LOGICAL_HASH_VERSION = "discord-outbound-v1";
+const MAX_BASE64_LENGTH = 4 * Math.ceil(MAX_OUTBOUND_IMAGE_BYTES / 3);
+const LOGICAL_HASH_VERSION = "discord-native-outbound-v2";
 
 export const OUTBOUND_IMAGE_MIME_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
 export type OutboundImageMimeType = typeof OUTBOUND_IMAGE_MIME_TYPES[number];
 
+export interface NativeOutboundImage {
+	type: "image";
+	data: string;
+	mimeType: OutboundImageMimeType;
+}
+
 export interface OutboundImageDescriptor {
+	version: 1;
 	snapshot: string;
 	digest: string;
 	mimeType: OutboundImageMimeType;
@@ -29,94 +34,138 @@ export interface DiscordOutboundAttachment {
 	filename: string;
 }
 
-export interface PreparedOutboundImages {
-	images: OutboundImageDescriptor[];
-	omitted: number;
+export interface SettledReply {
+	messageId: string;
+	text: string;
+	responseTo: string[];
+	images: NativeOutboundImage[];
 }
 
-const EXTENSION_MIME_TYPES = new Map<string, OutboundImageMimeType>([
-	[".gif", "image/gif"],
-	[".jpeg", "image/jpeg"],
-	[".jpg", "image/jpeg"],
-	[".png", "image/png"],
-	[".webp", "image/webp"],
-]);
-
-function isDescendant(root: string, candidate: string): boolean {
-	const fromRoot = relative(root, candidate);
-	return fromRoot !== "" && fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot);
+interface ValidatedImage {
+	data: Buffer;
+	digest: string;
+	mimeType: OutboundImageMimeType;
 }
+
+const MIME_EXTENSIONS: Record<OutboundImageMimeType, string> = {
+	"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp",
+};
 
 function detectedMimeType(bytes: Uint8Array): OutboundImageMimeType | undefined {
-	if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
-		bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return "image/png";
+	if (bytes.length >= 8 && Buffer.from(bytes.subarray(0, 8)).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
 	if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
-	if (bytes.length >= 6) {
-		const signature = Buffer.from(bytes.subarray(0, 6)).toString("ascii");
-		if (signature === "GIF87a" || signature === "GIF89a") return "image/gif";
-	}
-	if (bytes.length >= 12 && Buffer.from(bytes.subarray(0, 4)).toString("ascii") === "RIFF" &&
-		Buffer.from(bytes.subarray(8, 12)).toString("ascii") === "WEBP") return "image/webp";
+	const ascii = Buffer.from(bytes.subarray(0, 12)).toString("ascii");
+	if (ascii.startsWith("GIF87a") || ascii.startsWith("GIF89a")) return "image/gif";
+	if (ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WEBP") return "image/webp";
 	return undefined;
 }
 
-function generatedFilename(path: string, mimeType: OutboundImageMimeType, index: number): string {
-	const extension = mimeType === "image/jpeg" ? ".jpg" : `.${mimeType.slice("image/".length)}`;
-	const rawStem = basename(path, extname(path)).normalize("NFKD").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-	const stem = (rawStem || "image").slice(0, 72);
-	return `${stem}-${index + 1}${extension}`;
+function validateImage(value: unknown): ValidatedImage | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const image = value as Record<string, unknown>, mimeType = image.mimeType as OutboundImageMimeType;
+	if (image.type !== "image" || typeof image.data !== "string" || image.data.length === 0 ||
+		image.data.length > MAX_BASE64_LENGTH || !OUTBOUND_IMAGE_MIME_TYPES.includes(mimeType) ||
+		!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(image.data)) return undefined;
+	const data = Buffer.from(image.data, "base64");
+	if (data.length === 0 || data.length > MAX_OUTBOUND_IMAGE_BYTES || data.toString("base64") !== image.data ||
+		detectedMimeType(data.subarray(0, 16)) !== mimeType) return undefined;
+	return { data, mimeType, digest: createHash("sha256").update(data).digest("hex") };
 }
 
-function normalizedReference(reference: string): string | undefined {
-	if (!reference || reference.length > MAX_OUTBOUND_IMAGE_PATH_LENGTH || reference.includes("\0") || /^[a-z][a-z0-9+.-]*:/i.test(reference)) {
-		return undefined;
-	}
-	try {
-		return decodeURIComponent(reference);
-	} catch {
-		return undefined;
-	}
-}
-
-export function assistantImagePaths(text: string): string[] {
-	const paths: string[] = [], visited = new WeakSet<object>();
-	const visit = (node: unknown): void => {
-		if (!node || typeof node !== "object" || visited.has(node)) return; visited.add(node);
-		if (Array.isArray(node)) { for (const child of node) visit(child); return; }
-		const token = node as Record<string, unknown>;
-		if (token.type === "image" && typeof token.href === "string") paths.push(token.href);
-		for (const value of Object.values(token)) visit(value);
-	};
-	try { visit(marked.lexer(text)); } catch { return []; } return paths.slice(0, MAX_OUTBOUND_IMAGE_REFERENCES);
-}
-
-export function outboundLogicalHash(text: string, responseTo: readonly string[], references: readonly string[]): string {
-	return createHash("sha256").update(LOGICAL_HASH_VERSION).update("\0")
-		.update(JSON.stringify([text, responseTo, references])).digest("hex");
+export function isNativeOutboundImageList(value: unknown): value is NativeOutboundImage[] {
+	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_OUTBOUND_IMAGES) return false;
+	const validated = value.map(validateImage);
+	return validated.every(Boolean) && validated.reduce((total, image) => total + image!.data.length, 0) <= MAX_OUTBOUND_IMAGE_TOTAL_BYTES &&
+		new Set(validated.map((image) => image!.digest)).size === validated.length;
 }
 
 export function isOutboundImageDescriptor(value: unknown): value is OutboundImageDescriptor {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const image = value as Record<string, unknown>;
-	const mimeType = image.mimeType as OutboundImageMimeType;
-	return typeof image.snapshot === "string" && /^[0-9a-f-]{36}\.image$/.test(image.snapshot) &&
-		typeof image.digest === "string" && /^[a-f0-9]{64}$/.test(image.digest) &&
-		OUTBOUND_IMAGE_MIME_TYPES.includes(mimeType) && Number.isSafeInteger(image.size) &&
-		Number(image.size) > 0 && Number(image.size) <= MAX_OUTBOUND_IMAGE_BYTES &&
-		typeof image.filename === "string" && /^[A-Za-z0-9._-]{1,100}$/.test(image.filename) &&
-		EXTENSION_MIME_TYPES.get(extname(image.filename).toLowerCase()) === mimeType;
+	const image = value as Record<string, unknown>, mimeType = image.mimeType as OutboundImageMimeType;
+	return image.version === 1 && typeof image.snapshot === "string" && /^[0-9a-f-]{36}\.image$/.test(image.snapshot) &&
+		typeof image.digest === "string" && /^[a-f0-9]{64}$/.test(image.digest) && OUTBOUND_IMAGE_MIME_TYPES.includes(mimeType) &&
+		Number.isSafeInteger(image.size) && Number(image.size) > 0 && Number(image.size) <= MAX_OUTBOUND_IMAGE_BYTES &&
+		typeof image.filename === "string" && /^image-[1-4]\.(?:jpg|png|gif|webp)$/.test(image.filename) &&
+		image.filename === `image-${image.filename.slice(6, 7)}.${MIME_EXTENSIONS[mimeType]}`;
 }
 
 export function isOutboundImageDescriptorList(value: unknown): value is OutboundImageDescriptor[] {
-	return Array.isArray(value) && value.length > 0 && value.length <= MAX_OUTBOUND_IMAGES &&
-		value.every(isOutboundImageDescriptor) &&
-		value.reduce((total, image) => total + image.size, 0) <= MAX_OUTBOUND_IMAGE_TOTAL_BYTES;
+	return Array.isArray(value) && value.length > 0 && value.length <= MAX_OUTBOUND_IMAGES && value.every((image, index) =>
+		isOutboundImageDescriptor(image) && image.filename === `image-${index + 1}.${MIME_EXTENSIONS[image.mimeType]}`) &&
+		value.reduce((total, image) => total + image.size, 0) <= MAX_OUTBOUND_IMAGE_TOTAL_BYTES &&
+		new Set(value.map((image) => image.digest)).size === value.length;
 }
 
-export function appendOutboundImageWarning(text: string, omitted = 0): string {
-	if (omitted <= 0) return text;
-	const notice = `⚠️ Discord omitted ${omitted} image attachment${omitted === 1 ? "" : "s"}.`;
-	return text ? `${text}\n\n${notice}` : notice;
+export function isLegacyOutboundImageDescriptorList(value: unknown): boolean {
+	return Array.isArray(value) && value.length > 0 && value.length <= MAX_OUTBOUND_IMAGES && value.every((entry) => {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+		const image = entry as Record<string, unknown>;
+		return image.version === undefined && typeof image.snapshot === "string" && /^[0-9a-f-]{36}\.image$/.test(image.snapshot) &&
+			typeof image.digest === "string" && /^[a-f0-9]{64}$/.test(image.digest);
+	});
+}
+
+function logicalDescriptors(images: readonly NativeOutboundImage[]): Array<Record<string, unknown>> {
+	return images.map((image, index) => {
+		const validated = validateImage(image);
+		if (!validated) throw new Error("Discord native outbound image is invalid");
+		return { version: 1, digest: validated.digest, mimeType: validated.mimeType, size: validated.data.length,
+			filename: `image-${index + 1}.${MIME_EXTENSIONS[validated.mimeType]}` };
+	});
+}
+
+export function outboundLogicalHash(text: string, responseTo: readonly string[], images: readonly NativeOutboundImage[]): string {
+	return createHash("sha256").update(LOGICAL_HASH_VERSION).update("\0")
+		.update(JSON.stringify([text, responseTo, logicalDescriptors(images)])).digest("hex");
+}
+
+export function splitOutboundText(text: string, maximum = 1_900): string[] {
+	if (!Number.isInteger(maximum) || maximum < 1 || maximum > 2_000) throw new Error("Invalid Discord outbound text limit");
+	const chunks: string[] = []; let remaining = text;
+	while (remaining.length > maximum) {
+		let cut = remaining.lastIndexOf("\n", maximum - 1);
+		if (cut >= Math.floor(maximum / 2)) cut++;
+		else { cut = remaining.lastIndexOf(" ", maximum); if (cut < 1) cut = maximum; }
+		if (/^[\uDC00-\uDFFF]$/.test(remaining[cut] ?? "") && /[\uD800-\uDBFF]/.test(remaining[cut - 1] ?? "")) cut--;
+		chunks.push(remaining.slice(0, cut)); remaining = remaining.slice(cut);
+	}
+	if (remaining) chunks.push(remaining);
+	return chunks;
+}
+
+export class SettledReplyCollector {
+	private images: NativeOutboundImage[] = [];
+	private digests = new Set<string>();
+	private totalBytes = 0;
+	private candidate?: SettledReply;
+
+	recordToolResult(message: { role?: string; content?: unknown }): void {
+		if (message.role !== "toolResult" || !Array.isArray(message.content)) return;
+		for (const block of message.content) {
+			const image = validateImage(block);
+			if (!image || this.images.length >= MAX_OUTBOUND_IMAGES || this.totalBytes + image.data.length > MAX_OUTBOUND_IMAGE_TOTAL_BYTES ||
+				this.digests.has(image.digest)) continue;
+			this.images.push({ type: "image", data: image.data.toString("base64"), mimeType: image.mimeType });
+			this.digests.add(image.digest); this.totalBytes += image.data.length;
+		}
+	}
+
+	recordAssistant(message: { role?: string; content?: unknown; stopReason?: string }, responseTo: readonly string[]): void {
+		this.candidate = undefined;
+		if (message.role !== "assistant" || (message.stopReason !== "stop" && message.stopReason !== "length") ||
+			!Array.isArray(message.content) || message.content.some((part) => part && typeof part === "object" &&
+				(part as { type?: unknown }).type === "toolCall")) return;
+		const text = message.content.filter((part): part is { type: "text"; text: string } => Boolean(part) && typeof part === "object" &&
+			(part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string").map((part) => part.text).join("");
+		if (!/\S/u.test(text)) return;
+		this.candidate = { messageId: randomUUID(), text, responseTo: [...responseTo], images: this.images.map((image) => ({ ...image })) };
+	}
+
+	settle(): SettledReply | undefined {
+		const candidate = this.candidate;
+		this.images = []; this.digests.clear(); this.totalBytes = 0; this.candidate = undefined;
+		return candidate;
+	}
 }
 
 export class OutboundImageStore {
@@ -130,51 +179,34 @@ export class OutboundImageStore {
 			await unlink(resolve(this.directory, entry.name)).catch(() => {});
 	}
 
-	async prepare(root: string, references: readonly string[]): Promise<PreparedOutboundImages> {
-		if ((await readdir(this.directory)).length + Math.min(references.length, MAX_OUTBOUND_IMAGES) > MAX_OUTBOUND_SNAPSHOT_ENTRIES) return { images: [], omitted: references.length };
-		let canonicalRoot; try { canonicalRoot = await realpath(resolve(root)); } catch { return { images: [], omitted: references.length }; }
-		const images: OutboundImageDescriptor[] = [], identities = new Set<string>();
-		let omitted = Math.max(0, references.length - MAX_OUTBOUND_IMAGE_REFERENCES), totalBytes = 0;
-		for (const rawReference of references.slice(0, MAX_OUTBOUND_IMAGE_REFERENCES)) {
-			if (images.length >= MAX_OUTBOUND_IMAGES) { omitted++; continue; }
-			let source, snapshot;
-			const snapshotName = `${randomUUID()}.image`;
+	async prepare(payloads: readonly NativeOutboundImage[]): Promise<OutboundImageDescriptor[]> {
+		if ((await readdir(this.directory)).length + payloads.length > MAX_OUTBOUND_SNAPSHOT_ENTRIES) return [];
+		const images: OutboundImageDescriptor[] = [], digests = new Set<string>(); let totalBytes = 0;
+		for (const payload of payloads.slice(0, MAX_OUTBOUND_IMAGES)) {
+			const image = validateImage(payload), snapshotName = `${randomUUID()}.image`; let snapshot;
 			try {
-				const reference = normalizedReference(rawReference); if (!reference) throw new Error("unsafe reference");
-				const lexicalPath = resolve(root, reference), lexicalStat = await lstat(lexicalPath), canonicalPath = await realpath(lexicalPath);
-				if (lexicalStat.isSymbolicLink() || !isDescendant(canonicalRoot, canonicalPath)) throw new Error("unsafe reference");
-				const mimeType = EXTENSION_MIME_TYPES.get(extname(canonicalPath).toLowerCase()); if (!mimeType) throw new Error("unsupported image");
-				source = await open(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-				const sourceStat = await source.stat(), pathStat = await lstat(canonicalPath);
-				if (!sourceStat.isFile() || pathStat.isSymbolicLink() || sourceStat.dev !== pathStat.dev || sourceStat.ino !== pathStat.ino ||
-					sourceStat.size <= 0 || sourceStat.size > MAX_OUTBOUND_IMAGE_BYTES) throw new Error("invalid image identity");
-				const data = await source.readFile(); if (data.byteLength !== sourceStat.size ||
-					detectedMimeType(data.subarray(0, 16)) !== mimeType) throw new Error("invalid image content");
-				const digest = createHash("sha256").update(data).digest("hex"), identity = `${digest}:${data.byteLength}`;
-				if (identities.has(identity) || totalBytes + data.byteLength > MAX_OUTBOUND_IMAGE_TOTAL_BYTES) throw new Error("duplicate or oversized");
-				await mkdir(this.directory, { recursive: true, mode: 0o700 });
-				snapshot = await open(resolve(this.directory, snapshotName), "wx", 0o600); await snapshot.writeFile(data);
-				identities.add(identity); totalBytes += data.byteLength;
-				images.push({ snapshot: snapshotName, digest, mimeType, size: data.byteLength,
-					filename: generatedFilename(reference, mimeType, images.length) });
-			} catch { omitted++; await unlink(resolve(this.directory, snapshotName)).catch(() => {}); }
-			finally { await source?.close().catch(() => {}); await snapshot?.close().catch(() => {}); }
+				if (!image || digests.has(image.digest) || totalBytes + image.data.length > MAX_OUTBOUND_IMAGE_TOTAL_BYTES) continue;
+				snapshot = await open(resolve(this.directory, snapshotName), "wx", 0o600); await snapshot.writeFile(image.data);
+				digests.add(image.digest); totalBytes += image.data.length;
+				images.push({ version: 1, snapshot: snapshotName, digest: image.digest, mimeType: image.mimeType, size: image.data.length,
+					filename: `image-${images.length + 1}.${MIME_EXTENSIONS[image.mimeType]}` });
+			} catch { await unlink(resolve(this.directory, snapshotName)).catch(() => {}); }
+			finally { await snapshot?.close().catch(() => {}); }
 		}
-		return { images, omitted };
+		return images;
 	}
 
-	async load(images: readonly OutboundImageDescriptor[]): Promise<{ files: DiscordOutboundAttachment[]; omitted: number }> {
+	async load(images: readonly OutboundImageDescriptor[]): Promise<DiscordOutboundAttachment[]> {
 		if (!isOutboundImageDescriptorList(images)) throw new Error("Discord outbound image metadata is invalid");
-		const files: DiscordOutboundAttachment[] = []; let omitted = 0;
+		const files: DiscordOutboundAttachment[] = [];
 		for (const image of images) try {
 			const path = resolve(this.directory, image.snapshot), fileStat = await lstat(path);
-			if (!fileStat.isFile() || fileStat.isSymbolicLink() || fileStat.size !== image.size) throw new Error("invalid snapshot");
+			if (!fileStat.isFile() || fileStat.isSymbolicLink() || fileStat.size !== image.size) continue;
 			const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW), data = await handle.readFile().finally(() => handle.close());
-			if (createHash("sha256").update(data).digest("hex") !== image.digest || detectedMimeType(data.subarray(0, 16)) !== image.mimeType)
-				throw new Error("invalid snapshot");
-			files.push({ data, mimeType: image.mimeType, filename: image.filename });
-		} catch { omitted++; }
-		return { files, omitted };
+			if (createHash("sha256").update(data).digest("hex") === image.digest && detectedMimeType(data.subarray(0, 16)) === image.mimeType)
+				files.push({ data, mimeType: image.mimeType, filename: image.filename });
+		} catch {}
+		return files;
 	}
 
 	async remove(names: readonly string[]): Promise<void> {

@@ -18,6 +18,7 @@ import type { ManagerPresentation, ManagerPresentationActionControl } from "./ma
 import type { ManagerWakeDescriptor } from "./manager-wake.js";
 import type { ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 import type { ManagerTaskTerminal } from "./manager-task-terminal.js";
+import type { NativeOutboundImage } from "./outbound-images.js";
 
 const MARKER_BOUNDARY = "\u2063";
 const ZERO = "\u200b";
@@ -245,10 +246,19 @@ export class DiscordBridge {
 		}));
 	}
 
-	async enqueueAssistantMessage(messageId: string, text: string, imagePaths: readonly string[] = []): Promise<void> {
+	assistantResponseIds(): string[] {
+		return [...this.runInboundIds];
+	}
+
+	async enqueueAssistantMessage(
+		messageId: string,
+		text: string,
+		nativeImages: readonly NativeOutboundImage[] = [],
+		responseTo?: readonly string[],
+	): Promise<void> {
 		if (!this.acceptingAssistantMessages) throw new Error("Discord bridge is not accepting assistant messages");
-		const responseTo = [...this.runInboundIds];
-		const pending = this.assistantPersistence.then(() => this.relay.sendAssistantText(messageId, text, responseTo, imagePaths));
+		const responses = responseTo ?? [...this.runInboundIds];
+		const pending = this.assistantPersistence.then(() => this.relay.sendAssistantText(messageId, text, responses, nativeImages));
 		this.assistantPersistence = pending.catch((error) => {
 			this.assistantPersistenceFailure ??= error instanceof Error ? error : new Error(String(error));
 		});

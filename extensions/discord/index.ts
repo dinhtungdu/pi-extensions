@@ -1,11 +1,9 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DiscordBridge, inboundMessageId, stripInboundMarker, type BridgeSession } from "./bridge.js";
-import { assistantText } from "./text.js";
-import { assistantImagePaths } from "./outbound-images.js";
+import { SettledReplyCollector, type SettledReply } from "./outbound-images.js";
 import {
 	DISCORD_CONFIG_FILE,
 	type DiscordBridgeConfig,
@@ -168,6 +166,16 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		let currentCtx: ExtensionContext | undefined;
 		let operation: Promise<void> = Promise.resolve();
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
+		const settledReplies = new SettledReplyCollector();
+
+		const deliverSettledReply = async (reply: SettledReply | undefined, ctx: ExtensionContext): Promise<void> => {
+			if (!reply || !bridge) return;
+			try {
+				await bridge.enqueueAssistantMessage(reply.messageId, reply.text, reply.images, reply.responseTo);
+			} catch (error) {
+				ctx.ui.notify(`Discord assistant-message mirror failed: ${errorMessage(error)}`, "error");
+			}
+		};
 
 		const unsubscribeTaskSnapshots = pi.events.on("manager:task-snapshot", (value) => {
 			const snapshot = acceptedManagerTaskSnapshot(environment, value);
@@ -599,6 +607,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		});
 
 		pi.on("session_shutdown", async (_event, ctx) => {
+			settledReplies.settle();
 			unsubscribeTaskSnapshots();
 			unsubscribeTaskTerminals();
 			for (const timer of inboundAcceptanceTimers) clearTimeout(timer);
@@ -660,6 +669,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 		pi.on("message_start", async (event, ctx) => {
 			if (event.message.role !== "user") return;
+			await deliverSettledReply(settledReplies.settle(), ctx);
 			const text = typeof event.message.content === "string"
 				? event.message.content
 				: event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
@@ -685,15 +695,11 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 		pi.on("message_end", async (event, ctx) => {
 			if (event.message.role === "assistant") {
-				const acceptingBridge = bridge;
-				const text = assistantText(event.message);
-				if (!acceptingBridge || !text) return;
-				const messageId = randomUUID();
-				try {
-					await acceptingBridge.enqueueAssistantMessage(messageId, text, assistantImagePaths(text));
-				} catch (error) {
-					ctx.ui.notify(`Discord assistant-message mirror failed: ${errorMessage(error)}`, "error");
-				}
+				settledReplies.recordAssistant(event.message, bridge?.assistantResponseIds() ?? []);
+				return;
+			}
+			if (event.message.role === "toolResult") {
+				settledReplies.recordToolResult(event.message);
 				return;
 			}
 			if (event.message.role !== "user" || !bridge) return;
@@ -718,6 +724,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		pi.on("agent_settled", async (_event, ctx) => {
 			let settlementFailure: unknown;
 			try {
+				await deliverSettledReply(settledReplies.settle(), ctx);
 				await bridge?.settleAgentRun();
 			} catch (error) {
 				settlementFailure = error;

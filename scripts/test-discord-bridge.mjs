@@ -508,10 +508,11 @@ try {
 		loadInboundImages,
 	} = await importBuilt("extensions/discord/inbound-images.js");
 	const {
-		MAX_OUTBOUND_IMAGE_BYTES,
 		OutboundImageStore,
-		assistantImagePaths,
+		SettledReplyCollector,
+		isNativeOutboundImageList,
 		outboundLogicalHash,
+		splitOutboundText,
 	} = await importBuilt("extensions/discord/outbound-images.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
@@ -544,7 +545,6 @@ try {
 		interactiveUserChunks,
 		projectChannelName,
 		sessionThreadName,
-		splitDiscordText,
 	} = await importBuilt("extensions/discord/text.js");
 	const {
 		assertConfiguredCategory,
@@ -3139,7 +3139,7 @@ try {
 		sessionId: "legacy-linked-session",
 	});
 	assert.equal(legacyLinkedRegistration.channelId, legacyMainRegistration.channelId, "a new relay must canonicalize registrations from rolling older clients");
-	assert.deepEqual([legacyLinkedRegistration.cwd, legacyLinkedRegistration.outputRoot], [canonicalMainCheckout, await realpath(linkedWorktree)], "project routing and worktree output ownership stay separate");
+	assert.equal(legacyLinkedRegistration.cwd, canonicalMainCheckout, "project identity owns channel routing");
 	assert.notEqual(legacyLinkedRegistration.threadId, legacyMainRegistration.threadId);
 	assert.equal(Object.keys((await rollingIdentityState.load()).projects).length, 1);
 	await rollingIdentityCore.activateRegistration("legacy-main-client", "legacy-main-generation", "legacy-main-session", () => true);
@@ -4283,9 +4283,10 @@ try {
 		{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: 7 }] },
 	];
 	for (const message of omittedAssistantMessages) assert.equal(assistantText(message), undefined);
-	const chunks = splitDiscordText("a".repeat(4_100));
-	assert.equal(chunks.join(""), "a".repeat(4_100));
-	assert.ok(chunks.every((chunk) => chunk.length <= 1_900));
+	const chunkSource = `${"a".repeat(1_899)}😀\n${"b".repeat(2_200)}`;
+	const chunks = splitOutboundText(chunkSource);
+	assert.equal(chunks.join(""), chunkSource, "assistant chunks must preserve every code unit");
+	assert.ok(chunks.every((chunk) => chunk.length <= 1_900 && !/[\uD800-\uDBFF]$/.test(chunk)));
 	const interactivePrefix = "👨‍💻: ";
 	const prefixedInteractive = (body) => `${interactivePrefix}${body}`;
 	const interactiveBodies = (messages) => messages.map((message) => message.slice(interactivePrefix.length));
@@ -4387,19 +4388,24 @@ try {
 		type: "outbound", requestId: "response-1", messageId: "assistant-1", kind: "assistant", text: "done",
 		responseTo: ["turn-1"],
 	}), true);
+	const nativePng = { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" };
 	assert.equal(isClientFrame({
-		type: "outbound", requestId: "response-image", messageId: "assistant-image", kind: "assistant", text: "![chart](chart.png)",
-		imagePaths: ["chart.png"],
+		type: "outbound", requestId: "response-image", messageId: "assistant-image", kind: "assistant", text: "unchanged",
+		nativeImages: [nativePng],
 	}), true);
 	assert.equal(isClientFrame({
 		type: "outbound", requestId: "response-image-invalid", messageId: "assistant-image-invalid", kind: "user", text: "bad",
-		imagePaths: ["chart.png"],
-	}), false, "only assistant finals may request outbound images");
+		nativeImages: [nativePng],
+	}), false, "only assistant finals may carry native images");
+	assert.equal(isClientFrame({
+		type: "outbound", requestId: "malformed-image", messageId: "malformed-image", kind: "assistant", text: "bad",
+		nativeImages: [{ ...nativePng, data: `${nativePng.data}=../` }],
+	}), false, "native image IPC rejects non-canonical base64");
 	assert.equal(isClientFrame({
 		type: "outbound", requestId: "response-invalid", messageId: "assistant-2", kind: "user", text: "bad",
 		responseTo: ["turn-1"],
 	}), false, "only assistant delivery may settle exact working indicators");
-	assert.equal(isServerFrame({ type: "registered", channelId: "c", threadId: "t", leaderPid: 1, outboundImages: true }), true);
+	assert.equal(isServerFrame({ type: "registered", channelId: "c", threadId: "t", leaderPid: 1, nativeOutboundImages: true }), true);
 	assert.equal(isClientFrame({
 		type: "manager_presentation_control_result", requestId: "merge-1", ok: true, message: "done",
 	}), true);
@@ -4436,66 +4442,62 @@ try {
 		type: "manager_control", requestId: "manager-oversize-ask", action: "ask", target: "project:pi-extensions", request: "x".repeat(2_001),
 	}), false);
 
-	const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-	assert.deepEqual(assistantImagePaths("caption ![chart](images/chart.png) then ![space](<images/chart two.png>)"), [
-		"images/chart.png", "images/chart two.png",
-	]);
-	assert.deepEqual(assistantImagePaths("`![code](code.png)` [link](link.png)\n```md\n![fenced](fenced.png)\n```\n\\![escaped](escaped.png) ![bad](broken.png"),
-		[], "code, fences, escapes, links, and malformed syntax are not image AST nodes");
-	assert.notEqual(outboundLogicalHash("same", ["turn"], ["a.png", "b.png"]),
-		outboundLogicalHash("same", ["turn"], ["b.png", "a.png"]), "logical hash binds ordered raw references");
-	const outboundUnitRoot = join(dataDir, "outbound-image-unit");
-	await mkdir(join(outboundUnitRoot, "images"), { recursive: true });
-	const outboundValidPath = join(outboundUnitRoot, "images", "unsafe name.png");
-	const outboundOutsidePath = join(dataDir, "outbound-outside.png");
-	const outboundBadPath = join(outboundUnitRoot, "images", "bad.jpg");
-	const outboundOversizedPath = join(outboundUnitRoot, "images", "oversized.png");
-	await writeFile(outboundValidPath, pngBytes);
-	await writeFile(outboundOutsidePath, pngBytes);
-	await writeFile(outboundBadPath, pngBytes);
-	await writeFile(outboundOversizedPath, pngBytes);
-	const oversizedHandle = await open(outboundOversizedPath, "r+");
-	await oversizedHandle.truncate(MAX_OUTBOUND_IMAGE_BYTES + 1);
-	await oversizedHandle.close();
-	await symlink(outboundValidPath, join(outboundUnitRoot, "images", "linked.png"));
+	const pngBytes = Buffer.from(nativePng.data, "base64");
+	const nativePng2 = { ...nativePng, data: Buffer.concat([pngBytes, Buffer.from([1])]).toString("base64") };
+	assert.equal(isNativeOutboundImageList([{ ...nativePng, mimeType: "image/jpeg" }]), false, "MIME must match signature");
+	assert.notEqual(outboundLogicalHash("same", ["turn"], [nativePng, nativePng2]),
+		outboundLogicalHash("same", ["turn"], [nativePng2, nativePng]), "logical hash binds ordered native descriptors");
+
+	const collector = new SettledReplyCollector();
+	collector.recordToolResult({ role: "user", content: [nativePng] });
+	collector.recordToolResult({ role: "toolResult", content: [
+		{ type: "text", text: "tool text never mirrors" }, nativePng, nativePng,
+		{ ...nativePng, data: "/not canonical/" }, nativePng2,
+	] });
+	collector.recordAssistant({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall" }] }, ["turn-a"]);
+	collector.recordAssistant({ role: "assistant", stopReason: "error", content: [{ type: "text", text: "retry me" }] }, ["turn-a"]);
+	collector.recordAssistant({ role: "assistant", stopReason: "stop", content: [
+		{ type: "thinking", thinking: "private" }, { type: "text", text: "  exact\n" }, { type: "text", text: "reply  " },
+	] }, ["turn-a"]);
+	const collected = collector.settle();
+	assert.equal(collected.text, "  exact\nreply  ", "final assistant text must remain exact");
+	assert.deepEqual(collected.responseTo, ["turn-a"]);
+	assert.equal(collected.images.length, 2, "tool image siblings survive retries while user and duplicate images are excluded");
+	collector.recordToolResult({ role: "toolResult", content: Array.from({ length: 5 }, (_, index) => ({
+		...nativePng, data: Buffer.concat([pngBytes, Buffer.from([index + 2])]).toString("base64"),
+	})) });
+	collector.recordAssistant({ role: "assistant", stopReason: "length", content: [{ type: "text", text: "first segment" }] }, ["turn-a"]);
+	assert.equal(collector.settle().images.length, 4, "collector bounds each settlement to four unique images");
+	collector.recordAssistant({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "follow-up" }] }, ["turn-b"]);
+	assert.deepEqual(collector.settle().responseTo, ["turn-b"], "steering and follow-ups start a fresh association segment");
 	const outboundSnapshotDirectory = join(dataDir, "outbound-image-snapshots"), outboundStore = new OutboundImageStore(outboundSnapshotDirectory);
 	await outboundStore.initialize(new Set());
-	const preparedOutbound = await outboundStore.prepare(outboundUnitRoot, [
-		"images/unsafe name.png",
-		"images/unsafe name.png",
-		"images/missing.png",
-		"../outbound-outside.png",
-		"images/linked.png",
-		"images/bad.jpg",
-		"images/oversized.png",
-	]);
-	assert.equal(preparedOutbound.images.length, 1, "mixed image references must retain only valid unique files");
-	assert.equal(preparedOutbound.omitted, 6, "all rejected sources collapse into one bounded path-free count");
-	assert.match(preparedOutbound.images[0].filename, /^[A-Za-z0-9._-]+\.png$/);
-	assert.equal("localPath" in preparedOutbound.images[0], false, "persisted metadata must never contain mutable source paths");
-	assert.equal((await stat(join(outboundSnapshotDirectory, preparedOutbound.images[0].snapshot))).mode & 0o777, 0o600,
+	const preparedOutbound = await outboundStore.prepare([nativePng, nativePng2]);
+	assert.deepEqual(preparedOutbound.map((image) => image.filename), ["image-1.png", "image-2.png"], "relay generates filenames");
+	assert.equal((await stat(join(outboundSnapshotDirectory, preparedOutbound[0].snapshot))).mode & 0o777, 0o600,
 		"private snapshots must be mode 0600");
-	const countPaths = [];
-	for (let index = 0; index < 5; index++) {
-		const relativePath = `images/count-${index}.png`;
-		await writeFile(join(outboundUnitRoot, relativePath), Buffer.concat([pngBytes, Buffer.from([index])]));
-		countPaths.push(relativePath);
-	}
-	const countLimited = await outboundStore.prepare(outboundUnitRoot, countPaths);
-	assert.equal(countLimited.images.length, 4);
-	assert.equal(countLimited.omitted, 1, "outbound image count rejection must remain bounded");
-	await writeFile(outboundValidPath, Buffer.from("mutated!"));
-	assert.deepEqual((await outboundStore.load(preparedOutbound.images)).files[0].data, pngBytes,
-		"queued delivery must use immutable snapshot despite source mutation");
-	await writeFile(join(outboundSnapshotDirectory, countLimited.images[0].snapshot), Buffer.from("corrupt"));
-	const partialSnapshots = await outboundStore.load(countLimited.images);
-	assert.equal(partialSnapshots.files.length, 3, "one corrupt snapshot must not block valid siblings");
-	assert.equal(partialSnapshots.omitted, 1);
+	await writeFile(join(outboundSnapshotDirectory, preparedOutbound[0].snapshot), Buffer.from("corrupt"));
+	const partialSnapshots = await outboundStore.load(preparedOutbound);
+	assert.equal(partialSnapshots.length, 1, "one corrupt snapshot must not block valid siblings");
 
-	const outboundIntegrationRoot = join(dataDir, "outbound-image-integration");
-	await mkdir(outboundIntegrationRoot, { recursive: true });
-	const outboundIntegrationPath = join(outboundIntegrationRoot, "result.png");
-	await writeFile(outboundIntegrationPath, pngBytes);
+	const legacySnapshotDirectory = join(dataDir, "legacy-outbound-snapshots"), legacyStore = new OutboundImageStore(legacySnapshotDirectory);
+	await legacyStore.initialize(new Set());
+	const legacySnapshot = "11111111-1111-4111-8111-111111111111.image";
+	await writeFile(join(legacySnapshotDirectory, legacySnapshot), pngBytes, { mode: 0o600 });
+	const legacyOutboundStateFile = join(dataDir, "legacy-outbound-state.json");
+	const legacyMessage = { id: "legacy-path", kind: "assistant", threadId: "legacy-thread",
+		chunks: [{ index: 0, content: "legacy text", nonce: "legacy-nonce" }],
+		images: [{ snapshot: legacySnapshot, digest: "0".repeat(64), mimeType: "image/png", size: pngBytes.length, filename: "old.png" }] };
+	await writeFile(legacyOutboundStateFile, JSON.stringify({ version: 1, projects: {}, sessions: { legacy: { cwd: "/legacy", channelId: "legacy-channel",
+		threadId: "legacy-thread", lastActiveAt: 1, threadCursors: {}, pendingMessages: [], retainedImages: [],
+		outboundMessages: [legacyMessage, { ...legacyMessage, id: "uncertain-path", multipartAttempted: true }], lifecycleMessages: [] } }, recentMessageIds: [] }));
+	const legacyOutboundState = new DiscordStateStore(legacyOutboundStateFile);
+	const migratedLegacy = await legacyOutboundState.getSession("legacy");
+	assert.equal(migratedLegacy.outboundMessages.length, 1, "uncertain legacy multipart is abandoned");
+	assert.equal(migratedLegacy.outboundMessages[0].images, undefined, "unattempted legacy path images drain as exact text only");
+	await legacyStore.initialize(await legacyOutboundState.pendingOutboundSnapshots());
+	await assert.rejects(() => stat(join(legacySnapshotDirectory, legacySnapshot)), /ENOENT/, "legacy snapshots are deleted");
+
 	const outboundImageState = new DiscordStateStore(join(dataDir, "outbound-image-state.json"));
 	const outboundImageGateway = new FakeGateway();
 	const outboundIntegrationStore = new OutboundImageStore(join(dataDir, "outbound-integration-snapshots"));
@@ -4504,87 +4506,64 @@ try {
 		undefined, undefined, undefined, outboundIntegrationStore,
 	);
 	await outboundImageCore.start();
-	const outboundImageRegistration = { cwd: outboundIntegrationRoot, sessionId: "outbound-image-session" };
+	const outboundImageRegistration = { cwd: "/native-output", sessionId: "outbound-image-session" };
 	const outboundImagePrepared = await outboundImageCore.prepareRegistration(
 		"outbound-image-client", "outbound-image-generation", outboundImageRegistration,
 	);
 	await outboundImageCore.activateRegistration(
 		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId, () => true,
-		undefined, false, undefined, false, undefined, undefined, false, outboundImagePrepared.outputRoot,
 	);
-	const partialImageText = "Caption stays intact. ![result](result.png)";
+	const partialImageText = "  Caption stays exact.\n";
 	await outboundImageCore.queueOutbound(
 		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
-		"outbound-image-partial", "assistant", partialImageText, undefined,
-		["result.png", "missing.png"],
+		"outbound-image-partial", "assistant", partialImageText, ["turn-native"], [nativePng, nativePng2],
 	);
-	await waitFor(() => FakeGateway.imageUploadAttempts.get(`${partialImageText}\n\n⚠️ Discord omitted 1 image attachment.`) === 1,
-		"partial outbound image delivery");
-	const partialImageMessage = outboundImageGateway.sent.find((message) => message.text.startsWith(partialImageText));
-	assert.equal(partialImageMessage.channelId, outboundImagePrepared.threadId, "outbound images must use exact mapped session thread");
-	assert.equal(partialImageMessage.text.startsWith(partialImageText), true, "validation warning must preserve final response text");
+	await waitFor(() => FakeGateway.imageUploadAttempts.get(partialImageText) === 1, "native outbound image delivery");
+	const partialImageMessage = outboundImageGateway.sent.find((message) => message.text === partialImageText);
+	assert.equal(partialImageMessage.channelId, outboundImagePrepared.threadId, "outbound images use mapped session thread");
+	assert.equal(partialImageMessage.text, partialImageText, "attachments never mutate final text");
 	assert.deepEqual((FakeGateway.channelMessages.get(outboundImagePrepared.threadId) ?? [])
-		.find((message) => message.id === partialImageMessage.id).files[0].data, pngBytes);
+		.find((message) => message.id === partialImageMessage.id).files.map((file) => file.data), [pngBytes, Buffer.from(nativePng2.data, "base64")]);
 
-	const imageOnlyText = "![result](result.png)";
+	const longImageText = `${"A".repeat(1_900)}😀${"B".repeat(2_100)}`, longChunks = splitOutboundText(longImageText);
+	FakeGateway.failOnceTexts.add(longChunks[1]);
 	await outboundImageCore.queueOutbound(
 		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
-		"outbound-image-only", "assistant", imageOnlyText, undefined, ["result.png"],
+		"outbound-image-long", "assistant", longImageText, undefined, [nativePng],
 	);
-	await waitFor(() => FakeGateway.imageUploadAttempts.get(imageOnlyText) === 1, "image-only final delivery");
-	assert.equal(outboundImageGateway.sent.filter((message) => message.text === imageOnlyText).length, 1,
-		"image-only final must deliver once");
+	await waitFor(() => longChunks.every((chunk) => outboundImageGateway.sent.some((message) => message.text === chunk)), "later chunk retry");
+	assert.equal(FakeGateway.imageUploadAttempts.get(longChunks[0]), 1, "later chunk retries never reattempt multipart");
+	assert.equal(longChunks.join(""), longImageText, "long Unicode text remains lossless");
 
-	let releaseDedupedImage;
-	let dedupedImageStarted;
+	let releaseDedupedImage, dedupedImageStarted;
 	const dedupedImageStart = new Promise((resolveStart) => { dedupedImageStarted = resolveStart; });
 	const originalSendImages = outboundImageGateway.sendImages.bind(outboundImageGateway);
 	outboundImageGateway.sendImages = async (...args) => {
-		if (args[1] === "dedupe image") {
-			dedupedImageStarted();
-			await new Promise((resolveUpload) => { releaseDedupedImage = resolveUpload; });
-		}
+		if (args[1] === "dedupe image") { dedupedImageStarted(); await new Promise((resolveUpload) => { releaseDedupedImage = resolveUpload; }); }
 		return originalSendImages(...args);
 	};
-	await outboundImageCore.queueOutbound(
-		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
-		"outbound-image-dedupe", "assistant", "dedupe image", undefined, ["result.png"],
-	);
-	await dedupedImageStart;
-	await writeFile(outboundIntegrationPath, Buffer.from("source changed"));
-	await outboundImageCore.queueOutbound(
-		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
-		"outbound-image-dedupe", "assistant", "dedupe image", undefined, ["result.png"],
-	);
-	releaseDedupedImage();
-	await waitFor(() => FakeGateway.imageUploadAttempts.get("dedupe image") === 1, "deduplicated image upload");
-	assert.equal(outboundImageGateway.sent.filter((message) => message.text === "dedupe image").length, 1);
 	await outboundImageCore.queueOutbound("outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
-		"outbound-image-dedupe", "assistant", "dedupe image", undefined, ["result.png"]);
-	assert.equal(FakeGateway.imageUploadAttempts.get("dedupe image"), 1, "recent same ID/hash skips mutated source");
+		"outbound-image-dedupe", "assistant", "dedupe image", undefined, [nativePng]);
+	await dedupedImageStart;
+	await outboundImageCore.queueOutbound("outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-image-dedupe", "assistant", "dedupe image", undefined, [nativePng]);
+	releaseDedupedImage();
+	await waitFor(() => FakeGateway.imageUploadAttempts.get("dedupe image") === 1, "same-ID reconnect dedupe");
 	await assert.rejects(() => outboundImageCore.queueOutbound("outbound-image-client", "outbound-image-generation",
-		outboundImageRegistration.sessionId, "outbound-image-dedupe", "assistant", "changed payload", undefined, ["result.png"]),
-	/different content/, "same ID with different logical payload conflicts");
+		outboundImageRegistration.sessionId, "outbound-image-dedupe", "assistant", "dedupe image", undefined, [nativePng2]),
+	/different content/, "same ID with changed native descriptor conflicts");
 	outboundImageGateway.sendImages = originalSendImages;
-	await writeFile(outboundIntegrationPath, pngBytes);
 
-	const failedImageText = "upload failure caption";
-	FakeGateway.failImageUploads.add(failedImageText);
-	await outboundImageCore.queueOutbound(
-		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
-		"outbound-image-failure", "assistant", failedImageText, undefined, ["result.png"],
-	);
+	FakeGateway.failImageUploads.add("upload failure caption");
+	await outboundImageCore.queueOutbound("outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-image-failure", "assistant", "upload failure caption", undefined, [nativePng]);
 	await waitFor(async () => (await outboundImageState.getSession(outboundImageRegistration.sessionId)).outboundMessages.length === 0,
-		"uncertain multipart attempt abandonment");
-	assert.equal(FakeGateway.imageUploadAttempts.get(failedImageText), 1, "uncertain upload stays at-most-once");
-	assert.equal(outboundImageGateway.sent.some((message) => message.text.startsWith(failedImageText)), false, "no duplicate text fallback");
-	await outboundImageCore.queueOutbound(
-		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
-		"outbound-after-image-failure", "assistant", "later reply progresses",
-	);
-	await waitFor(() => outboundImageGateway.sent.some((message) => message.text === "later reply progresses"),
-		"later reply after image upload failure");
-	assert.equal((await outboundImageState.getSession(outboundImageRegistration.sessionId)).outboundMessages.length, 0);
+		"uncertain multipart abandonment");
+	assert.equal(FakeGateway.imageUploadAttempts.get("upload failure caption"), 1, "uncertain upload stays at-most-once");
+	assert.equal(outboundImageGateway.sent.some((message) => message.text === "upload failure caption"), false, "no text fallback duplicates");
+	await outboundImageCore.queueOutbound("outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-after-image-failure", "assistant", "later reply progresses");
+	await waitFor(() => outboundImageGateway.sent.some((message) => message.text === "later reply progresses"), "later reply progresses");
 	await outboundImageCore.stop();
 
 	const validAttachmentUrl = "https://cdn.discordapp.com/attachments/12345/67890/image.png?ex=signed";
@@ -5061,7 +5040,7 @@ try {
 		async prepareRegistration() {
 			return { channelId: "old-client-channel", threadId: "old-client-thread", cwd: "/workspace/the-manager" };
 		},
-		async activateRegistration(...args) { oldClientActivatedAsProducer = args.at(-5); },
+		async activateRegistration(...args) { oldClientActivatedAsProducer = args[7]; },
 		unregisterClient() {},
 		async resumeDelivery() {},
 		updateManagerCatalogues() {},
@@ -5194,14 +5173,14 @@ try {
 		{ provider: "compat", id: "model", name: "Compatibility Model" },
 	], "new clients may advertise controls to older relays because registration fields are additive");
 	assert.equal(previousHostRegistrations[0].inboundImages, true, "new clients may advertise additive image support to older relays");
-	assert.equal(previousHostRegistrations[0].outboundImages, true, "new clients may advertise additive outbound image support to older relays");
+	assert.equal(previousHostRegistrations[0].nativeOutboundImages, true, "new clients may advertise additive native image support to older relays");
 	assert.equal(previousHostRegistrations[0].managerTaskSummaryProducer, true,
 		"new eligible manager clients may advertise summary ownership to an older relay without breaking registration");
 	assert.equal(previousRegisterValidator(previousHostRegistrations[0]), true,
 		"the previous relay registration validator must accept the additive producer capability");
 	assert.equal(compatibilityClient.status().sessionControls, undefined, "an older relay must not advertise unsupported controls");
 	assert.equal(compatibilityClient.status().inboundImages, undefined, "an older relay must preserve text-only rolling compatibility");
-	assert.equal(compatibilityClient.status().outboundImages, undefined, "an older relay must not receive outbound image paths");
+	assert.equal(compatibilityClient.status().nativeOutboundImages, undefined, "an older relay remains text-only");
 	let workingRetryAttempts = 0;
 	handleWorking = (_frame, socket) => {
 		if (++workingRetryAttempts !== 1) return false;
@@ -5229,10 +5208,10 @@ try {
 	assert.equal(previousValidator(previousHostFrames[0]), true);
 	assert.equal(isClientFrame(previousHostFrames[0]), true);
 	assert.equal(isClientFrame({ ...previousHostFrames[0], kind: "interactive" }), false, "unknown outbound kinds must remain invalid");
-	await compatibilityClient.sendAssistantText("compat-image", "![image](secret.png)", [], ["secret.png"]);
+	await compatibilityClient.sendAssistantText("compat-image", "exact compatibility text", [], [nativePng]);
 	const compatibilityImageFrame = previousHostFrames.find((frame) => frame.messageId === "compat-image");
-	assert.equal(compatibilityImageFrame.imagePaths, undefined, "old relays must never receive local image paths");
-	assert.match(compatibilityImageFrame.text, /^!\[image\]\(secret\.png\)\n\n⚠️ Discord omitted 1 image attachment\.$/);
+	assert.equal(compatibilityImageFrame.nativeImages, undefined, "old relays remain text-only");
+	assert.equal(compatibilityImageFrame.text, "exact compatibility text", "capability fallback never mutates text");
 	assert.equal(compatibilityErrors.length, 0);
 	rejectOutbound = true;
 	const rejectionStarted = Date.now();
@@ -6446,7 +6425,9 @@ try {
 	await first.emit("message_end", {
 		message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "final only" }] },
 	});
-	await waitFor(() => FakeGateway.sendAttempts.get("final only") === 1, "post-persistence Discord attempt");
+	assert.equal(FakeGateway.sendAttempts.get("final only"), undefined, "candidate waits for settlement");
+	await first.emit("agent_settled", {});
+	await waitFor(() => FakeGateway.sendAttempts.get("final only") === 1, "post-settlement Discord attempt");
 	const persistedAssistant = (await new DiscordStateStore(stateFile).getSession("session-11111111")).outboundMessages
 		.find((message) => message.chunks.map((chunk) => chunk.content).join("") === "final only");
 	assert.ok(persistedAssistant, "eligible message_end must durably persist before settlement and Discord delivery");
@@ -6456,7 +6437,7 @@ try {
 	assert.equal(gateway.sent.filter((message) => message.text === "final only").length, 1);
 	await first.emit("agent_settled", {});
 	assert.equal(gateway.sent.filter((message) => message.text === "final only").length, 1,
-		"agent settlement must not own or duplicate assistant persistence");
+		"duplicate settlement must not duplicate assistant persistence");
 
 	const outboundFinalRoot = join(dataDir, "outbound-final-session");
 	await mkdir(outboundFinalRoot, { recursive: true });
@@ -6468,10 +6449,12 @@ try {
 	});
 	await outboundFinal.emit("session_start", { reason: "startup" });
 	const outboundFinalThread = (await new DiscordStateStore(stateFile).getSession("session-outbound-final")).threadId;
-	const outboundFinalText = "Rendered result. ![final](final.png)";
+	const outboundFinalText = "  Rendered result.  ";
+	await outboundFinal.emit("message_end", { message: { role: "toolResult", content: [nativePng] } });
 	await outboundFinal.emit("message_end", {
 		message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: outboundFinalText }] },
 	});
+	await outboundFinal.emit("agent_settled", {});
 	await waitFor(() => gateway.sent.some((message) => message.text === outboundFinalText && message.channelId === outboundFinalThread),
 		"final-response outbound image routing");
 	assert.equal(FakeGateway.imageUploadAttempts.get(outboundFinalText), 1);

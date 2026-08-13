@@ -3,7 +3,7 @@ import type { DiscordBridgeConfig } from "./config.js";
 import type { RelaySessionRegistration } from "./relay-core.js";
 import type { DiscordLifecycleStatus } from "./reactions.js";
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
-import { MAX_OUTBOUND_IMAGE_PATH_LENGTH, MAX_OUTBOUND_IMAGE_REFERENCES } from "./outbound-images.js";
+import { isNativeOutboundImageList, type NativeOutboundImage } from "./outbound-images.js";
 import {
 	isManagerProjectCatalogue,
 	isManagerTaskCatalogue,
@@ -28,7 +28,7 @@ import {
 	type ManagerPresentationActionControl,
 } from "./manager-presentation.js";
 
-export const MAX_IPC_FRAME_BYTES = 1_048_576;
+export const MAX_IPC_FRAME_BYTES = 16 * 1_048_576;
 
 export type ClientFrame =
 	| ({
@@ -44,10 +44,10 @@ export type ClientFrame =
 		managerPresentation?: { schemaVersion: 1; controlIds: string[] };
 		managerTaskSnapshotTaskId?: string;
 		inboundImages?: true;
-		outboundImages?: true;
+		nativeOutboundImages?: true;
 	} & RelaySessionRegistration)
 	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string; responseTo?: string[];
-		imagePaths?: string[] }
+		nativeImages?: NativeOutboundImage[] }
 	| { type: "working"; requestId: string; messageId: string }
 	| { type: "project_summary"; requestId: string; text: string }
 	| { type: "manager_presentation"; requestId: string; presentation: ManagerPresentation }
@@ -76,7 +76,7 @@ export type ServerFrame =
 		managerControls?: true;
 		managerPresentation?: { schemaVersion: 1; controlIds: string[] };
 		inboundImages?: true;
-		outboundImages?: true;
+		nativeOutboundImages?: true;
 	}
 	| { type: "inbound"; messageId: string; text: string; images?: QueuedInboundImage[] }
 	| { type: "control"; requestId: string; action: PiSessionControlAction }
@@ -130,7 +130,7 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(frame.projectIdentityResolved === undefined || typeof frame.projectIdentityResolved === "boolean") &&
 			(frame.sessionName === undefined || typeof frame.sessionName === "string") &&
 			(frame.inboundImages === undefined || frame.inboundImages === true) &&
-			(frame.outboundImages === undefined || frame.outboundImages === true) &&
+			(frame.nativeOutboundImages === undefined || frame.nativeOutboundImages === true) &&
 			(frame.managerTaskSummaryProducer === undefined || frame.managerTaskSummaryProducer === true) &&
 			(frame.managerTaskSnapshotTaskId === undefined ||
 				(typeof frame.managerTaskSnapshotTaskId === "string" && frame.managerTaskSnapshotTaskId.length > 0)) &&
@@ -154,9 +154,7 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(frame.responseTo === undefined || frame.kind === "assistant" && Array.isArray(frame.responseTo) &&
 				frame.responseTo.length >= 1 && frame.responseTo.length <= 256 &&
 				new Set(frame.responseTo).size === frame.responseTo.length && frame.responseTo.every((id) => typeof id === "string")) &&
-			(frame.imagePaths === undefined || frame.kind === "assistant" && Array.isArray(frame.imagePaths) &&
-				frame.imagePaths.length >= 1 && frame.imagePaths.length <= MAX_OUTBOUND_IMAGE_REFERENCES &&
-				frame.imagePaths.every((path) => typeof path === "string" && path.length > 0 && path.length <= MAX_OUTBOUND_IMAGE_PATH_LENGTH));
+			(frame.nativeImages === undefined || frame.kind === "assistant" && isNativeOutboundImageList(frame.nativeImages));
 	}
 	if (frame.type === "working") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
@@ -205,7 +203,7 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 			(frame.managerControls === undefined || frame.managerControls === true) &&
 			(frame.managerPresentation === undefined || isManagerPresentationCapability(frame.managerPresentation)) &&
 			(frame.inboundImages === undefined || frame.inboundImages === true) &&
-			(frame.outboundImages === undefined || frame.outboundImages === true);
+			(frame.nativeOutboundImages === undefined || frame.nativeOutboundImages === true);
 	}
 	if (frame.type === "inbound") {
 		return typeof frame.messageId === "string" && typeof frame.text === "string" &&

@@ -1,7 +1,7 @@
 import type { Socket } from "node:net";
 
 export const MAX_QUEUED_IPC_FRAMES = 64;
-export const MAX_QUEUED_IPC_BYTES = 4 * 1_048_576;
+export const MAX_QUEUED_IPC_BYTES = 16 * 1_048_576;
 
 interface WritableSocket {
 	destroyed: boolean;

@@ -65,7 +65,6 @@
 	},
 	"dependencies": {
 		"discord.js": "^14.27.0",
-		"jiti": "^2.7.0",
-		"marked": "17.0.4"
+		"jiti": "^2.7.0"
 	}
 }

@@ -32,7 +32,7 @@ interface SocketState {
 	managerControls: boolean;
 	managerPresentation: boolean;
 	managerTaskTerminalProducer: boolean;
-	outboundImages: boolean;
+	nativeOutboundImages: boolean;
 	buffer: string;
 	queue: Promise<void>;
 	queuedInputFrames: number;
@@ -180,7 +180,7 @@ export class LocalRelayHost {
 			managerControls: false,
 			managerPresentation: false,
 			managerTaskTerminalProducer: false,
-			outboundImages: false,
+			nativeOutboundImages: false,
 			buffer: "",
 			queue: Promise.resolve(),
 			queuedInputFrames: 0,
@@ -291,7 +291,7 @@ export class LocalRelayHost {
 			state.generation = parsed.generation;
 			state.sessionId = parsed.sessionId;
 			state.managerControls = parsed.managerControls !== undefined;
-			state.outboundImages = parsed.outboundImages === true;
+			state.nativeOutboundImages = parsed.nativeOutboundImages === true;
 			const managerTaskSummaryProducer = isEligibleManagerTaskSummaryProducer(prepared.cwd, parsed);
 			state.managerTaskTerminalProducer = managerTaskSummaryProducer;
 			const managerPresentation = negotiatedManagerPresentation(prepared.cwd, parsed);
@@ -308,7 +308,7 @@ export class LocalRelayHost {
 				managerControls: true,
 				...(managerPresentation ? { managerPresentation } : {}),
 				inboundImages: true,
-				...(state.outboundImages ? { outboundImages: true as const } : {}),
+				...(state.nativeOutboundImages ? { nativeOutboundImages: true as const } : {}),
 			})) throw new Error("Local Discord relay response queue is full");
 			await this.options.core.activateRegistration(
 				parsed.clientId,
@@ -337,7 +337,6 @@ export class LocalRelayHost {
 				} : undefined,
 				parsed.managerTaskSnapshotTaskId,
 				state.managerTaskTerminalProducer,
-				prepared.outputRoot,
 			);
 			if (state.closed) {
 				this.options.core.unregisterClient(parsed.clientId, parsed.generation);
@@ -456,13 +455,13 @@ export class LocalRelayHost {
 			return;
 		}
 		if (parsed.type === "outbound") {
-			if (parsed.imagePaths?.length && !state.outboundImages) {
-				this.fail(socket, state, "Local client did not negotiate Discord outbound image support", false, parsed.requestId);
+			if (parsed.nativeImages?.length && !state.nativeOutboundImages) {
+				this.fail(socket, state, "Local client did not negotiate Discord native outbound image support", false, parsed.requestId);
 				return;
 			}
 			try {
 				await this.options.core.queueOutbound(
-					clientId, generation, sessionId, parsed.messageId, parsed.kind, parsed.text, parsed.responseTo, parsed.imagePaths,
+					clientId, generation, sessionId, parsed.messageId, parsed.kind, parsed.text, parsed.responseTo, parsed.nativeImages,
 				);
 			} catch (error) {
 				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
