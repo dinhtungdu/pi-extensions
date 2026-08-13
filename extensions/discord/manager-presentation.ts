@@ -63,6 +63,11 @@ export function isManagerPresentationActionControl(value: unknown, contentLength
 		isConfirmationText(action.confirmation.title, 100) && isConfirmationText(action.confirmation.body, 1_500) &&
 		isConfirmationText(action.confirmation.confirmLabel, 80);
 }
+function isSplitSurrogateOffset(after: number, content: string | undefined): boolean {
+	if (content === undefined || after <= 0 || after >= content.length) return false;
+	const left = content.charCodeAt(after - 1), right = content.charCodeAt(after);
+	return left >= 0xD800 && left <= 0xDBFF && right >= 0xDC00 && right <= 0xDFFF;
+}
 export function isManagerPresentation(value: unknown): value is ManagerPresentation {
 	if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.revision !== "string" || !/^[a-f0-9]{64}$/.test(value.revision) ||
 		typeof value.content !== "string" || value.content.length < 1 || value.content.length > MAX_MANAGER_PRESENTATION_CONTENT ||
@@ -79,8 +84,8 @@ export function isManagerPresentation(value: unknown): value is ManagerPresentat
 	let previousAfter = 0;
 	const taskIds = new Set<string>();
 	for (const action of value.actionControls ?? []) {
-		if (!isManagerPresentationActionControl(action, value.content.length) || ids.has(action.id) || taskIds.has(action.taskId) ||
-			action.after <= previousAfter) return false;
+		if (!isManagerPresentationActionControl(action, value.content.length) || isSplitSurrogateOffset(action.after, value.content) ||
+			ids.has(action.id) || taskIds.has(action.taskId) || action.after <= previousAfter) return false;
 		ids.add(action.id);
 		taskIds.add(action.taskId);
 		previousAfter = action.after;

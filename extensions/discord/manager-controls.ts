@@ -254,6 +254,32 @@ export class ManagerControlExecutor {
 		return executor;
 	}
 
+	async executePresentationMerge(_requestId: string, taskId: string): Promise<PiSessionControlResult> {
+		if (!MANAGER_TASK_ID.test(taskId)) return { ok: false, message: "Manager action task ID is invalid." };
+		try {
+			await this.validateRuntime();
+			const supervisorClient = join(this.root, "bin", "manager-supervisor-client.mjs");
+			const taskPath = join(this.root, "data", "tasks", `${taskId}.md`);
+			const result = await this.run(process.execPath, [
+				supervisorClient, "task-merge-and-archive", "--root", this.root, "--task", taskPath,
+				"--activity-clear", "yes", "--evidence", `User explicitly confirmed merge, push, and archive for task ${taskId} via Discord.`,
+			], { cwd: this.root, timeout: MANAGER_CONTROL_PROCESS_TIMEOUT_MS });
+			if (result.code !== 0) return boundedControlResult({
+				ok: false, message: failureMessage(result, `merge-and-archive failed with exit ${result.code}.`),
+			});
+			const output = parseJson(result.stdout, "merge-and-archive");
+			if (output.ok !== true || output.command !== "task-merge-and-archive" || output.task_id !== taskId ||
+				output.archived !== true || typeof output.checkout_mode !== "string" ||
+				(output.slot_state !== null && typeof output.slot_state !== "string") || output.pushed !== true ||
+				typeof output.replay !== "boolean") {
+				return { ok: false, message: "merge-and-archive returned conflicting manager output." };
+			}
+			return { ok: true, message: `@${taskId} merged, pushed, and archived.` };
+		} catch (error) {
+			return boundedControlResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
+		}
+	}
+
 	async execute(
 		request: PiManagerControlRequest,
 		tasks: readonly ManagerTaskCatalogueEntry[],

@@ -642,21 +642,22 @@ export class DiscordRelayCore {
 		if (this.inFlightPresentationControls.has(channelKey)) {
 			return Promise.resolve({ ok: false, message: "A manager presentation control is already running; retry later." });
 		}
-		let resolveResult!: (result: DiscordPresentationControlResult) => void;
-		let rejectResult!: (error: unknown) => void;
-		const result = new Promise<DiscordPresentationControlResult>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
-		const reservation = { requestId: request.requestId, result };
+		let reservation!: { requestId: string; result: Promise<DiscordPresentationControlResult> };
+		const result = (async () => {
+			try {
+				const settled = await this.executeCurrentPresentationControl(request);
+				this.completedPresentationControls.set(request.requestId, settled);
+				while (this.completedPresentationControls.size > MAX_RECENT_SESSION_CONTROLS)
+					this.completedPresentationControls.delete(this.completedPresentationControls.keys().next().value!);
+				return settled;
+			} finally {
+				if (this.inFlightPresentationControls.get(interactionKey) === reservation) this.inFlightPresentationControls.delete(interactionKey);
+				if (this.inFlightPresentationControls.get(channelKey) === reservation) this.inFlightPresentationControls.delete(channelKey);
+			}
+		})();
+		reservation = { requestId: request.requestId, result };
 		this.inFlightPresentationControls.set(interactionKey, reservation);
 		this.inFlightPresentationControls.set(channelKey, reservation);
-		void this.executeCurrentPresentationControl(request).then((settled) => {
-			this.completedPresentationControls.set(request.requestId, settled);
-			while (this.completedPresentationControls.size > MAX_RECENT_SESSION_CONTROLS)
-				this.completedPresentationControls.delete(this.completedPresentationControls.keys().next().value!);
-			return settled;
-		}).then(resolveResult, rejectResult).finally(() => {
-			if (this.inFlightPresentationControls.get(interactionKey) === reservation) this.inFlightPresentationControls.delete(interactionKey);
-			if (this.inFlightPresentationControls.get(channelKey) === reservation) this.inFlightPresentationControls.delete(channelKey);
-		});
 		return result;
 	}
 
@@ -669,23 +670,23 @@ export class DiscordRelayCore {
 		const owner = this.summaryOwners.get(project.cwd);
 		const authorization = this.summaryAuthorizations.get(project.cwd);
 		const desired = project.summary.desiredPresentation;
-		const delivered = project.summary.delivery?.presentation;
+		const deliveredPage = project.summary.delivery?.pages?.find((page) => page.messageId === request.messageId)?.presentation ??
+			(project.summary.delivery?.messageId === request.messageId ? project.summary.delivery.presentation : undefined);
 		const control = desired?.controls.find((candidate) => candidate.id === custom[2]);
 		const actionControl = desired?.actionControls?.find((candidate) => candidate.id === custom[2]);
-		const deliveredControl = delivered?.controls.find((candidate) => candidate.id === custom[2]);
-		const deliveredActionControl = delivered?.actionControls?.find((candidate) => candidate.id === custom[2]);
-		const deliveredMessageIds = project.summary.delivery?.messageIds ??
-			(project.summary.delivery ? [project.summary.delivery.messageId] : []);
+		const deliveredControl = deliveredPage?.controls.find((candidate) => candidate.id === custom[2]);
+		const deliveredActionControl = deliveredPage?.actionControls?.find((candidate) => candidate.id === custom[2]);
 		const descriptorMatches = control
 			? isSupportedManagerPresentationControl(control.id, control.command) && JSON.stringify(control) === JSON.stringify(deliveredControl)
 			: actionControl
-				? isManagerPresentationActionControl(actionControl, desired?.content.length) &&
-					JSON.stringify(actionControl) === JSON.stringify(deliveredActionControl)
+				? isManagerPresentationActionControl(actionControl, desired?.content.length) && deliveredActionControl !== undefined &&
+					actionControl.id === deliveredActionControl.id && actionControl.command === deliveredActionControl.command &&
+					actionControl.taskId === deliveredActionControl.taskId &&
+					JSON.stringify(actionControl.confirmation) === JSON.stringify(deliveredActionControl.confirmation)
 				: false;
 		if (!owner?.executePresentationControl || this.activeSessions.get(owner.sessionId) !== owner ||
 			!authorization || authorization.owner !== owner || authorization.revision !== project.summary.revision ||
-			!deliveredMessageIds.includes(request.messageId) || desired?.revision !== custom[1] || delivered?.revision !== custom[1] ||
-			!descriptorMatches) {
+			desired?.revision !== custom[1] || deliveredPage?.revision !== custom[1] || !descriptorMatches) {
 			return { ok: false, message: "This manager control is stale or no longer authorized." };
 		}
 		if (actionControl && request.confirmed !== true) {
@@ -1112,7 +1113,7 @@ export class DiscordRelayCore {
 				for (const page of pages) {
 					if (!this.isCurrentSummaryAuthorization(cwd, authorization)) throw new Error("Manager summary owner changed during replacement");
 					const nonce = randomBytes(18).toString("base64url");
-					const messageId = page.page === page.total
+					const messageId = page.page === page.total || page.presentation.actionControls !== undefined
 						? await this.transport.sendPresentation(channelId, page.presentation, nonce)
 						: await this.transport.sendText(channelId, page.content, nonce);
 					sent.push(messageId);
@@ -1133,7 +1134,8 @@ export class DiscordRelayCore {
 			await this.transport.deleteOwnText(channelId, messageId);
 		}
 		if (!this.isCurrentSummaryAuthorization(cwd, authorization)) return;
-		await this.state.recordProjectSummaryBatchSent(cwd, newMessageIds, authorization.revision);
+		await this.state.recordProjectSummaryBatchSent(cwd, newMessageIds, authorization.revision,
+			pages.map((page, index) => ({ messageId: newMessageIds[index]!, presentation: page.presentation })));
 	}
 
 	private scheduleProjectSummaryRetry(cwd: string): void {

@@ -48,6 +48,19 @@ const PI_COMMAND_NAME = "pi";
 const MANAGER_COMMAND_NAME = "m";
 const LEGACY_MANAGER_COMMAND_NAME = "manager";
 
+export function isManagerPresentationButton(customId: string): boolean {
+	return customId.startsWith("m:");
+}
+
+export function dispatchManagerPresentationButton<T extends { customId: string }>(
+	interaction: T,
+	dispatch: (interaction: T) => void,
+): boolean {
+	if (!isManagerPresentationButton(interaction.customId)) return false;
+	dispatch(interaction);
+	return true;
+}
+
 export interface DiscordPresentationControlRequest {
 	requestId: string; guildId?: string; channelId: string; messageId: string; customId: string; confirmed?: true;
 }
@@ -390,7 +403,10 @@ export class DiscordJsTransport implements DiscordTransport {
 		client.on(Events.InteractionCreate, (interaction) => {
 			const channelId = interactionChannels.resolve(interaction);
 			if (interaction.isButton()) {
-				void this.executePresentationControlInteraction(interaction, channelId);
+				// Ephemeral mc:* confirmation buttons are owned and acknowledged only by their message collector.
+				dispatchManagerPresentationButton(interaction, (button) => {
+					void this.executePresentationControlInteraction(button, channelId);
+				});
 				return;
 			}
 			if (interaction.isAutocomplete()) {
@@ -817,7 +833,7 @@ export class DiscordJsTransport implements DiscordTransport {
 				const confirmId = `mc:${interaction.id}:yes`;
 				const cancelId = `mc:${interaction.id}:no`;
 				const reply = await interaction.editReply({
-					content: `**${confirmation.title}**\n${confirmation.body}`,
+					content: `${confirmation.title}\n${confirmation.body}`,
 					components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 						new ButtonBuilder().setCustomId(confirmId).setLabel(confirmation.confirmLabel).setStyle(ButtonStyle.Danger),
 						new ButtonBuilder().setCustomId(cancelId).setLabel("Cancel").setStyle(ButtonStyle.Secondary),

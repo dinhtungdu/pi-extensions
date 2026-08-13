@@ -532,12 +532,14 @@ try {
 	const {
 		assertConfiguredCategory,
 		collectChronologicalMessages,
+		dispatchManagerPresentationButton,
 		DiscordInteractionChannelResolver,
 		DiscordJsTransport,
 		MANAGER_CONTROL_INTERACTION_TIMEOUT_MS,
 		managerCommandDefinition,
 		archiveSessionThread,
 		lockSessionThread,
+		isManagerPresentationButton,
 		managerPresentationComponents,
 		managerSummaryMessageContent,
 		presentationComponents,
@@ -1855,6 +1857,8 @@ try {
 					const customId = payload.components[0].toJSON().components[0].custom_id;
 					const decision = { id: "confirm-interaction", customId, user: { id: "owner" },
 						async deferUpdate() { decisionDeferred = true; } };
+					assert.equal(options.filter({ ...decision, user: { id: "wrong-user" } }), false,
+						"wrong user cannot satisfy confirmation collector");
 					assert.equal(options.filter(decision), true);
 					return decision;
 				},
@@ -1864,7 +1868,7 @@ try {
 	await confirmationTransport.executePresentationControlInteraction(confirmationInteraction, "project-channel");
 	assert.equal(confirmationDeferredFlags, MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds,
 		"merge confirmation must remain ephemeral");
-	assert.equal(confirmationReplies[0].content, "**Merge ready-task?**\nLand on main and push origin/main.");
+	assert.equal(confirmationReplies[0].content, "Merge ready-task?\nLand on main and push origin/main.");
 	assert.equal(confirmationReplies[0].components[0].toJSON().components[0].label, "Merge now");
 	assert.equal(decisionDeferred, true);
 	assert.deepEqual(confirmationRequests.map(({ requestId, confirmed }) => ({ requestId, confirmed })), [
@@ -1872,6 +1876,48 @@ try {
 		{ requestId: "confirm-interaction", confirmed: true },
 	], "only explicit confirmation advances manager action execution");
 	assert.equal(confirmationReplies.at(-1).content, "✅ @ready-task merged, pushed, and archived.");
+	assert.equal(isManagerPresentationButton(`m:${"9".repeat(64)}:merge-ready`), true);
+	assert.equal(isManagerPresentationButton("mc:preview-interaction:yes"), false,
+		"generic InteractionCreate dispatch must ignore collector-owned confirmation IDs");
+	let genericDispatches = 0;
+	assert.equal(dispatchManagerPresentationButton({ customId: "mc:preview-interaction:yes" }, () => genericDispatches++), false);
+	assert.equal(dispatchManagerPresentationButton({ customId: `m:${"9".repeat(64)}:merge-ready` }, () => genericDispatches++), true);
+	assert.equal(genericDispatches, 1, "dispatch routes summary action once and ignores confirmation button");
+	const requestsBeforeCancel = confirmationRequests.length;
+	let cancelAcks = 0;
+	await confirmationTransport.executePresentationControlInteraction({
+		...confirmationInteraction,
+		id: "cancel-preview",
+		async editReply(payload) {
+			confirmationReplies.push(payload);
+			return { async awaitMessageComponent(options) {
+				const customId = payload.components[0].toJSON().components[1].custom_id;
+				const decision = { id: "cancel-interaction", customId, user: { id: "owner" },
+					async deferUpdate() { cancelAcks++; } };
+				assert.equal(options.filter(decision), true);
+				return decision;
+			} };
+		},
+	}, "project-channel");
+	assert.equal(cancelAcks, 1, "collector alone acknowledges cancel exactly once");
+	assert.equal(confirmationRequests.length, requestsBeforeCancel + 1,
+		"cancel performs preview only and no confirmed relay request/execution");
+	const requestsBeforeWrongUser = confirmationRequests.length;
+	await confirmationTransport.executePresentationControlInteraction({
+		...confirmationInteraction,
+		id: "wrong-user-preview",
+		async editReply(payload) {
+			confirmationReplies.push(payload);
+			return { async awaitMessageComponent(options) {
+				const customId = payload.components[0].toJSON().components[0].custom_id;
+				assert.equal(options.filter({ id: "wrong-user-confirm", customId, user: { id: "intruder" } }), false);
+				throw new Error("simulated collector timeout");
+			} };
+		},
+	}, "project-channel");
+	assert.equal(confirmationRequests.length, requestsBeforeWrongUser + 1,
+		"wrong user performs preview only and no confirmed relay request/execution");
+	assert.equal(confirmationReplies.at(-1).content, "❌ Merge confirmation expired.");
 
 	const historyRevision = "a".repeat(64);
 	const historyMessages = Array.from({ length: 150 }, (_, index) => ({
@@ -2186,6 +2232,11 @@ try {
 		...actionPresentationEnvelope,
 		action_controls: [{ ...actionPresentationEnvelope.action_controls[0], after: actionPresentationEnvelope.content.length + 1 }],
 	}), /invalid presentation/, "out-of-range manager-owned placement must fail closed");
+	assert.throws(() => parseManagerPresentationEnvelope({
+		...actionPresentationEnvelope,
+		action_controls: [{ ...actionPresentationEnvelope.action_controls[0],
+			after: actionPresentationEnvelope.content.indexOf("😀") + 1 }],
+	}), /invalid presentation/, "offset between UTF-16 surrogate halves must fail closed");
 	for (const [name, mutation] of [
 		["unknown control", { controls: [{ id: "other", label: "Other", style: "secondary", command: "other" }] }],
 		["unsupported command", { controls: [{ id: "github-refresh-reconcile", label: "Refresh", style: "secondary", command: "status" }] }],
@@ -2551,6 +2602,16 @@ try {
 	assert.equal(managerActionCalls.slice(0, 9).every((call) =>
 		call.args.includes(join(managerExecutorRoot, "data", "tasks", "safe-task.md"))), true,
 	"supplied task selection must resolve only to the canonical active task path");
+	assert.deepEqual(await managerExecutor.executePresentationMerge("descriptor-merge", "descriptor-only-task"), {
+		ok: true, message: "@descriptor-only-task merged, pushed, and archived.",
+	}, "validated descriptor merge must execute with empty/stale autocomplete catalogue");
+	assert.deepEqual(managerProcessCalls.at(-1).args.slice(0, 6), [
+		join(managerExecutorRoot, "bin", "manager-supervisor-client.mjs"), "task-merge-and-archive",
+		"--root", managerExecutorRoot, "--task", join(managerExecutorRoot, "data", "tasks", "descriptor-only-task.md"),
+	], "descriptor task_id must route directly to canonical Supervisor validation");
+	const lifecycleCallsBeforeAsk = managerProcessCalls.filter((call) => [
+		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive", "task-reconcile-pr",
+	].includes(call.args[1])).length;
 	const deliveredAskRequests = [];
 	const executorProjects = [{ projectId: "pi-extensions" }, { projectId: "safe-task" }];
 	assert.deepEqual(await managerExecutor.execute({
@@ -2695,7 +2756,7 @@ try {
 		"canonical stale/removed target refusals must never call deliverAsk");
 	assert.equal(managerProcessCalls.filter((call) => [
 		"handoff-start", "handoff-return", "task-archive", "task-merge-and-archive", "task-reconcile-pr",
-	].includes(call.args[1])).length, 16,
+	].includes(call.args[1])).length, lifecycleCallsBeforeAsk,
 	"ask must not invoke or mutate manager lifecycle state");
 	const callsBeforeStale = managerProcessCalls.length;
 	assert.deepEqual(await managerExecutor.execute({ requestId: "executor-stale", action: "archive", taskId: "missing-task" }, executorCatalogue), {
@@ -3668,8 +3729,9 @@ try {
 	await restartSummaryCore.stop();
 
 	const managerPresentationPayload = (revision, content, controls = [{ id: "github-refresh-reconcile",
-		label: "Refresh & Reconcile", style: "secondary", command: "github-refresh-reconcile" }]) =>
-		({ schemaVersion: 1, revision, content, controls, degraded: false, warnings: [] });
+		label: "Refresh & Reconcile", style: "secondary", command: "github-refresh-reconcile" }], actionControls) =>
+		({ schemaVersion: 1, revision, content, controls, ...(actionControls !== undefined ? { actionControls } : {}),
+			degraded: false, warnings: [] });
 	assert.equal(paginateManagerPresentation(managerPresentationPayload("4".repeat(64), "x".repeat(1_900))).length, 1,
 		"manager summary payload boundary must fit one page");
 	assert.equal(paginateManagerPresentation(managerPresentationPayload("5".repeat(64), "x".repeat(1_901))).length, 2,
@@ -3683,6 +3745,25 @@ try {
 	assert.ok(boundaryPages.slice(0, -1).every((page) => page.presentation.controls.length === 0));
 	assert.deepEqual(boundaryPages.at(-1).presentation.controls, boundaryPresentation.controls,
 		"only final manager summary page may carry controls");
+	const pagedActionContent = `${"a".repeat(900)}😀${"b".repeat(3_500)}end`;
+	const pagedActions = [1_900, 3_800, 4_100].map((after, index) => ({
+		id: `merge-page-${index + 1}`, label: "Merge & archive", style: "success", command: "task-merge-and-archive",
+		taskId: `page-task-${index + 1}`, after,
+		confirmation: { title: `Merge page task ${index + 1}?`, body: `Body ${index + 1}`, confirmLabel: "Confirm" },
+	}));
+	const pagedActionPresentation = managerPresentationPayload("e".repeat(64), pagedActionContent, undefined, pagedActions);
+	const pagedActionPages = paginateManagerPresentation(pagedActionPresentation);
+	assert.equal(pagedActionPages.length, 3);
+	assert.deepEqual(pagedActionPages.map((page) => page.presentation.actionControls.map((action) => action.id)), [
+		["merge-page-1"], ["merge-page-2"], ["merge-page-3"],
+	], "early, middle, and final pages retain only their exact action controls");
+	assert.deepEqual(pagedActionPages.map((page) => page.presentation.actionControls[0].after), [1_900, 1_900, 300],
+		"boundary actions stay on preceding pages and convert to exact page-local UTF-16 offsets");
+	assert.ok(pagedActionPages.slice(0, -1).every((page) => page.presentation.controls.length === 0));
+	assert.equal(pagedActionPages.at(-1).presentation.controls[0].id, "github-refresh-reconcile",
+		"global refresh remains final-page-only beside final task action");
+	assert.equal(pagedActionPages.map((page) => page.payload).join(""), pagedActionContent,
+		"action pagination preserves Unicode content byte-for-byte");
 	assert.deepEqual(boundaryPages.map((page) => managerSummaryPageMetadata(page.content)),
 		boundaryPages.map(({ revision, page, total }) => ({ revision, page, total })), "page metadata must round-trip");
 	assert.equal(managerSummaryPageMetadata("unrelated bot message"), undefined);
@@ -4004,32 +4085,42 @@ try {
 		},
 	);
 	await actionCore.queueManagerPresentation(
-		"presentation-action-client", "presentation-action-generation", "presentation-action-session", actionPresentation,
+		"presentation-action-client", "presentation-action-generation", "presentation-action-session", pagedActionPresentation,
 	);
 	const actionMapping = await actionState.getSession("presentation-action-session");
-	await waitFor(async () => (await actionState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === actionPresentation.revision,
+	await waitFor(async () => (await actionState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === pagedActionPresentation.revision,
 		"action_controls presentation delivery");
-	const actionMessage = FakeGateway.channelMessages.get(actionMapping.channelId).at(-1);
+	const actionMessages = FakeGateway.channelMessages.get(actionMapping.channelId);
+	const deliveredActionState = (await actionState.projectSummaries())[0].summary.delivery;
+	assert.deepEqual(deliveredActionState.pages.map((page) => page.messageId), actionMessages.map((message) => message.id),
+		"state persists exact delivered page/message presentation association");
+	assert.equal(actionMessages.every((message) => message.presentation), true,
+		"relay must send every action-bearing early, middle, and final page as Components V2 presentation");
+	const actionMessage = actionMessages.find((message) => message.presentation.actionControls?.[0]?.id === "merge-page-1");
+	const otherValidPage = actionMessages.find((message) => message.id !== actionMessage.id);
 	const actionRequest = {
 		requestId: "action-merge-preview", guildId: "12345", channelId: actionMapping.channelId, messageId: actionMessage.id,
-		customId: `m:${actionPresentation.revision}:merge-ready-task`,
+		customId: `m:${pagedActionPresentation.revision}:merge-page-1`,
 	};
 	assert.deepEqual(await actionCore.executeDiscordPresentationControl(actionRequest), {
 		ok: true,
 		message: "Confirmation required.",
-		confirmation: { title: "Merge ready-task?", body: "Land on main and push origin/main.", confirmLabel: "Merge now" },
+		confirmation: { title: "Merge page task 1?", body: "Body 1", confirmLabel: "Confirm" },
 	}, "ready direct-landing action must return manager-owned confirmation details before mutation");
 	assert.equal(actionExecutions.length, 0, "preview must not execute merge-and-archive");
 	assert.equal((await actionCore.executeDiscordPresentationControl({
 		...actionRequest, requestId: "action-wrong-message", messageId: "stale-message", confirmed: true,
 	})).ok, false, "task action from wrong summary message must fail stale");
+	assert.equal((await actionCore.executeDiscordPresentationControl({
+		...actionRequest, requestId: "action-other-valid-page", messageId: otherValidPage.id, confirmed: true,
+	})).ok, false, "task action must reject every other valid page in the same delivered batch");
 	assert.deepEqual(await actionCore.executeDiscordPresentationControl({
 		...actionRequest, requestId: "action-merge-confirmed", confirmed: true,
-	}), { ok: true, message: "@ready-task merged, pushed, and archived." });
+	}), { ok: true, message: "@page-task-1 merged, pushed, and archived." });
 	assert.equal(actionExecutions.length, 1, "confirmed action executes exactly once");
-	assert.deepEqual(actionExecutions[0].actionControl, actionPresentation.actionControls[0],
+	assert.deepEqual(actionExecutions[0].actionControl, pagedActionPresentation.actionControls[0],
 		"relay forwards exact manager-owned action descriptor instead of parsing summary Markdown");
-	const replacedActionPresentation = { ...actionPresentation, revision: "7".repeat(64), content: `${actionPresentation.content}\nUpdated.` };
+	const replacedActionPresentation = { ...pagedActionPresentation, revision: "7".repeat(64), content: `${pagedActionPresentation.content}\nUpdated.` };
 	await actionCore.queueManagerPresentation(
 		"presentation-action-client", "presentation-action-generation", "presentation-action-session", replacedActionPresentation,
 	);

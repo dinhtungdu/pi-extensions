@@ -48,6 +48,7 @@ export interface ProjectSummaryState {
 		messageIds?: string[];
 		content: string;
 		presentation?: ManagerPresentation;
+		pages?: Array<{ messageId: string; presentation: ManagerPresentation }>;
 	};
 	pendingSend?: {
 		nonce: string;
@@ -273,11 +274,30 @@ function parseProjectSummary(value: unknown, file: string): ProjectSummaryState 
 		if (value.delivery.presentation !== undefined && !isManagerPresentation(value.delivery.presentation)) {
 			throw new Error(`Discord bridge state ${file} has an invalid delivered manager presentation`);
 		}
+		let pages: NonNullable<ProjectSummaryState["delivery"]>["pages"];
+		if (value.delivery.pages !== undefined) {
+			if (!Array.isArray(value.delivery.pages) || value.delivery.pages.length < 1 || value.delivery.pages.length > 99 ||
+				!value.delivery.pages.every((page) => isRecord(page) && typeof page.messageId === "string" &&
+					isManagerPresentation(page.presentation)) ||
+				new Set(value.delivery.pages.map((page) => (page as { messageId: string }).messageId)).size !== value.delivery.pages.length) {
+				throw new Error(`Discord bridge state ${file} has invalid delivered manager presentation pages`);
+			}
+			pages = value.delivery.pages.map((page) => ({
+				messageId: (page as { messageId: string }).messageId,
+				presentation: structuredClone((page as { presentation: ManagerPresentation }).presentation),
+			}));
+			const deliveredMessageIds = value.delivery.messageIds;
+			if (Array.isArray(deliveredMessageIds) &&
+				pages.some((page, index) => page.messageId !== deliveredMessageIds[index])) {
+				throw new Error(`Discord bridge state ${file} has inconsistent manager presentation pages`);
+			}
+		}
 		delivery = {
 			messageId: value.delivery.messageId,
 			...(Array.isArray(value.delivery.messageIds) ? { messageIds: [...value.delivery.messageIds] as string[] } : {}),
 			content: value.delivery.content,
 			...(value.delivery.presentation ? { presentation: structuredClone(value.delivery.presentation as ManagerPresentation) } : {}),
+			...(pages ? { pages } : {}),
 		};
 	}
 	let pendingSend: ProjectSummaryState["pendingSend"];
@@ -630,9 +650,16 @@ export class DiscordStateStore {
 		});
 	}
 
-	async recordProjectSummaryBatchSent(cwd: string, messageIds: readonly string[] | string, expectedRevision: number): Promise<void> {
+	async recordProjectSummaryBatchSent(
+		cwd: string,
+		messageIds: readonly string[] | string,
+		expectedRevision: number,
+		pages?: readonly { messageId: string; presentation: ManagerPresentation }[],
+	): Promise<void> {
 		const batchIds = typeof messageIds === "string" ? [messageIds] : [...messageIds];
-		if (batchIds.length < 1 || batchIds.length > 99 || new Set(batchIds).size !== batchIds.length) {
+		if (batchIds.length < 1 || batchIds.length > 99 || new Set(batchIds).size !== batchIds.length ||
+			(pages !== undefined && (pages.length !== batchIds.length || pages.some((page, index) =>
+				page.messageId !== batchIds[index] || !isManagerPresentation(page.presentation))))) {
 			throw new Error("Discord manager summary batch message IDs are invalid");
 		}
 		await this.mutate(async (state) => {
@@ -643,6 +670,9 @@ export class DiscordStateStore {
 				messageIds: batchIds,
 				content: summary.desiredText,
 				presentation: structuredClone(summary.desiredPresentation),
+				...(pages ? { pages: pages.map((page) => ({
+					messageId: page.messageId, presentation: structuredClone(page.presentation),
+				})) } : {}),
 			};
 		});
 	}
