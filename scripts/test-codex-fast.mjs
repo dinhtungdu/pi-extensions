@@ -89,9 +89,17 @@ try {
 	);
 
 	await first.emit("session_start");
-	assert.deepEqual(first.statuses.at(-1), [CODEX_FAST_STATUS_KEY, CODEX_FAST_STATUS_ICON]);
+	assert.deepEqual(first.statuses.at(-1), [CODEX_FAST_STATUS_KEY, undefined]);
 
 	const payload = { model: "gpt-5.4", service_tier: "default" };
+	assert.equal(
+		await first.emit("before_provider_request", { payload }),
+		undefined,
+		"Fast mode must default to disabled",
+	);
+
+	await first.command("on");
+	assert.deepEqual(first.statuses.at(-1), [CODEX_FAST_STATUS_KEY, CODEX_FAST_STATUS_ICON]);
 	const fastPayload = await first.emit("before_provider_request", { payload });
 	assert.deepEqual(fastPayload, { model: "gpt-5.4", service_tier: "priority" });
 	assert.equal(payload.service_tier, "default", "provider payload must not be mutated in place");

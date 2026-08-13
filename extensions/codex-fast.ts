@@ -13,7 +13,7 @@ function configPath(): string {
 
 function loadEnabled(): boolean {
 	const path = configPath();
-	if (!existsSync(path)) return true;
+	if (!existsSync(path)) return false;
 
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
@@ -25,7 +25,7 @@ function loadEnabled(): boolean {
 	} catch (error) {
 		console.error(`codex-fast: failed to read ${path}: ${String(error)}`);
 	}
-	return true;
+	return false;
 }
 
 function saveEnabled(enabled: boolean): string {
@@ -40,7 +40,7 @@ function isOpenAICodex(ctx: ExtensionContext): boolean {
 }
 
 export default function codexFastExtension(pi: ExtensionAPI): void {
-	let enabled = true;
+	let enabled = false;
 
 	function syncStatus(ctx: ExtensionContext): void {
 		ctx.ui.setStatus(
