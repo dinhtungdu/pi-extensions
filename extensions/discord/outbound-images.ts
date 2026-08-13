@@ -137,12 +137,7 @@ export class SettledReplyCollector {
 	private images: NativeOutboundImage[] = [];
 	private digests = new Set<string>();
 	private totalBytes = 0;
-	private candidate?: SettledReply;
-	private pendingSteers = 0;
-
-	recordInput(streamingBehavior?: "steer" | "followUp"): void {
-		if (streamingBehavior === "steer") { this.pendingSteers++; this.candidate = undefined; }
-	}
+	private replies: SettledReply[] = [];
 
 	recordToolResult(message: { role?: string; content?: unknown }): void {
 		if (message.role !== "toolResult" || !Array.isArray(message.content)) return;
@@ -156,25 +151,20 @@ export class SettledReplyCollector {
 	}
 
 	recordAssistant(message: { role?: string; content?: unknown; stopReason?: string }, responseTo: readonly string[]): void {
-		this.candidate = undefined;
 		if (message.role !== "assistant" || (message.stopReason !== "stop" && message.stopReason !== "length") ||
 			!Array.isArray(message.content) || message.content.some((part) => part && typeof part === "object" &&
 				(part as { type?: unknown }).type === "toolCall")) return;
 		const text = message.content.filter((part): part is { type: "text"; text: string } => Boolean(part) && typeof part === "object" &&
 			(part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string").map((part) => part.text).join("");
 		if (!/\S/u.test(text)) return;
-		this.candidate = { messageId: randomUUID(), text, responseTo: [...responseTo], images: this.images.map((image) => ({ ...image })) };
+		this.replies.push({ messageId: randomUUID(), text, responseTo: [...responseTo], images: [] });
 	}
 
-	startUserMessage(): SettledReply | undefined {
-		if (this.pendingSteers > 0) { this.pendingSteers--; this.candidate = undefined; return undefined; }
-		return this.settle();
-	}
-
-	settle(): SettledReply | undefined {
-		const candidate = this.candidate;
-		this.images = []; this.digests.clear(); this.totalBytes = 0; this.candidate = undefined; this.pendingSteers = 0;
-		return candidate;
+	settle(): SettledReply[] {
+		const replies = this.replies;
+		if (replies.length > 0) replies[replies.length - 1]!.images = this.images.map((image) => ({ ...image }));
+		this.images = []; this.digests.clear(); this.totalBytes = 0; this.replies = [];
+		return replies;
 	}
 }
 

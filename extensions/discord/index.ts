@@ -168,9 +168,9 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		const inboundAcceptanceTimers = new Set<ReturnType<typeof setTimeout>>();
 		const settledReplies = new SettledReplyCollector();
 
-		const deliverSettledReply = async (reply: SettledReply | undefined, ctx: ExtensionContext): Promise<void> => {
-			if (!reply || !bridge) return;
-			try {
+		const deliverSettledReplies = async (replies: readonly SettledReply[], ctx: ExtensionContext): Promise<void> => {
+			if (!bridge) return;
+			for (const reply of replies) try {
 				await bridge.enqueueAssistantMessage(reply.messageId, reply.text, reply.images, reply.responseTo);
 			} catch (error) {
 				ctx.ui.notify(`Discord assistant-message mirror failed: ${errorMessage(error)}`, "error");
@@ -617,7 +617,6 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		});
 
 		pi.on("input", async (event, ctx) => {
-			settledReplies.recordInput(event.streamingBehavior);
 			if (event.text === MANAGER_SUMMARY_COMMAND && presentationProducer) {
 				if (event.source === "extension") {
 					if (managerSummaryTurn?.origin !== "discord" || !managerSummaryTurn.awaitingInput) {
@@ -670,7 +669,6 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 		pi.on("message_start", async (event, ctx) => {
 			if (event.message.role !== "user") return;
-			await deliverSettledReply(settledReplies.startUserMessage(), ctx);
 			const text = typeof event.message.content === "string"
 				? event.message.content
 				: event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
@@ -725,7 +723,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		pi.on("agent_settled", async (_event, ctx) => {
 			let settlementFailure: unknown;
 			try {
-				await deliverSettledReply(settledReplies.settle(), ctx);
+				await deliverSettledReplies(settledReplies.settle(), ctx);
 				await bridge?.settleAgentRun();
 			} catch (error) {
 				settlementFailure = error;

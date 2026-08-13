@@ -5754,8 +5754,8 @@ try {
 	assert.equal(fullSummaryMessages.some((message) => message.id === managerSummaryMessageId), false,
 		"automatic lifecycle publication must replace the prior batch after new pages succeed");
 	managerSummaryMessageId = fullSummaryMessages.at(-1).id;
-	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive" }),
-		{ action: "handled" }, "a second canonical TUI command must be rejected while one is active");
+	assert.deepEqual(await managerSummarySession.emit("input", { text: canonicalSummaryCommand, source: "interactive", streamingBehavior: "steer" }),
+		{ action: "handled" }, "handled steer with no user-message event must remain isolated from reply association");
 	await settleManagerCommand();
 	await waitFor(async () => (await managerSummaryState())?.summary.delivery?.content === fullSummary,
 		"complete untruncated TUI-origin summary publication");
@@ -6425,19 +6425,14 @@ try {
 	});
 	await outboundFinal.emit("session_start", { reason: "startup" });
 	const outboundFinalThread = (await new DiscordStateStore(stateFile).getSession("session-outbound-final")).threadId;
-	const preSteerText = "obsolete before steer", outboundFinalText = "  Rendered after steer.  ";
-	await outboundFinal.emit("message_end", { message: { role: "toolResult", content: [nativePng] } });
-	await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: preSteerText }] } });
-	await outboundFinal.emit("input", { source: "interactive", streamingBehavior: "steer", text: "correct it" }); await outboundFinal.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "correct it" }] } });
-	assert.equal(FakeGateway.sendAttempts.get(preSteerText), undefined, "Pi 0.84.1 steer input suppresses pre-steer candidate");
-	await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: outboundFinalText }] } });
-	await outboundFinal.emit("input", { source: "interactive", streamingBehavior: "followUp", text: "next request" }); await outboundFinal.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "next request" }] } });
-	await waitFor(() => gateway.sent.some((message) => message.text === outboundFinalText && message.channelId === outboundFinalThread), "post-steer image delivery at true follow-up boundary");
-	assert.equal(FakeGateway.imageUploadAttempts.get(outboundFinalText), 1, "steer-retained images attach exactly once");
-	await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "follow-up final" }] } });
-	await outboundFinal.emit("agent_settled", {});
-	await waitFor(() => FakeGateway.sendAttempts.get("follow-up final") === 1, "follow-up settlement");
-	assert.equal(FakeGateway.imageUploadAttempts.get("follow-up final"), undefined, "true follow-up starts image-free segment");
+	const cycleReplies = ["  Before steer.  ", "After steer\n", " Follow-up final "];
+	await outboundFinal.emit("message_end", { message: { role: "toolResult", content: [{ type: "text", text: "private" }, nativePng, nativePng] } }); await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: cycleReplies[0] }] } });
+	await outboundFinal.emit("input", { source: "interactive", streamingBehavior: "steer", text: "correct it" }); await outboundFinal.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "correct it" }] } }); await outboundFinal.emit("message_end", { message: { role: "toolResult", content: [{ ...nativePng, data: "/invalid/" }, nativePng2] } }); await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "length", content: [{ type: "text", text: cycleReplies[1] }] } });
+	await outboundFinal.emit("input", { source: "interactive", streamingBehavior: "followUp", text: "next request" }); await outboundFinal.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "next request" }] } }); await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "intermediate" }] } }); await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: cycleReplies[2] }] } });
+	assert.ok(cycleReplies.every((text) => FakeGateway.sendAttempts.get(text) === undefined), "all eligible replies wait for settlement"); await outboundFinal.emit("agent_settled", {}); await waitFor(() => cycleReplies.every((text) => FakeGateway.sendAttempts.get(text) === 1), "settled cycle replies");
+	assert.deepEqual(gateway.sent.filter((message) => cycleReplies.includes(message.text)).map((message) => message.text), cycleReplies, "settlement preserves exact reply order and text"); assert.deepEqual(cycleReplies.map((text) => FakeGateway.imageUploadAttempts.get(text)), [undefined, undefined, 1], "all tool images attach exactly once to last eligible reply"); assert.equal(FakeGateway.channelMessages.get(outboundFinalThread).find((message) => message.text === cycleReplies[2]).files.length, 2);
+	await outboundFinal.emit("message_end", { message: { role: "toolResult", content: [nativePng] } }); await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "aborted", content: [{ type: "text", text: "cancelled" }] } }); await outboundFinal.emit("agent_settled", {}); await outboundFinal.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "after cancellation" }] } }); await outboundFinal.emit("agent_settled", {});
+	await waitFor(() => FakeGateway.sendAttempts.get("after cancellation") === 1, "post-cancellation cycle"); assert.equal(FakeGateway.sendAttempts.get("cancelled"), undefined); assert.equal(FakeGateway.imageUploadAttempts.get("after cancellation"), undefined, "cycle without final text drops collected images");
 	await outboundFinal.emit("session_shutdown", { reason: "quit" });
 
 	async function runTerminalLifecycle(id, stopReason) {
