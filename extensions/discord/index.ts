@@ -5,6 +5,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DiscordBridge, inboundMessageId, stripInboundMarker, type BridgeSession } from "./bridge.js";
 import { assistantText } from "./text.js";
+import { assistantImagePaths } from "./outbound-images.js";
 import {
 	DISCORD_CONFIG_FILE,
 	type DiscordBridgeConfig,
@@ -689,7 +690,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				if (!acceptingBridge || !text) return;
 				const messageId = randomUUID();
 				try {
-					await acceptingBridge.enqueueAssistantMessage(messageId, text);
+					await acceptingBridge.enqueueAssistantMessage(messageId, text, assistantImagePaths(text));
 				} catch (error) {
 					ctx.ui.notify(`Discord assistant-message mirror failed: ${errorMessage(error)}`, "error");
 				}

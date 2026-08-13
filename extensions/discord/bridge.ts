@@ -245,10 +245,10 @@ export class DiscordBridge {
 		}));
 	}
 
-	async enqueueAssistantMessage(messageId: string, text: string): Promise<void> {
+	async enqueueAssistantMessage(messageId: string, text: string, imagePaths: readonly string[] = []): Promise<void> {
 		if (!this.acceptingAssistantMessages) throw new Error("Discord bridge is not accepting assistant messages");
 		const responseTo = [...this.runInboundIds];
-		const pending = this.assistantPersistence.then(() => this.relay.sendAssistantText(messageId, text, responseTo));
+		const pending = this.assistantPersistence.then(() => this.relay.sendAssistantText(messageId, text, responseTo, imagePaths));
 		this.assistantPersistence = pending.catch((error) => {
 			this.assistantPersistenceFailure ??= error instanceof Error ? error : new Error(String(error));
 		});

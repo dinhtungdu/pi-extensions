@@ -9,6 +9,7 @@ import { interactiveUserChunks } from "./text.js";
 import type { DiscordLifecycleStatus } from "./reactions.js";
 import { restartOwnedRelay } from "./leader.js";
 import type { QueuedInboundImage } from "./inbound-images.js";
+import { appendOutboundImageWarning } from "./outbound-images.js";
 import {
 	boundedControlResult,
 	MAX_MANAGER_PROJECT_CATALOGUE_ITEMS,
@@ -50,6 +51,7 @@ export interface RelayClientStatus {
 	managerControls?: true;
 	managerPresentation?: { schemaVersion: 1; controlIds: string[] };
 	inboundImages?: true;
+	outboundImages?: true;
 }
 
 export interface RelayClientCallbacks {
@@ -209,8 +211,22 @@ export class LocalRelayClient {
 		for (const chunk of interactiveUserChunks(text)) await this.queueOutbound("user", chunk);
 	}
 
-	async sendAssistantText(messageId: string, text: string, responseTo: readonly string[] = []): Promise<void> {
-		await this.queueOutbound("assistant", text, messageId, responseTo);
+	async sendAssistantText(
+		messageId: string,
+		text: string,
+		responseTo: readonly string[] = [],
+		imagePaths: readonly string[] = [],
+	): Promise<void> {
+		const supported = this.currentStatus.outboundImages === true;
+		await this.queueOutbound(
+			"assistant",
+			imagePaths.length && !supported
+				? appendOutboundImageWarning(text, "⚠️ Discord omitted image attachments: relay upgrade required.")
+				: text,
+			messageId,
+			responseTo,
+			supported ? imagePaths : [],
+		);
 	}
 
 	async startWorking(messageId: string): Promise<void> {
@@ -419,6 +435,7 @@ export class LocalRelayClient {
 					configEpoch: this.config.epoch,
 					...this.registration,
 					inboundImages: true,
+					outboundImages: true,
 					...(modelCatalogue ? { sessionControls: { modelCatalogue } } : {}),
 					...(managerTaskCatalogue && managerProjectCatalogue ? {
 						managerControls: { taskCatalogue: managerTaskCatalogue, projectCatalogue: managerProjectCatalogue },
@@ -495,6 +512,7 @@ export class LocalRelayClient {
 					controlIds: frame.managerPresentation.controlIds.slice(),
 				} } : {}),
 				...(frame.inboundImages ? { inboundImages: true as const } : {}),
+				...(frame.outboundImages ? { outboundImages: true as const } : {}),
 			});
 			this.flushLifecycleStatuses();
 			return;
@@ -611,8 +629,9 @@ export class LocalRelayClient {
 		text: string,
 		messageId: string = randomUUID(),
 		responseTo: readonly string[] = [],
+		imagePaths: readonly string[] = [],
 	): Promise<void> {
-		if (!text.trim()) return;
+		if (!text.trim() && imagePaths.length === 0) return;
 		for (;;) {
 			if (this.stopped) throw new Error("Local Discord relay client is stopped");
 			try {
@@ -623,6 +642,7 @@ export class LocalRelayClient {
 					kind,
 					text,
 					...(kind === "assistant" && responseTo.length ? { responseTo: [...responseTo] } : {}),
+					...(kind === "assistant" && imagePaths.length ? { imagePaths: [...imagePaths] } : {}),
 				}, REQUEST_TIMEOUT_MS);
 				return;
 			} catch (error) {

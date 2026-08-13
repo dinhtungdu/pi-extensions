@@ -61,6 +61,8 @@ class FakeGateway {
 	static nonceResults = new Map();
 	static failSendAt = undefined;
 	static failOnceTexts = new Set();
+	static failImageUploads = new Set();
+	static imageUploadAttempts = new Map();
 	static sendAttempts = new Map();
 	static sendAttemptTimes = new Map();
 	static deletedThreads = new Set();
@@ -254,6 +256,15 @@ class FakeGateway {
 		FakeGateway.archivedThreads.add(channelId);
 		FakeGateway.threadEvents.push({ type: "archive", channelId });
 		FakeGateway.summaryEvents.push({ type: "archive", channelId });
+	}
+
+	async sendImages(channelId, text, files, nonce) {
+		FakeGateway.imageUploadAttempts.set(text, (FakeGateway.imageUploadAttempts.get(text) ?? 0) + 1);
+		if (FakeGateway.failImageUploads.delete(text)) throw new Error("injected Discord image upload failure");
+		const messageId = await this.sendText(channelId, text, nonce);
+		const message = (FakeGateway.channelMessages.get(channelId) ?? []).find((candidate) => candidate.id === messageId);
+		if (message) message.files = files.map((file) => ({ ...file, data: Buffer.from(file.data) }));
+		return messageId;
 	}
 
 	async sendPresentation(channelId, presentation, nonce) {
@@ -496,6 +507,13 @@ try {
 		TransientInboundImageError,
 		loadInboundImages,
 	} = await importBuilt("extensions/discord/inbound-images.js");
+	const {
+		MAX_OUTBOUND_IMAGE_BYTES,
+		appendOutboundImageWarning,
+		assistantImagePaths,
+		loadOutboundImages,
+		prepareOutboundImages,
+	} = await importBuilt("extensions/discord/outbound-images.js");
 	const { BoundedSocketWriter, MAX_QUEUED_IPC_FRAMES } = await importBuilt("extensions/discord/ipc-writer.js");
 	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
 	const { managerWakeRegistration, wakeManagerSession } = await importBuilt("extensions/discord/manager-wake.js");
@@ -4370,9 +4388,18 @@ try {
 		responseTo: ["turn-1"],
 	}), true);
 	assert.equal(isClientFrame({
+		type: "outbound", requestId: "response-image", messageId: "assistant-image", kind: "assistant", text: "![chart](chart.png)",
+		imagePaths: ["chart.png"],
+	}), true);
+	assert.equal(isClientFrame({
+		type: "outbound", requestId: "response-image-invalid", messageId: "assistant-image-invalid", kind: "user", text: "bad",
+		imagePaths: ["chart.png"],
+	}), false, "only assistant finals may request outbound images");
+	assert.equal(isClientFrame({
 		type: "outbound", requestId: "response-invalid", messageId: "assistant-2", kind: "user", text: "bad",
 		responseTo: ["turn-1"],
 	}), false, "only assistant delivery may settle exact working indicators");
+	assert.equal(isServerFrame({ type: "registered", channelId: "c", threadId: "t", leaderPid: 1, outboundImages: true }), true);
 	assert.equal(isClientFrame({
 		type: "manager_presentation_control_result", requestId: "merge-1", ok: true, message: "done",
 	}), true);
@@ -4410,6 +4437,144 @@ try {
 	}), false);
 
 	const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+	assert.deepEqual(assistantImagePaths("caption ![chart](images/chart.png) then ![space](<images/chart two.png>)"), [
+		"images/chart.png", "images/chart two.png",
+	]);
+	assert.deepEqual(assistantImagePaths("plain `images/chart.png` and [link](images/chart.png)"), [],
+		"only explicit Markdown image references may request outbound upload");
+	const outboundUnitRoot = join(dataDir, "outbound-image-unit");
+	await mkdir(join(outboundUnitRoot, "images"), { recursive: true });
+	const outboundValidPath = join(outboundUnitRoot, "images", "unsafe name.png");
+	const outboundOutsidePath = join(dataDir, "outbound-outside.png");
+	const outboundBadPath = join(outboundUnitRoot, "images", "bad.jpg");
+	const outboundOversizedPath = join(outboundUnitRoot, "images", "oversized.png");
+	await writeFile(outboundValidPath, pngBytes);
+	await writeFile(outboundOutsidePath, pngBytes);
+	await writeFile(outboundBadPath, pngBytes);
+	await writeFile(outboundOversizedPath, pngBytes);
+	const oversizedHandle = await open(outboundOversizedPath, "r+");
+	await oversizedHandle.truncate(MAX_OUTBOUND_IMAGE_BYTES + 1);
+	await oversizedHandle.close();
+	await symlink(outboundValidPath, join(outboundUnitRoot, "images", "linked.png"));
+	const preparedOutbound = await prepareOutboundImages(outboundUnitRoot, [
+		"images/unsafe name.png",
+		"images/unsafe name.png",
+		"images/missing.png",
+		"../outbound-outside.png",
+		"images/linked.png",
+		"images/bad.jpg",
+		"images/oversized.png",
+	]);
+	assert.equal(preparedOutbound.images.length, 1, "mixed image references must retain only valid unique files");
+	assert.match(preparedOutbound.images[0].filename, /^[A-Za-z0-9._-]+\.png$/);
+	assert.match(preparedOutbound.warning, /duplicate 1/);
+	assert.match(preparedOutbound.warning, /missing 1/);
+	assert.match(preparedOutbound.warning, /unsafe path 2/);
+	assert.match(preparedOutbound.warning, /unsupported type 1/);
+	assert.match(preparedOutbound.warning, /oversized 1/);
+	assert.doesNotMatch(preparedOutbound.warning, /outbound|unsafe name|\.\.\//,
+		"visible rejection warnings must not leak local paths");
+	const countPaths = [];
+	for (let index = 0; index < 5; index++) {
+		const relativePath = `images/count-${index}.png`;
+		await writeFile(join(outboundUnitRoot, relativePath), pngBytes);
+		countPaths.push(relativePath);
+	}
+	const countLimited = await prepareOutboundImages(outboundUnitRoot, countPaths);
+	assert.equal(countLimited.images.length, 4);
+	assert.match(countLimited.warning, /count limit 1/, "outbound image count rejection must be visible and bounded");
+	assert.deepEqual((await loadOutboundImages(outboundUnitRoot, preparedOutbound.images))[0].data, pngBytes);
+	await writeFile(outboundValidPath, Buffer.from("mutated!"));
+	await assert.rejects(() => loadOutboundImages(outboundUnitRoot, preparedOutbound.images), /no longer matches/,
+		"upload-time validation must reject files changed after queue validation");
+	assert.equal(appendOutboundImageWarning("caption", "warning"), "caption\n\nwarning");
+
+	const outboundIntegrationRoot = join(dataDir, "outbound-image-integration");
+	await mkdir(outboundIntegrationRoot, { recursive: true });
+	const outboundIntegrationPath = join(outboundIntegrationRoot, "result.png");
+	await writeFile(outboundIntegrationPath, pngBytes);
+	const outboundImageState = new DiscordStateStore(join(dataDir, "outbound-image-state.json"));
+	const outboundImageGateway = new FakeGateway();
+	const outboundImageCore = new DiscordRelayCore(
+		{ token: "token", guildId: "12345", epoch: 1 },
+		outboundImageState,
+		outboundImageGateway,
+	);
+	await outboundImageCore.start();
+	const outboundImageRegistration = { cwd: outboundIntegrationRoot, sessionId: "outbound-image-session" };
+	const outboundImagePrepared = await outboundImageCore.prepareRegistration(
+		"outbound-image-client", "outbound-image-generation", outboundImageRegistration,
+	);
+	await outboundImageCore.activateRegistration(
+		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId, () => true,
+		undefined, false, undefined, false, undefined, undefined, false, outboundImagePrepared.outputRoot,
+	);
+	const partialImageText = "Caption stays intact. ![result](result.png)";
+	await outboundImageCore.queueOutbound(
+		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-image-partial", "assistant", partialImageText, undefined,
+		["result.png", "missing.png"],
+	);
+	await waitFor(() => FakeGateway.imageUploadAttempts.get(`${partialImageText}\n\n⚠️ Images omitted: missing 1.`) === 1,
+		"partial outbound image delivery");
+	const partialImageMessage = outboundImageGateway.sent.find((message) => message.text.startsWith(partialImageText));
+	assert.equal(partialImageMessage.channelId, outboundImagePrepared.threadId, "outbound images must use exact mapped session thread");
+	assert.equal(partialImageMessage.text.startsWith(partialImageText), true, "validation warning must preserve final response text");
+	assert.deepEqual((FakeGateway.channelMessages.get(outboundImagePrepared.threadId) ?? [])
+		.find((message) => message.id === partialImageMessage.id).files[0].data, pngBytes);
+
+	const imageOnlyText = "![result](result.png)";
+	await outboundImageCore.queueOutbound(
+		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-image-only", "assistant", imageOnlyText, undefined, ["result.png"],
+	);
+	await waitFor(() => FakeGateway.imageUploadAttempts.get(imageOnlyText) === 1, "image-only final delivery");
+	assert.equal(outboundImageGateway.sent.filter((message) => message.text === imageOnlyText).length, 1,
+		"image-only final must deliver once");
+
+	let releaseDedupedImage;
+	let dedupedImageStarted;
+	const dedupedImageStart = new Promise((resolveStart) => { dedupedImageStarted = resolveStart; });
+	const originalSendImages = outboundImageGateway.sendImages.bind(outboundImageGateway);
+	outboundImageGateway.sendImages = async (...args) => {
+		if (args[1] === "dedupe image") {
+			dedupedImageStarted();
+			await new Promise((resolveUpload) => { releaseDedupedImage = resolveUpload; });
+		}
+		return originalSendImages(...args);
+	};
+	await outboundImageCore.queueOutbound(
+		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-image-dedupe", "assistant", "dedupe image", undefined, ["result.png"],
+	);
+	await dedupedImageStart;
+	await outboundImageCore.queueOutbound(
+		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-image-dedupe", "assistant", "dedupe image", undefined, ["result.png"],
+	);
+	releaseDedupedImage();
+	await waitFor(() => FakeGateway.imageUploadAttempts.get("dedupe image") === 1, "deduplicated image upload");
+	assert.equal(outboundImageGateway.sent.filter((message) => message.text === "dedupe image").length, 1);
+	outboundImageGateway.sendImages = originalSendImages;
+
+	const failedImageText = "upload failure caption";
+	FakeGateway.failImageUploads.add(failedImageText);
+	await outboundImageCore.queueOutbound(
+		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-image-failure", "assistant", failedImageText, undefined, ["result.png"],
+	);
+	await waitFor(() => outboundImageGateway.sent.some((message) => message.text.startsWith(failedImageText) &&
+		message.text.includes("upload failed")), "outbound upload failure fallback");
+	assert.equal(FakeGateway.imageUploadAttempts.get(failedImageText), 1, "failed image upload must not retry");
+	await outboundImageCore.queueOutbound(
+		"outbound-image-client", "outbound-image-generation", outboundImageRegistration.sessionId,
+		"outbound-after-image-failure", "assistant", "later reply progresses",
+	);
+	await waitFor(() => outboundImageGateway.sent.some((message) => message.text === "later reply progresses"),
+		"later reply after image upload failure");
+	assert.equal((await outboundImageState.getSession(outboundImageRegistration.sessionId)).outboundMessages.length, 0);
+	await outboundImageCore.stop();
+
 	const validAttachmentUrl = "https://cdn.discordapp.com/attachments/12345/67890/image.png?ex=signed";
 	const imageUnitDirectory = join(dataDir, "image-unit");
 	const imageFetchCalls = [];
@@ -4884,7 +5049,7 @@ try {
 		async prepareRegistration() {
 			return { channelId: "old-client-channel", threadId: "old-client-thread", cwd: "/workspace/the-manager" };
 		},
-		async activateRegistration(...args) { oldClientActivatedAsProducer = args.at(-4); },
+		async activateRegistration(...args) { oldClientActivatedAsProducer = args.at(-5); },
 		unregisterClient() {},
 		async resumeDelivery() {},
 		updateManagerCatalogues() {},
@@ -5017,12 +5182,14 @@ try {
 		{ provider: "compat", id: "model", name: "Compatibility Model" },
 	], "new clients may advertise controls to older relays because registration fields are additive");
 	assert.equal(previousHostRegistrations[0].inboundImages, true, "new clients may advertise additive image support to older relays");
+	assert.equal(previousHostRegistrations[0].outboundImages, true, "new clients may advertise additive outbound image support to older relays");
 	assert.equal(previousHostRegistrations[0].managerTaskSummaryProducer, true,
 		"new eligible manager clients may advertise summary ownership to an older relay without breaking registration");
 	assert.equal(previousRegisterValidator(previousHostRegistrations[0]), true,
 		"the previous relay registration validator must accept the additive producer capability");
 	assert.equal(compatibilityClient.status().sessionControls, undefined, "an older relay must not advertise unsupported controls");
 	assert.equal(compatibilityClient.status().inboundImages, undefined, "an older relay must preserve text-only rolling compatibility");
+	assert.equal(compatibilityClient.status().outboundImages, undefined, "an older relay must not receive outbound image paths");
 	let workingRetryAttempts = 0;
 	handleWorking = (_frame, socket) => {
 		if (++workingRetryAttempts !== 1) return false;
@@ -5050,6 +5217,10 @@ try {
 	assert.equal(previousValidator(previousHostFrames[0]), true);
 	assert.equal(isClientFrame(previousHostFrames[0]), true);
 	assert.equal(isClientFrame({ ...previousHostFrames[0], kind: "interactive" }), false, "unknown outbound kinds must remain invalid");
+	await compatibilityClient.sendAssistantText("compat-image", "![image](secret.png)", [], ["secret.png"]);
+	const compatibilityImageFrame = previousHostFrames.find((frame) => frame.messageId === "compat-image");
+	assert.equal(compatibilityImageFrame.imagePaths, undefined, "old relays must never receive local image paths");
+	assert.match(compatibilityImageFrame.text, /^!\[image\]\(secret\.png\)\n\n⚠️ Discord omitted image attachments: relay upgrade required\.$/);
 	assert.equal(compatibilityErrors.length, 0);
 	rejectOutbound = true;
 	const rejectionStarted = Date.now();
@@ -6274,6 +6445,32 @@ try {
 	await first.emit("agent_settled", {});
 	assert.equal(gateway.sent.filter((message) => message.text === "final only").length, 1,
 		"agent settlement must not own or duplicate assistant persistence");
+
+	const outboundFinalRoot = join(dataDir, "outbound-final-session");
+	await mkdir(outboundFinalRoot, { recursive: true });
+	await writeFile(join(outboundFinalRoot, "final.png"), pngBytes);
+	const outboundFinal = createExtensionHarness(extension, {
+		cwd: outboundFinalRoot,
+		sessionId: "session-outbound-final",
+		sessionName: "Outbound final",
+	});
+	await outboundFinal.emit("session_start", { reason: "startup" });
+	const outboundFinalThread = (await new DiscordStateStore(stateFile).getSession("session-outbound-final")).threadId;
+	const outboundFinalText = "Rendered result. ![final](final.png)";
+	await outboundFinal.emit("message_end", {
+		message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: outboundFinalText }] },
+	});
+	await waitFor(() => gateway.sent.some((message) => message.text === outboundFinalText && message.channelId === outboundFinalThread),
+		"final-response outbound image routing");
+	assert.equal(FakeGateway.imageUploadAttempts.get(outboundFinalText), 1);
+	const imageAttemptsBeforePartial = FakeGateway.imageUploadAttempts.size;
+	await outboundFinal.emit("message_end", {
+		message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "![partial](final.png)" }] },
+	});
+	await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+	assert.equal(FakeGateway.imageUploadAttempts.size, imageAttemptsBeforePartial,
+		"intermediate assistant output must never request image delivery");
+	await outboundFinal.emit("session_shutdown", { reason: "quit" });
 
 	async function runTerminalLifecycle(id, stopReason) {
 		const delivery = second.nextUserMessage();

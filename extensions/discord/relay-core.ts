@@ -54,6 +54,11 @@ import {
 	type ManagerPresentationActionControl,
 } from "./manager-presentation.js";
 import { paginateManagerPresentation } from "./manager-summary-pages.js";
+import {
+	appendOutboundImageWarning,
+	loadOutboundImages,
+	prepareOutboundImages,
+} from "./outbound-images.js";
 
 export interface RelaySessionRegistration {
 	cwd: string;
@@ -70,6 +75,7 @@ export interface PreparedRegistration {
 	channelId: string;
 	threadId: string;
 	cwd: string;
+	outputRoot: string;
 }
 
 interface ActiveSession {
@@ -96,6 +102,7 @@ interface ActiveSession {
 	executePresentationControl?: (request: { requestId: string; revision: string; controlId: string; command: string;
 		actionControl?: ManagerPresentationActionControl }) => Promise<PiSessionControlResult>;
 	inboundImages: boolean;
+	outputRoot: string;
 }
 
 interface SummaryAuthorization {
@@ -406,7 +413,7 @@ export class DiscordRelayCore {
 			this.inboundQueue = catchUp.catch(() => {});
 			await catchUp;
 			this.catchingUpSessions.delete(registration.sessionId);
-			return { channelId, threadId: mapping.threadId, cwd: mapping.cwd };
+			return { channelId, threadId: mapping.threadId, cwd: mapping.cwd, outputRoot: normalizeCwd(registration.cwd) };
 		} catch (error) {
 			this.catchingUpSessions.delete(registration.sessionId);
 			const reserved = this.reservedSessions.get(registration.sessionId);
@@ -438,6 +445,7 @@ export class DiscordRelayCore {
 		},
 		managerTaskSnapshotTaskId?: string,
 		managerTaskTerminalProducer = false,
+		outputRoot?: string,
 	): Promise<void> {
 		const reserved = this.reservedSessions.get(sessionId);
 		if (reserved?.clientId !== clientId || reserved.generation !== generation) {
@@ -471,6 +479,7 @@ export class DiscordRelayCore {
 			...(managerControls ? { executeManagerControl: managerControls.execute } : {}),
 			...(managerPresentation ? { executePresentationControl: managerPresentation.execute } : {}),
 			inboundImages,
+			outputRoot: outputRoot ?? mapping!.cwd,
 		};
 		const replaced = this.activeSessions.get(sessionId);
 		if (replaced && this.activeThreadSessions.get(replaced.threadId) === sessionId) this.activeThreadSessions.delete(replaced.threadId);
@@ -949,17 +958,26 @@ export class DiscordRelayCore {
 		kind: "user" | "assistant",
 		text: string,
 		responseTo?: readonly string[],
+		imagePaths: readonly string[] = [],
 	): Promise<void> {
 		this.assertClientSession(clientId, generation, sessionId);
-		if (!text.trim()) return;
+		if (!text.trim() && imagePaths.length === 0) return;
+		const active = this.activeSessions.get(sessionId)!;
+		const preparedImages = imagePaths.length ? await prepareOutboundImages(active.outputRoot, imagePaths) : { images: [] };
 		const mapping = await this.state.getSession(sessionId);
 		if (!mapping) throw new Error(`Pi session ${sessionId} has no Discord mapping`);
+		const chunks = splitDiscordText(text);
 		const message: OutboundMessage = {
 			id: messageId,
 			kind,
 			threadId: mapping.threadId,
 			...(kind === "assistant" && responseTo?.length ? { responseTo: [...responseTo] } : {}),
-			chunks: splitDiscordText(text).map((content, index) => ({
+			...(preparedImages.images.length ? {
+				images: preparedImages.images,
+				imageRoot: active.outputRoot,
+			} : {}),
+			...(preparedImages.warning ? { imageWarning: preparedImages.warning } : {}),
+			chunks: (chunks.length ? chunks : [""]).map((content, index) => ({
 				index,
 				content,
 				nonce: createHash("sha256").update(`${messageId}:${index}`).digest("hex").slice(0, 25),
@@ -1414,9 +1432,33 @@ export class DiscordRelayCore {
 				let deliveryFailed = false;
 				for (const chunk of next.message.chunks) {
 					if (chunk.discordMessageId) continue;
+					const firstChunk = chunk.index === 0;
 					let discordMessageId: string;
 					try {
-						discordMessageId = await this.transport.sendText(next.message.threadId, chunk.content, chunk.nonce);
+						if (firstChunk && next.message.images?.length && !next.message.imageDeliveryFailed) {
+							try {
+								const files = await loadOutboundImages(next.message.imageRoot!, next.message.images);
+								discordMessageId = await this.transport.sendImages(
+									next.message.threadId,
+									appendOutboundImageWarning(chunk.content, next.message.imageWarning),
+									files,
+									chunk.nonce,
+								);
+							} catch {
+								await this.state.markOutboundImagesFailed(next.sessionId, next.message.id);
+								next.message.imageDeliveryFailed = true;
+								discordMessageId = await this.transport.sendText(
+									next.message.threadId,
+									appendOutboundImageWarning(chunk.content, next.message.imageWarning, true),
+									chunk.nonce,
+								);
+							}
+						} else {
+							const content = firstChunk
+								? appendOutboundImageWarning(chunk.content, next.message.imageWarning, next.message.imageDeliveryFailed)
+								: chunk.content;
+							discordMessageId = await this.transport.sendText(next.message.threadId, content, chunk.nonce);
+						}
 					} catch {
 						blockedSessions.add(next.sessionId);
 						this.scheduleOutboundRetry(next.sessionId);

@@ -18,6 +18,7 @@ import {
 } from "discord.js";
 import type { DiscordBridgeConfig } from "./config.js";
 import type { DiscordInboundAttachment } from "./inbound-images.js";
+import type { DiscordOutboundAttachment } from "./outbound-images.js";
 import { DISCORD_LIFECYCLE_REACTIONS, type DiscordLifecycleReaction } from "./reactions.js";
 import {
 	boundedControlResult,
@@ -103,6 +104,7 @@ export interface DiscordTransport {
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
 	sendText(channelId: string, text: string, nonce: string): Promise<string>;
+	sendImages(channelId: string, text: string, files: readonly DiscordOutboundAttachment[], nonce: string): Promise<string>;
 	sendPresentation(channelId: string, presentation: ManagerPresentation, nonce: string): Promise<string>;
 	lockThread(channelId: string): Promise<void>;
 	archiveThread(channelId: string): Promise<void>;
@@ -556,6 +558,24 @@ export class DiscordJsTransport implements DiscordTransport {
 		}
 		const message = await channel.send({
 			content: text,
+			nonce,
+			enforceNonce: true,
+			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
+		});
+		return message.id;
+	}
+
+	async sendImages(
+		channelId: string,
+		text: string,
+		files: readonly DiscordOutboundAttachment[],
+		nonce: string,
+	): Promise<string> {
+		const channel = await this.textChannel(channelId, "receive images");
+		const message = await channel.send({
+			...(text ? { content: text } : {}),
+			files: files.map((file) => ({ attachment: file.data, name: file.filename })),
 			nonce,
 			enforceNonce: true,
 			allowedMentions: { parse: [] },
