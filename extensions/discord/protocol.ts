@@ -5,14 +5,8 @@ import type { DiscordLifecycleStatus } from "./reactions.js";
 import { isQueuedInboundImageList, type QueuedInboundImage } from "./inbound-images.js";
 import { isNativeOutboundImageList, type NativeOutboundImage } from "./outbound-images.js";
 import {
-	isManagerProjectCatalogue,
-	isManagerTaskCatalogue,
-	isPiManagerControlRequest,
 	isPiModelCatalogue,
 	isPiSessionControlAction,
-	type ManagerProjectCatalogueEntry,
-	type ManagerTaskCatalogueEntry,
-	type PiManagerControlRequest,
 	type PiModelCatalogueEntry,
 	type PiSessionControlAction,
 } from "./controls.js";
@@ -39,7 +33,6 @@ export type ClientFrame =
 		configFingerprint: string;
 		configEpoch: number;
 		sessionControls?: { modelCatalogue: PiModelCatalogueEntry[] };
-		managerControls?: { taskCatalogue: ManagerTaskCatalogueEntry[]; projectCatalogue?: ManagerProjectCatalogueEntry[] };
 		managerTaskSummaryProducer?: true;
 		managerPresentation?: { schemaVersion: 1; controlIds: string[] };
 		managerTaskSnapshotTaskId?: string;
@@ -49,7 +42,6 @@ export type ClientFrame =
 	| { type: "outbound"; requestId: string; messageId: string; kind: "user" | "assistant"; text: string; responseTo?: string[];
 		nativeImages?: NativeOutboundImage[] }
 	| { type: "working"; requestId: string; messageId: string }
-	| { type: "project_summary"; requestId: string; text: string }
 	| { type: "manager_presentation"; requestId: string; presentation: ManagerPresentation }
 	| { type: "manager_task_snapshot"; requestId: string; snapshot: ManagerTaskSnapshot }
 	| { type: "manager_task_terminal"; requestId: string; terminal: ManagerTaskTerminal }
@@ -57,8 +49,6 @@ export type ClientFrame =
 	| { type: "release_inbound_images"; requestId: string; messageId: string }
 	| { type: "lifecycle"; messageId: string; status: DiscordLifecycleStatus }
 	| { type: "control_result"; requestId: string; ok: boolean; message: string }
-	| { type: "manager_catalogue"; requestId: string; taskCatalogue: ManagerTaskCatalogueEntry[]; projectCatalogue?: ManagerProjectCatalogueEntry[] }
-	| { type: "manager_control_result"; requestId: string; ok: boolean; message: string }
 	| { type: "manager_presentation_control_result"; requestId: string; ok: boolean; message: string }
 	| { type: "unregister" }
 	| { type: "ping" };
@@ -71,27 +61,22 @@ export type ServerFrame =
 		leaderPid: number;
 		leaderNonce?: string;
 		lifecycleReactions?: true;
-		projectSummaries?: true;
 		sessionControls?: true;
-		managerControls?: true;
 		managerPresentation?: { schemaVersion: 1; controlIds: string[] };
 		inboundImages?: true;
 		nativeOutboundImages?: true;
 	}
 	| { type: "inbound"; messageId: string; text: string; images?: QueuedInboundImage[] }
 	| { type: "control"; requestId: string; action: PiSessionControlAction }
-	| ({ type: "manager_control" } & PiManagerControlRequest)
 	| { type: "manager_presentation_control"; requestId: string; revision: string; controlId: string; command: string;
 		actionControl?: ManagerPresentationActionControl }
 	| { type: "inbound_acked"; requestId: string; messageId: string }
 	| { type: "inbound_images_released"; requestId: string; messageId: string }
 	| { type: "outbound_queued"; requestId: string; messageId: string }
 	| { type: "working_queued"; requestId: string; messageId: string }
-	| { type: "project_summary_queued"; requestId: string }
 	| { type: "manager_presentation_queued"; requestId: string }
 	| { type: "manager_task_snapshot_queued"; requestId: string }
 	| { type: "manager_task_terminal_queued"; requestId: string }
-	| { type: "manager_catalogue_updated"; requestId: string }
 	| { type: "pong" }
 	| { type: "replacing"; configEpoch: number }
 	| { type: "error"; message: string; fatal?: boolean; requestId?: string };
@@ -140,12 +125,6 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(frame.sessionControls === undefined || (
 				Boolean(frame.sessionControls) && typeof frame.sessionControls === "object" && !Array.isArray(frame.sessionControls) &&
 				isPiModelCatalogue((frame.sessionControls as Record<string, unknown>).modelCatalogue)
-			)) &&
-			(frame.managerControls === undefined || (
-				Boolean(frame.managerControls) && typeof frame.managerControls === "object" && !Array.isArray(frame.managerControls) &&
-				isManagerTaskCatalogue((frame.managerControls as Record<string, unknown>).taskCatalogue) &&
-				((frame.managerControls as Record<string, unknown>).projectCatalogue === undefined ||
-					isManagerProjectCatalogue((frame.managerControls as Record<string, unknown>).projectCatalogue))
 			));
 	}
 	if (frame.type === "outbound") {
@@ -162,9 +141,6 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 	if (frame.type === "ack_inbound" || frame.type === "release_inbound_images") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	}
-	if (frame.type === "project_summary") {
-		return typeof frame.requestId === "string" && typeof frame.text === "string" && frame.text.length <= 2_000;
-	}
 	if (frame.type === "manager_presentation") {
 		return typeof frame.requestId === "string" && isManagerPresentation(frame.presentation);
 	}
@@ -179,14 +155,10 @@ export function isClientFrame(value: unknown): value is ClientFrame {
 			(frame.status === "accepted" || frame.status === "thinking" || frame.status === "tool" ||
 				frame.status === "succeeded" || frame.status === "failed");
 	}
-	if (frame.type === "control_result" || frame.type === "manager_control_result" || frame.type === "manager_presentation_control_result") {
+	if (frame.type === "control_result" || frame.type === "manager_presentation_control_result") {
 		return typeof frame.requestId === "string" && typeof frame.ok === "boolean" &&
 			typeof frame.message === "string" && frame.message.length <= 2_000 &&
 			(frame.type !== "manager_presentation_control_result" || frame.terminal === undefined);
-	}
-	if (frame.type === "manager_catalogue") {
-		return typeof frame.requestId === "string" && isManagerTaskCatalogue(frame.taskCatalogue) &&
-			(frame.projectCatalogue === undefined || isManagerProjectCatalogue(frame.projectCatalogue));
 	}
 	return frame.type === "unregister" || frame.type === "ping";
 }
@@ -198,9 +170,7 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 		return typeof frame.channelId === "string" && typeof frame.threadId === "string" && typeof frame.leaderPid === "number" &&
 			(frame.leaderNonce === undefined || (typeof frame.leaderNonce === "string" && frame.leaderNonce.length > 0)) &&
 			(frame.lifecycleReactions === undefined || frame.lifecycleReactions === true) &&
-			(frame.projectSummaries === undefined || frame.projectSummaries === true) &&
 			(frame.sessionControls === undefined || frame.sessionControls === true) &&
-			(frame.managerControls === undefined || frame.managerControls === true) &&
 			(frame.managerPresentation === undefined || isManagerPresentationCapability(frame.managerPresentation)) &&
 			(frame.inboundImages === undefined || frame.inboundImages === true) &&
 			(frame.nativeOutboundImages === undefined || frame.nativeOutboundImages === true);
@@ -210,7 +180,6 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 			(frame.images === undefined || isQueuedInboundImageList(frame.images));
 	}
 	if (frame.type === "control") return typeof frame.requestId === "string" && isPiSessionControlAction(frame.action);
-	if (frame.type === "manager_control") return isPiManagerControlRequest(frame);
 	if (frame.type === "manager_presentation_control") {
 		if (typeof frame.requestId !== "string" || typeof frame.revision !== "string" || !/^[a-f0-9]{64}$/.test(frame.revision) ||
 			typeof frame.controlId !== "string") return false;
@@ -224,9 +193,8 @@ export function isServerFrame(value: unknown): value is ServerFrame {
 	if (frame.type === "outbound_queued" || frame.type === "working_queued") {
 		return typeof frame.requestId === "string" && typeof frame.messageId === "string";
 	}
-	if (frame.type === "project_summary_queued" || frame.type === "manager_presentation_queued" ||
-		frame.type === "manager_task_snapshot_queued" || frame.type === "manager_task_terminal_queued" ||
-		frame.type === "manager_catalogue_updated") {
+	if (frame.type === "manager_presentation_queued" || frame.type === "manager_task_snapshot_queued" ||
+		frame.type === "manager_task_terminal_queued") {
 		return typeof frame.requestId === "string";
 	}
 	if (frame.type === "error") {

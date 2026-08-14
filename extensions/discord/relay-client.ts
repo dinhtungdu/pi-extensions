@@ -12,12 +12,7 @@ import type { QueuedInboundImage } from "./inbound-images.js";
 import type { NativeOutboundImage } from "./outbound-images.js";
 import {
 	boundedControlResult,
-	MAX_MANAGER_PROJECT_CATALOGUE_ITEMS,
-	MAX_MANAGER_TASK_CATALOGUE_ITEMS,
 	MAX_MODEL_CATALOGUE_ITEMS,
-	type ManagerProjectCatalogueEntry,
-	type ManagerTaskCatalogueEntry,
-	type PiManagerControlRequest,
 	type PiModelCatalogueEntry,
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
@@ -46,9 +41,7 @@ export interface RelayClientStatus {
 	leaderNonce?: string;
 	channelId?: string;
 	threadId?: string;
-	projectSummaries?: true;
 	sessionControls?: true;
-	managerControls?: true;
 	managerPresentation?: { schemaVersion: 1; controlIds: string[] };
 	inboundImages?: true;
 	nativeOutboundImages?: true;
@@ -60,9 +53,6 @@ export interface RelayClientCallbacks {
 	onStatus(status: RelayClientStatus): void;
 	modelCatalogue?(): PiModelCatalogueEntry[];
 	onControl?(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
-	managerTaskCatalogue?(): ManagerTaskCatalogueEntry[];
-	managerProjectCatalogue?(): ManagerProjectCatalogueEntry[];
-	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 	onManagerPresentationControl?(
 		request: { requestId: string; revision: string; controlId: string; command: string; actionControl?: ManagerPresentationActionControl },
 		signal: AbortSignal,
@@ -235,12 +225,6 @@ export class LocalRelayClient {
 		}
 	}
 
-	async sendProjectSummary(text: string): Promise<boolean> {
-		if (!text || !this.currentStatus.projectSummaries) return false;
-		await this.sendRequest({ type: "project_summary", requestId: randomUUID(), text }, REQUEST_TIMEOUT_MS);
-		return true;
-	}
-
 	async publishManagerTaskSnapshot(snapshot: ManagerTaskSnapshot): Promise<void> {
 		for (;;) {
 			if (this.stopped) throw new Error("Local Discord relay client is stopped");
@@ -286,20 +270,6 @@ export class LocalRelayClient {
 			type: "manager_presentation",
 			requestId: randomUUID(),
 			presentation: structuredClone(presentation),
-		}, REQUEST_TIMEOUT_MS);
-		return true;
-	}
-
-	async updateManagerCatalogues(
-		tasks: readonly ManagerTaskCatalogueEntry[],
-		projects: readonly ManagerProjectCatalogueEntry[],
-	): Promise<boolean> {
-		if (!this.callbacks.onManagerControl || !this.currentStatus.managerControls) return false;
-		await this.sendRequest({
-			type: "manager_catalogue",
-			requestId: randomUUID(),
-			taskCatalogue: tasks.slice(0, MAX_MANAGER_TASK_CATALOGUE_ITEMS).map((task) => ({ ...task })),
-			projectCatalogue: projects.slice(0, MAX_MANAGER_PROJECT_CATALOGUE_ITEMS).map((project) => ({ ...project })),
 		}, REQUEST_TIMEOUT_MS);
 		return true;
 	}
@@ -412,12 +382,6 @@ export class LocalRelayClient {
 				const modelCatalogue = this.callbacks.onControl
 					? (this.callbacks.modelCatalogue?.() ?? []).slice(0, MAX_MODEL_CATALOGUE_ITEMS)
 					: undefined;
-				const managerTaskCatalogue = this.callbacks.onManagerControl
-					? (this.callbacks.managerTaskCatalogue?.() ?? []).slice(0, MAX_MANAGER_TASK_CATALOGUE_ITEMS)
-					: undefined;
-				const managerProjectCatalogue = this.callbacks.onManagerControl
-					? (this.callbacks.managerProjectCatalogue?.() ?? []).slice(0, MAX_MANAGER_PROJECT_CATALOGUE_ITEMS)
-					: undefined;
 				const frame: ClientFrame = {
 					type: "register",
 					token: this.token!,
@@ -429,9 +393,6 @@ export class LocalRelayClient {
 					inboundImages: true,
 					nativeOutboundImages: true,
 					...(modelCatalogue ? { sessionControls: { modelCatalogue } } : {}),
-					...(managerTaskCatalogue && managerProjectCatalogue ? {
-						managerControls: { taskCatalogue: managerTaskCatalogue, projectCatalogue: managerProjectCatalogue },
-					} : {}),
 					...(this.callbacks.onManagerPresentationControl ? {
 						managerPresentation: {
 							schemaVersion: MANAGER_PRESENTATION_SCHEMA_VERSION,
@@ -496,9 +457,7 @@ export class LocalRelayClient {
 				...(frame.leaderNonce ? { leaderNonce: frame.leaderNonce } : {}),
 				channelId: frame.channelId,
 				threadId: frame.threadId,
-				...(frame.projectSummaries ? { projectSummaries: true as const } : {}),
 				...(frame.sessionControls ? { sessionControls: true as const } : {}),
-				...(frame.managerControls ? { managerControls: true as const } : {}),
 				...(frame.managerPresentation ? { managerPresentation: {
 					schemaVersion: 1 as const,
 					controlIds: frame.managerPresentation.controlIds.slice(),
@@ -577,36 +536,14 @@ export class LocalRelayClient {
 			}
 			return;
 		}
-		if (frame.type === "manager_control") {
-			let result: PiSessionControlResult;
-			try {
-				const request: PiManagerControlRequest = frame.action === "ask"
-					? { requestId: frame.requestId, action: "ask", target: frame.target, request: frame.request }
-					: frame.action === "reconcile-pr"
-						? { requestId: frame.requestId, action: "reconcile-pr", ...(frame.taskId ? { taskId: frame.taskId } : {}) }
-						: { requestId: frame.requestId, action: frame.action, taskId: frame.taskId };
-				result = this.callbacks.onManagerControl
-					? boundedControlResult(await this.callbacks.onManagerControl(request))
-					: { ok: false, message: "This Pi client does not support Discord manager controls." };
-			} catch (error) {
-				result = boundedControlResult({ ok: false, message: asError(error).message });
-			}
-			if (this.socket === socket && this.writer) {
-				if (!this.writer.write(encodeFrame({ type: "manager_control_result", requestId: frame.requestId, ...result }))) {
-					this.callbacks.onError(new Error("Local Discord relay request queue is full while returning a manager control result"));
-				}
-			}
-			return;
-		}
 		if (frame.type === "replacing") {
 			socket.destroy();
 			waiter.reject(new Error(`Local Discord relay is replacing configuration with epoch ${frame.configEpoch}`));
 			return;
 		}
 		if (frame.type === "inbound_acked" || frame.type === "inbound_images_released" ||
-			frame.type === "outbound_queued" || frame.type === "working_queued" || frame.type === "project_summary_queued" ||
-			frame.type === "manager_presentation_queued" || frame.type === "manager_task_snapshot_queued" ||
-			frame.type === "manager_task_terminal_queued" || frame.type === "manager_catalogue_updated") {
+			frame.type === "outbound_queued" || frame.type === "working_queued" || frame.type === "manager_presentation_queued" ||
+			frame.type === "manager_task_snapshot_queued" || frame.type === "manager_task_terminal_queued") {
 			const pending = this.pendingRequests.get(frame.requestId);
 			if (pending) {
 				clearTimeout(pending.timer);

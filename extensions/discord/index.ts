@@ -1,7 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DiscordBridge, inboundMessageId, stripInboundMarker, type BridgeSession } from "./bridge.js";
 import { SettledReplyCollector, type SettledReply } from "./outbound-images.js";
 import {
@@ -19,21 +18,15 @@ import { launchRelayChild } from "./relay-launcher.js";
 import { resolveProjectContext } from "./project-identity.js";
 import { discoverTaskTitle } from "./task-title.js";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
-import { ManagerTaskSummaryProducer } from "./manager-task-summary.js";
 import { ManagerPresentationProducer, type ManagerPresentation } from "./manager-presentation.js";
-import { ManagerControlExecutor } from "./manager-controls.js";
+import { ManagerPresentationControlExecutor } from "./manager-presentation-controls.js";
 import { managerWakeRegistration } from "./manager-wake.js";
 import { acceptedManagerTaskSnapshot, type ManagerTaskSnapshot } from "./manager-task-snapshot.js";
 import { isManagerTaskTerminal, type ManagerTaskTerminal } from "./manager-task-terminal.js";
 import {
 	MAX_MODEL_CATALOGUE_ITEMS,
-	MAX_SESSION_CONTROL_TEXT_LENGTH,
 	boundedControlResult,
-	isManagerTaskAction,
 	modelChoiceValue,
-	type ManagerProjectCatalogueEntry,
-	type ManagerTaskCatalogueEntry,
-	type PiManagerControlRequest,
 	type PiModelCatalogueEntry,
 	type PiSessionControlRequest,
 	type PiSessionControlResult,
@@ -45,7 +38,6 @@ const STATUS_RECONNECTING = "🔄";
 const STATUS_ERROR = "⚠️";
 const ACCEPTED_INBOUND_ENTRY = "discord-bridge-inbound-accepted";
 const MANAGER_SUMMARY_COMMAND = "/github-refresh-reconcile";
-export const MANAGER_CONTROL_RESULT_ENTRY = "discord-manager-control-result";
 
 interface ManagerSummaryTurn {
 	origin: "tui" | "discord";
@@ -53,20 +45,6 @@ interface ManagerSummaryTurn {
 	started: boolean;
 	ended: boolean;
 	failed: boolean;
-}
-
-interface ManagerControlResultEntryData {
-	action: Exclude<PiManagerControlRequest["action"], "ask">;
-	taskId?: string;
-	ok: boolean;
-	message: string;
-}
-
-function compactEntry(text: string) {
-	return {
-		render: (width: number) => [truncateToWidth(text, width)],
-		invalidate() {},
-	};
 }
 
 type ConfigLoader = () => Promise<DiscordBridgeConfig | null>;
@@ -124,36 +102,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 		: () => launchRelayChild(paths));
 
 	return function discordExtension(pi: ExtensionAPI): void {
-		try {
-			pi.registerEntryRenderer<ManagerControlResultEntryData>(MANAGER_CONTROL_RESULT_ENTRY, (entry, _options, theme) => {
-				try {
-					const data: unknown = entry.data;
-					if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid manager control result");
-					const result = data as Partial<ManagerControlResultEntryData>;
-					if (!isManagerTaskAction(result.action) || typeof result.ok !== "boolean" ||
-						typeof result.message !== "string" || !result.message ||
-						result.message.length > MAX_SESSION_CONTROL_TEXT_LENGTH ||
-						(result.taskId !== undefined && (typeof result.taskId !== "string" || result.taskId.length > 100 ||
-							!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(result.taskId)))) {
-						throw new Error("invalid manager control result");
-					}
-					const status = result.ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
-					const task = result.taskId ? ` @${result.taskId}` : "";
-					const message = result.message.replace(/\s+/g, " ");
-					return compactEntry(`${status} ${theme.fg("accent", `/m ${result.action}${task}`)} — ${message}`);
-				} catch {
-					return compactEntry("⚠ /m result unavailable");
-				}
-			});
-		} catch {
-			// History rendering is optional; manager controls must remain available without it.
-		}
-
 		let bridge: DiscordBridge | undefined;
-		let taskSummaryProducer: ManagerTaskSummaryProducer | undefined;
 		let presentationProducer: ManagerPresentationProducer | undefined;
-		let managerTaskCatalogue: ManagerTaskCatalogueEntry[] = [];
-		let managerProjectCatalogue: ManagerProjectCatalogueEntry[] = [];
 		let managerSummaryTurn: ManagerSummaryTurn | undefined;
 		let desiredPresentation: ManagerPresentation | undefined;
 		let publishingPresentation: Promise<void> | undefined;
@@ -349,12 +299,8 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 
 		async function stopBridge(ctx: ExtensionContext): Promise<void> {
 			managerSummaryTurn = undefined;
-			taskSummaryProducer?.stop();
-			taskSummaryProducer = undefined;
 			presentationProducer?.stop();
 			presentationProducer = undefined;
-			managerTaskCatalogue = [];
-			managerProjectCatalogue = [];
 			desiredPresentation = undefined;
 			presentationPublishRequested = false;
 			taskSnapshotPublishRequested = false;
@@ -380,26 +326,14 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			}
 
 			const { session, checkoutRoot } = await sessionFrom(ctx);
-			let managerExecutor: ManagerControlExecutor | undefined;
+			let presentationExecutor: ManagerPresentationControlExecutor | undefined;
 			try {
-				managerExecutor = await ManagerControlExecutor.create(checkoutRoot);
+				presentationExecutor = await ManagerPresentationControlExecutor.create(checkoutRoot);
 			} catch (error) {
-				ctx.ui.notify(`Discord manager controls disabled: ${errorMessage(error)}`, "warning");
+				ctx.ui.notify(`Discord manager-presentation controls disabled: ${errorMessage(error)}`, "warning");
 			}
 			const publishManagerTaskSummary = shouldPublishManagerTaskSummary(checkoutRoot);
 			if (!publishManagerTaskSummary) pendingTaskTerminals.clear();
-			const managerProducer = await ManagerTaskSummaryProducer.create(checkoutRoot, {
-				onCatalogues(tasks, projects) {
-					managerTaskCatalogue = tasks;
-					managerProjectCatalogue = projects;
-					void bridge?.updateManagerCatalogues(tasks, projects).catch((error) => {
-						ctx.ui.notify(`Discord manager catalogue update deferred: ${errorMessage(error)}`, "warning");
-					});
-				},
-				onError(error) {
-					ctx.ui.notify(`Discord task-summary producer: ${error.message}`, "warning");
-				},
-			});
 			const managerPresentationProducer = publishManagerTaskSummary ? await ManagerPresentationProducer.create(checkoutRoot, {
 				onPresentation(presentation) {
 					desiredPresentation = presentation;
@@ -430,7 +364,6 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 							status.connected ? STATUS_CONNECTED : STATUS_RECONNECTING,
 						);
 						if (status.connected) {
-							taskSummaryProducer?.requestRefresh(0);
 							presentationProducer?.requestRefresh(0);
 							publishTaskSnapshot(ctx);
 							publishTaskTerminals(ctx);
@@ -439,57 +372,13 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					supportsImageInput: () => ctx.model?.input?.includes("image") === true,
 					modelCatalogue: () => modelCatalogue(ctx),
 					onControl: (request) => executeSessionControl(request, ctx),
-					...(managerExecutor && managerProducer ? {
-						managerTaskCatalogue: () => managerTaskCatalogue,
-						managerProjectCatalogue: () => managerProjectCatalogue,
-						onManagerControl: async (request) => {
-							let result: PiSessionControlResult;
-							try {
-								result = boundedControlResult(await managerExecutor!.execute(
-									request,
-									managerTaskCatalogue,
-									managerProjectCatalogue,
-									(message) => {
-										if (ctx.isIdle()) pi.sendUserMessage(message);
-										else pi.sendUserMessage(message, { deliverAs: "followUp" });
-									},
-								));
-							} catch (error) {
-								result = boundedControlResult({ ok: false, message: errorMessage(error) });
-							}
-							if (request.action !== "ask") {
-								try {
-									pi.appendEntry<ManagerControlResultEntryData>(MANAGER_CONTROL_RESULT_ENTRY, {
-										action: request.action,
-										...(request.taskId ? { taskId: request.taskId } : {}),
-										...result,
-									});
-								} catch {
-									// Session history is best-effort and must not alter the Discord result.
-								}
-								managerProducer.requestRefresh(0);
-							}
-							return result;
-						},
-					} : {}),
 					...(managerPresentationProducer ? {
 						onManagerPresentationControl: async (request) => {
 							if (request.command === "task-merge-and-archive" && request.actionControl) {
-								if (!managerExecutor) return { ok: false, message: "Manager lifecycle controls are unavailable." };
-								const result = boundedControlResult(await managerExecutor.executePresentationMerge(
-									request.requestId, request.actionControl.taskId,
+								if (!presentationExecutor) return { ok: false, message: "Manager lifecycle controls are unavailable." };
+								const result = boundedControlResult(await presentationExecutor.executeMerge(
+									request.actionControl.taskId,
 								));
-								try {
-									pi.appendEntry<ManagerControlResultEntryData>(MANAGER_CONTROL_RESULT_ENTRY, {
-										action: "merge-and-archive",
-										taskId: request.actionControl.taskId,
-										ok: result.ok,
-										message: result.message,
-									});
-								} catch {
-									// Session history is best-effort and must not alter the Discord result.
-								}
-								managerProducer?.requestRefresh(0);
 								managerPresentationProducer.requestRefresh(0);
 								return result;
 							}
@@ -533,12 +422,9 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 				setConnectedStatus(ctx);
 				publishTaskSnapshot(ctx);
 				publishTaskTerminals(ctx);
-				taskSummaryProducer = managerProducer;
 				presentationProducer = managerPresentationProducer;
-				taskSummaryProducer?.start();
 				presentationProducer?.start();
 			} catch (error) {
-				managerProducer?.stop();
 				managerPresentationProducer?.stop();
 				await candidate.stop().catch(() => {});
 				bridge = undefined;
@@ -733,7 +619,7 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			if (!turn?.started) return;
 			try {
 				if (settlementFailure) throw settlementFailure;
-				if (!turn.ended || turn.failed) throw new Error("manager command turn did not complete successfully");
+				if (!turn.ended || turn.failed) throw new Error("Refresh & Reconcile turn did not complete successfully");
 				if (!presentationProducer) throw new Error("manager presentation producer is unavailable");
 				desiredPresentation = await presentationProducer.renderCurrent();
 				publishPresentation(ctx);

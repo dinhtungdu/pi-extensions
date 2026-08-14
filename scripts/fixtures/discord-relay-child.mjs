@@ -38,14 +38,6 @@ class ChildFakeTransport {
 		return () => {};
 	}
 
-	onManagerControl() {
-		return () => {};
-	}
-
-	onManagerAutocomplete() {
-		return () => {};
-	}
-
 	onPresentationControl() {
 		return () => {};
 	}

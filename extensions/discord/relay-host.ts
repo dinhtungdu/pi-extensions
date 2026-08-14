@@ -6,12 +6,7 @@ import type { LeaderLease } from "./leader.js";
 import { encodeFrame, isClientFrame, MAX_IPC_FRAME_BYTES, parseFrame, type ServerFrame } from "./protocol.js";
 import { BoundedSocketWriter, MAX_QUEUED_IPC_BYTES, MAX_QUEUED_IPC_FRAMES } from "./ipc-writer.js";
 import { DiscordRelayCore } from "./relay-core.js";
-import {
-	MAX_SESSION_CONTROL_QUEUE,
-	type PiManagerControlRequest,
-	type PiSessionControlRequest,
-	type PiSessionControlResult,
-} from "./controls.js";
+import { MAX_SESSION_CONTROL_QUEUE, type PiSessionControlRequest, type PiSessionControlResult } from "./controls.js";
 import { MANAGER_PRESENTATION_SCHEMA_VERSION, SUPPORTED_MANAGER_PRESENTATION_CONTROLS } from "./manager-presentation.js";
 
 export interface RelayHostOptions {
@@ -29,7 +24,6 @@ interface SocketState {
 	sessionId?: string;
 	closed: boolean;
 	registered: boolean;
-	managerControls: boolean;
 	managerPresentation: boolean;
 	managerTaskTerminalProducer: boolean;
 	nativeOutboundImages: boolean;
@@ -42,25 +36,24 @@ interface SocketState {
 		resolve(result: PiSessionControlResult): void;
 		reject(error: Error): void;
 		timer: ReturnType<typeof setTimeout>;
-		resultType: "control_result" | "manager_control_result" | "manager_presentation_control_result";
+		resultType: "control_result" | "manager_presentation_control_result";
 	}>;
 }
 
 const ZERO_CLIENT_GRACE_MS = 1_000;
 const SESSION_CONTROL_TIMEOUT_MS = 10_000;
-export const MANAGER_CONTROL_IPC_TIMEOUT_MS = 170_000;
+export const MANAGER_PRESENTATION_CONTROL_IPC_TIMEOUT_MS = 170_000;
 
 export function isEligibleManagerTaskSummaryProducer(
 	cwd: string,
-	registration: { managerControls?: unknown; managerTaskSummaryProducer?: true },
+	registration: { managerTaskSummaryProducer?: true },
 ): boolean {
-	return basename(cwd) === "the-manager" && registration.managerControls !== undefined &&
-		registration.managerTaskSummaryProducer === true;
+	return basename(cwd) === "the-manager" && registration.managerTaskSummaryProducer === true;
 }
 
 export function negotiatedManagerPresentation(
 	cwd: string,
-	registration: { managerControls?: unknown; managerTaskSummaryProducer?: true; managerPresentation?: { schemaVersion: 1; controlIds: string[] } },
+	registration: { managerTaskSummaryProducer?: true; managerPresentation?: { schemaVersion: 1; controlIds: string[] } },
 ): { schemaVersion: 1; controlIds: string[] } | undefined {
 	if (!isEligibleManagerTaskSummaryProducer(cwd, registration) ||
 		registration.managerPresentation?.schemaVersion !== MANAGER_PRESENTATION_SCHEMA_VERSION) return undefined;
@@ -177,7 +170,6 @@ export class LocalRelayHost {
 		Object.assign(state, {
 			closed: false,
 			registered: false,
-			managerControls: false,
 			managerPresentation: false,
 			managerTaskTerminalProducer: false,
 			nativeOutboundImages: false,
@@ -290,7 +282,6 @@ export class LocalRelayHost {
 			state.clientId = parsed.clientId;
 			state.generation = parsed.generation;
 			state.sessionId = parsed.sessionId;
-			state.managerControls = parsed.managerControls !== undefined;
 			state.nativeOutboundImages = parsed.nativeOutboundImages === true;
 			const managerTaskSummaryProducer = isEligibleManagerTaskSummaryProducer(prepared.cwd, parsed);
 			state.managerTaskTerminalProducer = managerTaskSummaryProducer;
@@ -303,9 +294,7 @@ export class LocalRelayHost {
 				leaderPid: this.options.lease.pid,
 				leaderNonce: this.options.lease.nonce,
 				lifecycleReactions: true,
-				...(managerTaskSummaryProducer ? { projectSummaries: true as const } : {}),
 				sessionControls: true,
-				managerControls: true,
 				...(managerPresentation ? { managerPresentation } : {}),
 				inboundImages: true,
 				...(state.nativeOutboundImages ? { nativeOutboundImages: true as const } : {}),
@@ -325,11 +314,6 @@ export class LocalRelayHost {
 					execute: (request) => this.requestControl(state, request),
 				} : undefined,
 				parsed.inboundImages === true,
-				parsed.managerControls ? {
-					taskCatalogue: parsed.managerControls.taskCatalogue,
-					projectCatalogue: parsed.managerControls.projectCatalogue,
-					execute: (request) => this.requestManagerControl(state, request),
-				} : undefined,
 				managerTaskSummaryProducer,
 				managerPresentation ? {
 					controlIds: managerPresentation.controlIds,
@@ -349,8 +333,7 @@ export class LocalRelayHost {
 		const generation = state.generation!;
 		const sessionId = state.sessionId!;
 		if (parsed.type === "register") throw new Error("Local Discord relay client is already registered");
-		if (parsed.type === "control_result" || parsed.type === "manager_control_result" ||
-			parsed.type === "manager_presentation_control_result") {
+		if (parsed.type === "control_result" || parsed.type === "manager_presentation_control_result") {
 			const pending = state.pendingControls.get(parsed.requestId);
 			if (!pending || pending.resultType !== parsed.type) return;
 			clearTimeout(pending.timer);
@@ -393,23 +376,6 @@ export class LocalRelayHost {
 			this.write(state, { type: "manager_task_terminal_queued", requestId: parsed.requestId });
 			return;
 		}
-		if (parsed.type === "manager_catalogue") {
-			if (!state.managerControls) throw new Error("Local client is not registered for manager controls");
-			try {
-				this.options.core.updateManagerCatalogues(
-					clientId,
-					generation,
-					sessionId,
-					parsed.taskCatalogue,
-					parsed.projectCatalogue,
-				);
-			} catch (error) {
-				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
-				return;
-			}
-			this.write(state, { type: "manager_catalogue_updated", requestId: parsed.requestId });
-			return;
-		}
 		if (parsed.type === "ack_inbound") {
 			try {
 				await this.options.core.acknowledge(clientId, generation, sessionId, parsed.messageId);
@@ -432,16 +398,6 @@ export class LocalRelayHost {
 		}
 		if (parsed.type === "lifecycle") {
 			await this.options.core.queueLifecycleUpdate(clientId, generation, sessionId, parsed.messageId, parsed.status);
-			return;
-		}
-		if (parsed.type === "project_summary") {
-			try {
-				await this.options.core.queueProjectSummary(clientId, generation, sessionId, parsed.text);
-			} catch (error) {
-				this.fail(socket, state, error instanceof Error ? error.message : String(error), false, parsed.requestId);
-				return;
-			}
-			this.write(state, { type: "project_summary_queued", requestId: parsed.requestId });
 			return;
 		}
 		if (parsed.type === "working") {
@@ -481,16 +437,7 @@ export class LocalRelayHost {
 		state: SocketState,
 		request: Omit<Extract<ServerFrame, { type: "manager_presentation_control" }>, "type">,
 	): Promise<PiSessionControlResult> {
-		return this.requestClientControl(state, { type: "manager_presentation_control", ...request }, MANAGER_CONTROL_IPC_TIMEOUT_MS);
-	}
-
-	private requestManagerControl(state: SocketState, request: PiManagerControlRequest): Promise<PiSessionControlResult> {
-		const frame: Extract<ServerFrame, { type: "manager_control" }> = request.action === "ask"
-			? { type: "manager_control", requestId: request.requestId, action: "ask", target: request.target, request: request.request }
-			: request.action === "reconcile-pr"
-				? { type: "manager_control", requestId: request.requestId, action: "reconcile-pr", ...(request.taskId ? { taskId: request.taskId } : {}) }
-				: { type: "manager_control", requestId: request.requestId, action: request.action, taskId: request.taskId };
-		return this.requestClientControl(state, frame, MANAGER_CONTROL_IPC_TIMEOUT_MS);
+		return this.requestClientControl(state, { type: "manager_presentation_control", ...request }, MANAGER_PRESENTATION_CONTROL_IPC_TIMEOUT_MS);
 	}
 
 	private requestControl(state: SocketState, request: PiSessionControlRequest): Promise<PiSessionControlResult> {
@@ -512,8 +459,7 @@ export class LocalRelayHost {
 		}
 		const existing = state.pendingControls.get(frame.requestId);
 		if (existing) return Promise.reject(new Error("Pi session control request is already pending"));
-		const resultType = frame.type === "manager_control" ? "manager_control_result"
-			: frame.type === "manager_presentation_control" ? "manager_presentation_control_result" : "control_result";
+		const resultType = frame.type === "manager_presentation_control" ? "manager_presentation_control_result" : "control_result";
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				state.pendingControls.delete(frame.requestId);

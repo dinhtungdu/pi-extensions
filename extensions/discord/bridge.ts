@@ -1,9 +1,6 @@
 import type { DiscordBridgeConfig } from "./config.js";
 import { LocalRelayClient, type RelayClientDependencies, type RelayClientStatus } from "./relay-client.js";
 import type {
-	ManagerProjectCatalogueEntry,
-	ManagerTaskCatalogueEntry,
-	PiManagerControlRequest,
 	PiModelCatalogueEntry,
 	PiSessionControlRequest,
 	PiSessionControlResult,
@@ -43,9 +40,6 @@ export interface BridgeCallbacks {
 	supportsImageInput?(): boolean;
 	modelCatalogue?(): PiModelCatalogueEntry[];
 	onControl?(request: PiSessionControlRequest): Promise<PiSessionControlResult>;
-	managerTaskCatalogue?(): ManagerTaskCatalogueEntry[];
-	managerProjectCatalogue?(): ManagerProjectCatalogueEntry[];
-	onManagerControl?(request: PiManagerControlRequest): Promise<PiSessionControlResult>;
 	onManagerPresentationControl?(
 		request: { requestId: string; revision: string; controlId: string; command: string;
 			actionControl?: ManagerPresentationActionControl },
@@ -109,9 +103,6 @@ export class DiscordBridge {
 				onStatus: callbacks.onStatus,
 				...(callbacks.modelCatalogue ? { modelCatalogue: callbacks.modelCatalogue } : {}),
 				...(callbacks.onControl ? { onControl: callbacks.onControl } : {}),
-				...(callbacks.managerTaskCatalogue ? { managerTaskCatalogue: callbacks.managerTaskCatalogue } : {}),
-				...(callbacks.managerProjectCatalogue ? { managerProjectCatalogue: callbacks.managerProjectCatalogue } : {}),
-				...(callbacks.onManagerControl ? { onManagerControl: callbacks.onManagerControl } : {}),
 				...(callbacks.onManagerPresentationControl ? { onManagerPresentationControl: callbacks.onManagerPresentationControl } : {}),
 			},
 			dependencies,
@@ -165,10 +156,6 @@ export class DiscordBridge {
 		return this.relay.restartRelay();
 	}
 
-	async publishProjectSummary(text: string): Promise<boolean> {
-		return this.relay.sendProjectSummary(text);
-	}
-
 	async publishManagerPresentation(presentation: ManagerPresentation): Promise<boolean> {
 		return this.relay.publishManagerPresentation(presentation);
 	}
@@ -179,13 +166,6 @@ export class DiscordBridge {
 
 	publishManagerTaskTerminal(terminal: ManagerTaskTerminal): Promise<boolean> {
 		return this.relay.publishManagerTaskTerminal(terminal);
-	}
-
-	async updateManagerCatalogues(
-		tasks: readonly ManagerTaskCatalogueEntry[],
-		projects: readonly ManagerProjectCatalogueEntry[],
-	): Promise<boolean> {
-		return this.relay.updateManagerCatalogues(tasks, projects);
 	}
 
 	async mirrorUserText(text: string, interactive = false): Promise<void> {

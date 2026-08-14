@@ -156,17 +156,6 @@ The relay registers guild-scoped `/pi` controls for mapped session threads. Repl
 /pi abort
 ```
 
-Verified live `the-manager` session threads also expose only the guild-scoped `/m` command. Manager autocomplete and execution stay bound to the invoking mapped thread; project channels, arbitrary threads, offline sessions, stale catalogue entries, and ordinary Pi sessions fail closed.
-
-```text
-/m handoff <task>
-/m takeback <task>
-/m archive <task>
-/m merge-and-archive <task>
-/m reconcile-pr [task]
-/m ask <target> <request>
-```
-
 When Pi runs from a `the-manager` checkout, the extension watches canonical Manager data changes and requests the complete opaque `summary-render` presentation with the Manager's 10,000-character bound. Discord only paginates that returned content: it preserves every content character, appends bounded batch revision/page metadata, and keeps each message within 2,000 characters. Presentations with Manager-owned `action_controls` use Discord Components V2 and place each action at its Manager-supplied UTF-16 `after` offset; Discord never parses summary Markdown. Ready direct-landing tasks may expose **Merge & archive** beneath their associated text. First valid click executes `task-merge-and-archive` through Manager Supervisor with no second confirmation. Pull-request landing tasks receive no Manager action. Exact summary revision, delivered source-message identity, and Manager-owned action descriptor fence execution. **Refresh & Reconcile** remains after summary content. Presentations without `action_controls` retain their existing control layout for backward compatibility. Replacement sends every new page first, then deletes prior bot-authored summary pages. A failed send preserves the last-good batch and triggers best-effort cleanup of partial new pages. Batch discovery uses reserved metadata in the dedicated Manager project channel; unrelated human and bot messages are never deleted.
 
 Desired presentation state and final control-message identity remain durable across relay restarts, but reconciliation still begins only after the elected producer for the matching Manager project publishes a fresh canonical snapshot. Registration alone, unrelated relay startup, and unrelated project sessions cannot revive persisted text. Concurrent eligible sessions keep one relay-elected writer, and every reconciliation step remains fenced by exact client generation and summary revision. Owner retirement settles old-generation work before promotion, strips controls by replacing the batch, and prevents stale side effects from overtaking newer state. Relay reconnection requests a fresh canonical presentation instead of replaying cached client text. Bounded backoff retries failed reconciliation without blocking Manager mutations. Producers submit only Manager-owned opaque content, global controls, and per-task action descriptors; relay derives the project channel from authenticated session registration and performs pagination and descriptor placement only.
