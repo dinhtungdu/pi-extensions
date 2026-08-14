@@ -258,6 +258,15 @@ class FakeGateway {
 		FakeGateway.summaryEvents.push({ type: "archive", channelId });
 	}
 
+	async sendUserText(channelId, text, nonce) {
+		const messageId = await this.sendText(channelId, text, nonce);
+		const sent = this.sent.find((candidate) => candidate.id === messageId);
+		if (sent) sent.sender = "webhook";
+		const message = (FakeGateway.channelMessages.get(channelId) ?? []).find((candidate) => candidate.id === messageId);
+		if (message) message.botOwned = false;
+		return messageId;
+	}
+
 	async sendImages(channelId, text, files, nonce) {
 		FakeGateway.imageUploadAttempts.set(text, (FakeGateway.imageUploadAttempts.get(text) ?? 0) + 1);
 		if (FakeGateway.failImageUploads.delete(text)) throw new Error("injected Discord image upload failure");
@@ -2030,6 +2039,45 @@ try {
 		allowedMentions: { parse: [] },
 		flags: MessageFlags.SuppressEmbeds,
 	}], "ordinary edits must retain embed suppression");
+
+	const webhookPayloads = [];
+	const webhookCreations = [];
+	const tuiWebhook = {
+		name: "Pi TUI",
+		owner: { id: "bot-user" },
+		isIncoming: () => true,
+		async send(payload) {
+			webhookPayloads.push(payload);
+			return { id: `webhook-message-${webhookPayloads.length}` };
+		},
+	};
+	const webhookParent = {
+		id: "project-channel",
+		type: ChannelType.GuildText,
+		async fetchWebhooks() { return new Map(); },
+		async createWebhook(options) { webhookCreations.push(options); return tuiWebhook; },
+	};
+	const webhookThread = { parentId: webhookParent.id, isThread: () => true };
+	const webhookTransport = new DiscordJsTransport();
+	webhookTransport.readyClient = () => ({
+		user: { id: "bot-user" },
+		channels: { async fetch(id) { return id === "session-thread" ? webhookThread : webhookParent; } },
+	});
+	assert.equal(await webhookTransport.sendUserText("session-thread", "from TUI", "ignored-nonce"), "webhook-message-1");
+	assert.equal(await webhookTransport.sendUserText("session-thread", "again", "ignored-nonce-2"), "webhook-message-2");
+	assert.deepEqual(webhookCreations, [{ name: "Pi TUI", reason: "Pi TUI user-message mirror" }],
+		"transport must create and cache one TUI webhook per project channel");
+	assert.deepEqual(webhookPayloads, [{
+		content: "from TUI",
+		threadId: "session-thread",
+		allowedMentions: { parse: [] },
+		flags: MessageFlags.SuppressEmbeds,
+	}, {
+		content: "again",
+		threadId: "session-thread",
+		allowedMentions: { parse: [] },
+		flags: MessageFlags.SuppressEmbeds,
+	}], "TUI mirrors must use project webhook inside exact session thread");
 	const managerDefinition = managerCommandDefinition();
 	assert.equal(managerDefinition.name, "m");
 	const commandRegistrationEvents = [];
@@ -4455,35 +4503,31 @@ try {
 	const chunks = splitOutboundText(chunkSource);
 	assert.equal(chunks.join(""), chunkSource, "assistant chunks must preserve every code unit");
 	assert.ok(chunks.every((chunk) => chunk.length <= 1_900 && !/[\uD800-\uDBFF]$/.test(chunk)));
-	const interactivePrefix = "👨‍💻: ";
-	const prefixedInteractive = (body) => `${interactivePrefix}${body}`;
-	const interactiveBodies = (messages) => messages.map((message) => message.slice(interactivePrefix.length));
-	assert.deepEqual(interactiveUserChunks("ordinary input"), [prefixedInteractive("ordinary input")]);
-	assert.deepEqual(interactiveUserChunks("line one\nline two"), [prefixedInteractive("line one\nline two")]);
+	assert.deepEqual(interactiveUserChunks("ordinary input"), ["ordinary input"]);
+	assert.deepEqual(interactiveUserChunks("line one\nline two"), ["line one\nline two"]);
 	assert.deepEqual(
 		interactiveUserChunks("**bold** _under_ `code` \\ slash"),
-		[prefixedInteractive("**bold** _under_ `code` \\ slash")],
-		"interactive Markdown must remain byte-for-byte unchanged after the prefix",
+		["**bold** _under_ `code` \\ slash"],
+		"interactive Markdown must remain byte-for-byte unchanged",
 	);
 	assert.deepEqual(interactiveUserChunks(""), []);
-	assert.deepEqual(interactiveUserChunks(" \n "), [prefixedInteractive(" \n ")], "whitespace-only interactive input must be preserved");
-	const interactiveCapacity = 1_900 - interactivePrefix.length;
-	assert.equal(interactiveCapacity, 1_893);
+	assert.deepEqual(interactiveUserChunks(" \n "), [" \n "], "whitespace-only interactive input must be preserved");
+	const interactiveCapacity = 1_900;
 	assert.equal(interactiveUserChunks("a".repeat(interactiveCapacity))[0].length, 1_900);
 	const boundaryUnicodeInput = `${"a".repeat(interactiveCapacity - 1)}😀b`;
 	const boundaryUnicodeChunks = interactiveUserChunks(boundaryUnicodeInput);
 	assert.equal(boundaryUnicodeChunks.length, 2);
-	assert.ok(boundaryUnicodeChunks.every((chunk) => chunk.startsWith(interactivePrefix) && chunk.length <= 1_900));
-	assert.equal(interactiveBodies(boundaryUnicodeChunks).join(""), boundaryUnicodeInput, "UTF-16 surrogate pairs must remain intact across chunks");
-	assert.doesNotMatch(interactiveBodies(boundaryUnicodeChunks)[0], /[\uD800-\uDBFF]$/);
-	assert.doesNotMatch(interactiveBodies(boundaryUnicodeChunks)[1], /^[\uDC00-\uDFFF]/);
-	assert.throws(() => interactiveUserChunks("x", interactivePrefix.length + 1), /between 9 and 2000/);
+	assert.ok(boundaryUnicodeChunks.every((chunk) => chunk.length <= 1_900));
+	assert.equal(boundaryUnicodeChunks.join(""), boundaryUnicodeInput, "UTF-16 surrogate pairs must remain intact across chunks");
+	assert.doesNotMatch(boundaryUnicodeChunks[0], /[\uD800-\uDBFF]$/);
+	assert.doesNotMatch(boundaryUnicodeChunks[1], /^[\uDC00-\uDFFF]/);
+	assert.throws(() => interactiveUserChunks("x", 1), /between 2 and 2000/);
 	const longInteractiveInput = "long *markdown* line\n".repeat(300);
 	const longInteractiveChunks = interactiveUserChunks(longInteractiveInput);
 	assert.ok(longInteractiveChunks.length > 1);
-	assert.ok(longInteractiveChunks.every((chunk) => chunk.startsWith(interactivePrefix) && chunk.length <= 1_900));
+	assert.ok(longInteractiveChunks.every((chunk) => chunk.length <= 1_900));
 	assert.ok(longInteractiveChunks.every((chunk) => !chunk.includes("────")), "interactive chunks must not reintroduce divider lines");
-	assert.equal(interactiveBodies(longInteractiveChunks).join(""), longInteractiveInput);
+	assert.equal(longInteractiveChunks.join(""), longInteractiveInput);
 
 	const resolvedRegistrationFrame = {
 		type: "register",
@@ -6541,13 +6585,15 @@ try {
 	assert.equal(FakeGateway.lifecycleReactionEvents.length, localReactionCount, "local/TUI runs must never receive Discord reactions");
 
 	await first.emit("input", { text: "local input", source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === prefixedInteractive("local input")), "prefixed interactive user send");
+	await waitFor(() => gateway.sent.some((message) => message.text === "local input"), "interactive user send");
 	assert.equal(gateway.sent.at(-1).channelId, firstThread);
-	assert.equal(gateway.sent.at(-1).text, prefixedInteractive("local input"));
+	assert.equal(gateway.sent.at(-1).text, "local input");
+	assert.equal(gateway.sent.at(-1).sender, "webhook", "TUI input must use distinct webhook identity");
 	await first.emit("input", { text: "line one\nline two", source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === prefixedInteractive("line one\nline two")), "prefixed multiline interactive send");
+	await waitFor(() => gateway.sent.some((message) => message.text === "line one\nline two"), "multiline interactive send");
+	const sentBeforeWhitespaceInput = gateway.sent.length;
 	await first.emit("input", { text: " \n ", source: "interactive" });
-	await waitFor(() => gateway.sent.some((message) => message.text === prefixedInteractive(" \n ")), "prefixed whitespace-only interactive send");
+	assert.equal(gateway.sent.length, sentBeforeWhitespaceInput, "Discord must skip whitespace-only interactive input");
 	const sentBeforeEmptyInput = gateway.sent.length;
 	await first.emit("input", { text: "", source: "interactive" });
 	assert.equal(gateway.sent.length, sentBeforeEmptyInput, "empty interactive input must not emit a Discord message");
@@ -6579,6 +6625,8 @@ try {
 	assert.match(persistedAssistant.id, /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/,
 		"message_end capture must assign a stable UUID before persistence");
 	await waitFor(() => gateway.sent.some((message) => message.text === "final only"), "transient Discord retry");
+	assert.equal(gateway.sent.find((message) => message.text === "final only").sender, undefined,
+		"assistant output must retain bot identity");
 	assert.equal(gateway.sent.filter((message) => message.text === "final only").length, 1);
 	await first.emit("agent_settled", {});
 	assert.equal(gateway.sent.filter((message) => message.text === "final only").length, 1,

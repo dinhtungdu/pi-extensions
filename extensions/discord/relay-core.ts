@@ -1449,6 +1449,8 @@ export class DiscordRelayCore {
 									await this.outboundImageStore?.remove(snapshots); this.clearOutboundRetry(next.sessionId); deliveryAbandoned = true; break;
 								}
 							} else discordMessageId = await this.transport.sendText(next.message.threadId, chunk.content, chunk.nonce);
+						} else if (next.message.kind === "user" || next.message.kind === "interactive") {
+							discordMessageId = await this.transport.sendUserText(next.message.threadId, chunk.content, chunk.nonce);
 						} else discordMessageId = await this.transport.sendText(next.message.threadId, chunk.content, chunk.nonce);
 					} catch {
 						blockedSessions.add(next.sessionId);

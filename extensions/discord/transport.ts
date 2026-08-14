@@ -15,6 +15,8 @@ import {
 	type ChatInputCommandInteraction,
 	type Guild,
 	type TextChannel,
+	type Webhook,
+	WebhookType,
 } from "discord.js";
 import type { DiscordBridgeConfig } from "./config.js";
 import type { DiscordInboundAttachment } from "./inbound-images.js";
@@ -47,6 +49,7 @@ export const MANAGER_CONTROL_INTERACTION_TIMEOUT_MS = 180_000;
 const PI_COMMAND_NAME = "pi";
 const MANAGER_COMMAND_NAME = "m";
 const LEGACY_MANAGER_COMMAND_NAME = "manager";
+const TUI_WEBHOOK_NAME = "Pi TUI";
 
 export function isManagerPresentationButton(customId: string): boolean {
 	return customId.startsWith("m:");
@@ -104,6 +107,7 @@ export interface DiscordTransport {
 	ensureSessionThread(request: SessionThreadRequest): Promise<string>;
 	fetchMessagesAfter(channelId: string, afterId?: string): Promise<DiscordInboundMessage[]>;
 	sendText(channelId: string, text: string, nonce: string): Promise<string>;
+	sendUserText(channelId: string, text: string, nonce: string): Promise<string>;
 	sendImages(channelId: string, text: string, files: readonly DiscordOutboundAttachment[], nonce: string): Promise<string>;
 	sendPresentation(channelId: string, presentation: ManagerPresentation, nonce: string): Promise<string>;
 	lockThread(channelId: string): Promise<void>;
@@ -357,6 +361,7 @@ export class DiscordJsTransport implements DiscordTransport {
 	private readonly managerAutocompleteListeners = new Set<(channelId: string, prefix: string, kind: "task" | "target") => DiscordModelChoice[]>();
 	private readonly presentationControlListeners = new Set<(request: DiscordPresentationControlRequest) => Promise<DiscordPresentationControlResult>>();
 	private readonly terminalListeners = new Set<(error: Error) => void>();
+	private readonly userWebhooks = new Map<string, Promise<Webhook<WebhookType.Incoming>>>();
 
 	async connect(config: DiscordBridgeConfig): Promise<void> {
 		if (this.client) throw new Error("Discord transport is already connected");
@@ -383,7 +388,7 @@ export class DiscordJsTransport implements DiscordTransport {
 				id: message.id,
 				channelId: message.channelId,
 				content: message.content,
-				authorBot: message.author.bot,
+				authorBot: message.author.bot || Boolean(message.webhookId),
 				attachments: [...message.attachments.values()].map((attachment) => ({
 					id: attachment.id,
 					url: attachment.url,
@@ -452,6 +457,7 @@ export class DiscordJsTransport implements DiscordTransport {
 	async disconnect(): Promise<void> {
 		this.client?.destroy();
 		this.client = undefined;
+		this.userWebhooks.clear();
 	}
 
 	onMessage(listener: (message: DiscordInboundMessage) => void): () => void {
@@ -490,7 +496,10 @@ export class DiscordJsTransport implements DiscordTransport {
 
 		if (request.mappedChannelId) {
 			const mapped = await guild.channels.fetch(request.mappedChannelId).catch(() => null);
-			if (mapped?.type === ChannelType.GuildText && mapped.guildId === guild.id) return mapped.id;
+			if (mapped?.type === ChannelType.GuildText && mapped.guildId === guild.id) {
+				await this.userWebhook(mapped);
+				return mapped.id;
+			}
 		}
 
 		const channel = await guild.channels.create({
@@ -500,6 +509,7 @@ export class DiscordJsTransport implements DiscordTransport {
 			topic: "Pi project bridge",
 			reason: "Pi Discord bridge project channel",
 		});
+		await this.userWebhook(channel);
 		return channel.id;
 	}
 
@@ -540,7 +550,7 @@ export class DiscordJsTransport implements DiscordTransport {
 				id: message.id,
 				channelId: message.channelId,
 				content: message.content,
-				authorBot: message.author.bot,
+				authorBot: message.author.bot || Boolean(message.webhookId),
 				attachments: [...message.attachments.values()].map((attachment) => ({
 					id: attachment.id,
 					url: attachment.url,
@@ -560,6 +570,25 @@ export class DiscordJsTransport implements DiscordTransport {
 			content: text,
 			nonce,
 			enforceNonce: true,
+			allowedMentions: { parse: [] },
+			flags: MessageFlags.SuppressEmbeds,
+		});
+		return message.id;
+	}
+
+	async sendUserText(channelId: string, text: string, _nonce: string): Promise<string> {
+		const client = this.readyClient();
+		const thread = await client.channels.fetch(channelId).catch(() => null);
+		if (!thread?.isThread() || !thread.parentId) {
+			throw new Error(`Discord thread ${channelId} is missing or cannot receive TUI user messages`);
+		}
+		const parent = await client.channels.fetch(thread.parentId).catch(() => null);
+		if (parent?.type !== ChannelType.GuildText) {
+			throw new Error(`Discord thread ${channelId} has no text-channel parent for its TUI webhook`);
+		}
+		const message = await (await this.userWebhook(parent)).send({
+			content: text,
+			threadId: channelId,
 			allowedMentions: { parse: [] },
 			flags: MessageFlags.SuppressEmbeds,
 		});
@@ -705,6 +734,24 @@ export class DiscordJsTransport implements DiscordTransport {
 	onTerminalError(listener: (error: Error) => void): () => void {
 		this.terminalListeners.add(listener);
 		return () => this.terminalListeners.delete(listener);
+	}
+
+	private userWebhook(channel: TextChannel): Promise<Webhook<WebhookType.Incoming>> {
+		const cached = this.userWebhooks.get(channel.id);
+		if (cached) return cached;
+		let operation: Promise<Webhook<WebhookType.Incoming>>;
+		operation = (async () => {
+			const botUserId = this.readyClient().user.id;
+			for (const webhook of (await channel.fetchWebhooks()).values()) {
+				if (webhook.isIncoming() && webhook.name === TUI_WEBHOOK_NAME && webhook.owner?.id === botUserId) return webhook;
+			}
+			return channel.createWebhook({ name: TUI_WEBHOOK_NAME, reason: "Pi TUI user-message mirror" });
+		})().catch((error) => {
+			if (this.userWebhooks.get(channel.id) === operation) this.userWebhooks.delete(channel.id);
+			throw new Error(`Cannot prepare Discord TUI webhook in channel ${channel.id}: ${error instanceof Error ? error.message : String(error)}`);
+		});
+		this.userWebhooks.set(channel.id, operation);
+		return operation;
 	}
 
 	private async registerControls(guildId: string): Promise<void> {
