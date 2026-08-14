@@ -49,7 +49,7 @@ export function isManagerWakeDescriptor(value: unknown): value is ManagerWakeDes
 }
 
 export function managerWakeRegistration(environment: NodeJS.ProcessEnv): ManagerWakeDescriptor | null | undefined {
-	if (environment.THE_MANAGER_ROLE !== "middle-manager") return undefined;
+	if (environment.THE_MANAGER_ROLE !== "task-lead") return undefined;
 	const encoded = environment.THE_MANAGER_DISCORD_WAKE_DESCRIPTOR;
 	if (!encoded || Buffer.byteLength(encoded) > MAX_MANAGER_WAKE_DESCRIPTOR_BYTES) return null;
 	let descriptor: unknown;
@@ -59,9 +59,9 @@ export function managerWakeRegistration(environment: NodeJS.ProcessEnv): Manager
 		return null;
 	}
 	if (!isManagerWakeDescriptor(descriptor)) return null;
-	const generation = Number(environment.THE_MANAGER_MIDDLE_MANAGER_GENERATION);
+	const generation = Number(environment.THE_MANAGER_TASK_LEAD_GENERATION);
 	const root = environment.THE_MANAGER_ROOT;
-	const broadCapability = environment.THE_MANAGER_MIDDLE_MANAGER_CAPABILITY;
+	const broadCapability = environment.THE_MANAGER_TASK_LEAD_CAPABILITY;
 	if (!root || !isAbsolute(root) || descriptor.socketPath !== resolve(root, ".manager", "supervisor.sock") ||
 		descriptor.taskId !== environment.THE_MANAGER_TASK_ID || !Number.isSafeInteger(generation) || generation < 1 ||
 		descriptor.generation !== generation || !broadCapability || !/^[a-f0-9]{64}$/.test(broadCapability) ||

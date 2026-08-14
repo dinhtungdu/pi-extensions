@@ -483,7 +483,7 @@ try {
 		MANAGER_CONTROL_RESULT_ENTRY,
 		shouldAutoStartDiscordBridge,
 		shouldPublishManagerTaskSummary,
-		shouldSubscribeOwnerToMiddleManagerThread,
+		shouldSubscribeOwnerToTaskLeadThread,
 	} = await importBuilt("extensions/discord/index.js");
 	const { managerProjectCatalogue, managerTaskCatalogue, ManagerTaskSummaryProducer } = await importBuilt("extensions/discord/manager-task-summary.js");
 	const {
@@ -573,6 +573,7 @@ try {
 		subscribeThreadOwner,
 	} = await importBuilt("extensions/discord/transport.js");
 
+	const legacyRoleFixture = "middle-manager"; // Historical role fixture: cutover must reject it without compatibility.
 	const activationHome = join(dataDir, "activation-home");
 	assert.equal(shouldAutoStartDiscordBridge(join(activationHome, "workspace"), activationHome), false,
 		"the workspace root must remain off by default");
@@ -592,15 +593,17 @@ try {
 		"the-manager checkout must publish task summaries");
 	assert.equal(shouldPublishManagerTaskSummary(join(activationHome, "workspace", "the-manager-copy")), false,
 		"other checkouts must not publish task summaries");
-	assert.equal(shouldSubscribeOwnerToMiddleManagerThread({ THE_MANAGER_ROLE: "middle-manager" }), true,
-		"middle-manager sessions must request owner subscription");
-	assert.equal(shouldSubscribeOwnerToMiddleManagerThread({
+	assert.equal(shouldSubscribeOwnerToTaskLeadThread({ THE_MANAGER_ROLE: "task-lead" }), true,
+		"task-lead sessions must request owner subscription");
+	assert.equal(shouldSubscribeOwnerToTaskLeadThread({ THE_MANAGER_ROLE: legacyRoleFixture }), false,
+		"legacy role fixture must not request owner subscription");
+	assert.equal(shouldSubscribeOwnerToTaskLeadThread({
 		THE_MANAGER_ROLE: "worker", THE_MANAGER_SESSION_POLICY: "continue",
 	}), false, "retained primary workers must not request owner subscription");
-	assert.equal(shouldSubscribeOwnerToMiddleManagerThread({
+	assert.equal(shouldSubscribeOwnerToTaskLeadThread({
 		THE_MANAGER_ROLE: "worker", THE_MANAGER_SESSION_POLICY: "fresh",
 	}), false, "fresh review workers must not request owner subscription");
-	assert.equal(shouldSubscribeOwnerToMiddleManagerThread({}), false,
+	assert.equal(shouldSubscribeOwnerToTaskLeadThread({}), false,
 		"ordinary sessions must not request owner subscription");
 
 	const taskSnapshot = {
@@ -613,10 +616,11 @@ try {
 	};
 	assert.equal(isManagerTaskSnapshot(taskSnapshot), true);
 	assert.deepEqual(acceptedManagerTaskSnapshot({
-		THE_MANAGER_ROLE: "middle-manager", THE_MANAGER_TASK_ID: "wake-task",
+		THE_MANAGER_ROLE: "task-lead", THE_MANAGER_TASK_ID: "wake-task",
 	}, taskSnapshot), taskSnapshot);
+	assert.equal(acceptedManagerTaskSnapshot({ THE_MANAGER_ROLE: legacyRoleFixture, THE_MANAGER_TASK_ID: "wake-task" }, taskSnapshot), undefined);
 	assert.equal(acceptedManagerTaskSnapshot({ THE_MANAGER_ROLE: "worker", THE_MANAGER_TASK_ID: "wake-task" }, taskSnapshot), undefined);
-	assert.equal(acceptedManagerTaskSnapshot({ THE_MANAGER_ROLE: "middle-manager", THE_MANAGER_TASK_ID: "other-task" }, taskSnapshot), undefined);
+	assert.equal(acceptedManagerTaskSnapshot({ THE_MANAGER_ROLE: "task-lead", THE_MANAGER_TASK_ID: "other-task" }, taskSnapshot), undefined);
 	for (const malformed of [
 		{ ...taskSnapshot, schemaVersion: 2 },
 		{ ...taskSnapshot, revision: "A".repeat(64) },
@@ -653,27 +657,28 @@ try {
 		taskId: "wake-task", generation: 3, capability: wakeCapability,
 	};
 	const wakeEnvironment = {
-		THE_MANAGER_ROLE: "middle-manager",
+		THE_MANAGER_ROLE: "task-lead",
 		THE_MANAGER_ROOT: wakeRoot,
 		THE_MANAGER_TASK_ID: "wake-task",
-		THE_MANAGER_MIDDLE_MANAGER_GENERATION: "3",
-		THE_MANAGER_MIDDLE_MANAGER_CAPABILITY: broadCapability,
+		THE_MANAGER_TASK_LEAD_GENERATION: "3",
+		THE_MANAGER_TASK_LEAD_CAPABILITY: broadCapability,
 		THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: JSON.stringify(wakeDescriptor),
 	};
 	assert.deepEqual(managerWakeRegistration(wakeEnvironment), wakeDescriptor,
-		"middle-manager wake descriptors must match protected Manager identity");
+		"task-lead wake descriptors must match protected Manager identity");
 	for (const environment of [
+		{ ...wakeEnvironment, THE_MANAGER_ROLE: legacyRoleFixture },
 		{ ...wakeEnvironment, THE_MANAGER_ROLE: "worker" },
 		{ ...wakeEnvironment, THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: "{" },
 		{ ...wakeEnvironment, THE_MANAGER_TASK_ID: "other-task" },
-		{ ...wakeEnvironment, THE_MANAGER_MIDDLE_MANAGER_GENERATION: "-3" },
+		{ ...wakeEnvironment, THE_MANAGER_TASK_LEAD_GENERATION: "-3" },
 		{ ...wakeEnvironment, THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: JSON.stringify({ ...wakeDescriptor, capability: broadCapability }) },
 		{ ...wakeEnvironment, THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: JSON.stringify({ ...wakeDescriptor, command: "pi" }) },
 		{ ...wakeEnvironment, THE_MANAGER_DISCORD_WAKE_DESCRIPTOR: JSON.stringify({ ...wakeDescriptor, socketPath: join(dataDir, "attacker.sock") }) },
 	]) {
 		const parsed = managerWakeRegistration(environment);
-		assert.equal(parsed, environment.THE_MANAGER_ROLE === "worker" ? undefined : null,
-			"invalid, broad, noncanonical, and non-manager wake descriptors must be rejected");
+		assert.equal(parsed, environment.THE_MANAGER_ROLE !== "task-lead" ? undefined : null,
+			"invalid, broad, noncanonical, and non-task-lead wake descriptors must be rejected");
 	}
 
 	const wakeRequests = [];
@@ -1317,62 +1322,62 @@ try {
 	await explicitEnable.emit("session_shutdown", { reason: "quit" });
 	await waitFor(() => FakeGateway.activeConnections === 0, "explicit-enable relay shutdown");
 
-	const middleManagerRelayDirectory = join(dataDir, "middle-manager-relay");
-	const middleManagerStateFile = join(middleManagerRelayDirectory, "state.json");
-	const middleManagerGateway = new FakeGateway();
-	const middleManager = createExtensionHarness(createDiscordExtension({
+	const taskLeadRelayDirectory = join(dataDir, "task-lead-relay");
+	const taskLeadStateFile = join(taskLeadRelayDirectory, "state.json");
+	const taskLeadGateway = new FakeGateway();
+	const taskLead = createExtensionHarness(createDiscordExtension({
 		environment: wakeEnvironment,
-		paths: relayPaths(middleManagerRelayDirectory),
-		loadConfig: async () => ({ token: "middle-manager-token", guildId: "12345", epoch: 1 }),
-		createStateStore: () => new DiscordStateStore(middleManagerStateFile),
-		createTransport: () => middleManagerGateway,
+		paths: relayPaths(taskLeadRelayDirectory),
+		loadConfig: async () => ({ token: "task-lead-token", guildId: "12345", epoch: 1 }),
+		createStateStore: () => new DiscordStateStore(taskLeadStateFile),
+		createTransport: () => taskLeadGateway,
 		autoStartForCwd: () => true,
 	}), {
-		cwd: "/work/middle-manager",
-		sessionId: "middle-manager",
-		sessionName: "Middle manager",
+		cwd: "/work/task-lead",
+		sessionId: "task-lead",
+		sessionName: "Task lead",
 	});
-	middleManager.emitBus("manager:task-snapshot", taskSnapshot);
-	middleManager.emitBus("manager:task-snapshot", { ...taskSnapshot, revision: "3".repeat(64), taskId: "other-task" });
-	middleManager.emitBus("manager:task-snapshot", { ...taskSnapshot, revision: "4".repeat(64), content: "" });
-	await middleManager.emit("session_start", { reason: "startup" });
-	await waitFor(async () => Boolean((await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager"))
+	taskLead.emitBus("manager:task-snapshot", taskSnapshot);
+	taskLead.emitBus("manager:task-snapshot", { ...taskSnapshot, revision: "3".repeat(64), taskId: "other-task" });
+	taskLead.emitBus("manager:task-snapshot", { ...taskSnapshot, revision: "4".repeat(64), content: "" });
+	await taskLead.emit("session_start", { reason: "startup" });
+	await waitFor(async () => Boolean((await new DiscordStateStore(taskLeadStateFile).getSession("task-lead"))
 		?.managerTaskSnapshot?.delivery), "pre-registration manager task snapshot delivery");
-	const middleManagerMapping = await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager");
-	assert.deepEqual(middleManagerMapping.managerWake, wakeDescriptor,
+	const taskLeadMapping = await new DiscordStateStore(taskLeadStateFile).getSession("task-lead");
+	assert.deepEqual(taskLeadMapping.managerWake, wakeDescriptor,
 		"authenticated relay registration must bind the trusted descriptor to the exact Pi session");
-	assert.equal(middleManagerGateway.threadRequests[0].subscribeOwner, true,
-		"middle-manager metadata must request owner subscription");
-	assert.equal(middleManagerMapping.managerTaskSnapshotTaskId, taskSnapshot.taskId);
-	assert.equal(middleManagerMapping.managerTaskSnapshot.desired.content, taskSnapshot.content,
+	assert.equal(taskLeadGateway.threadRequests[0].subscribeOwner, true,
+		"task-lead metadata must request owner subscription");
+	assert.equal(taskLeadMapping.managerTaskSnapshotTaskId, taskSnapshot.taskId);
+	assert.equal(taskLeadMapping.managerTaskSnapshot.desired.content, taskSnapshot.content,
 		"event before bridge registration must retain exact latest accepted content");
-	assert.equal(middleManagerMapping.managerTaskSnapshot.delivery.snapshot.content, taskSnapshot.content);
-	const extensionSnapshotMessageId = middleManagerMapping.managerTaskSnapshot.delivery.messageId;
-	assert.equal((FakeGateway.channelMessages.get(middleManagerMapping.threadId) ?? [])
+	assert.equal(taskLeadMapping.managerTaskSnapshot.delivery.snapshot.content, taskSnapshot.content);
+	const extensionSnapshotMessageId = taskLeadMapping.managerTaskSnapshot.delivery.messageId;
+	assert.equal((FakeGateway.channelMessages.get(taskLeadMapping.threadId) ?? [])
 		.find((message) => message.id === extensionSnapshotMessageId)?.text, taskSnapshot.content);
 	const extensionNextSnapshot = { ...taskSnapshot, revision: "5".repeat(64), content: "extension exact update\n@here" };
-	middleManager.emitBus("manager:task-snapshot", extensionNextSnapshot);
-	await waitFor(async () => (await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager"))
+	taskLead.emitBus("manager:task-snapshot", extensionNextSnapshot);
+	await waitFor(async () => (await new DiscordStateStore(taskLeadStateFile).getSession("task-lead"))
 		?.managerTaskSnapshot?.delivery?.snapshot.revision === extensionNextSnapshot.revision, "extension task snapshot edit");
-	const extensionUpdatedMapping = await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager");
+	const extensionUpdatedMapping = await new DiscordStateStore(taskLeadStateFile).getSession("task-lead");
 	assert.equal(extensionUpdatedMapping.managerTaskSnapshot.delivery.messageId, extensionSnapshotMessageId);
 	assert.equal(extensionUpdatedMapping.managerTaskSnapshot.delivery.snapshot.content, extensionNextSnapshot.content);
 	const extensionEventsBeforeDuplicate = FakeGateway.summaryEvents.length;
-	middleManager.emitBus("manager:task-snapshot", { ...extensionNextSnapshot, content: "duplicate revision ignored" });
+	taskLead.emitBus("manager:task-snapshot", { ...extensionNextSnapshot, content: "duplicate revision ignored" });
 	await new Promise((resolveWait) => setTimeout(resolveWait, 20));
 	assert.equal(FakeGateway.summaryEvents.length, extensionEventsBeforeDuplicate,
 		"extension duplicate revisions must not reach relay transport");
-	await middleManager.runCommand("discord", "reconnect");
-	assert.deepEqual(middleManagerGateway.threadRequests.at(-1), {
-		channelId: middleManagerMapping.channelId,
-		mappedThreadId: middleManagerMapping.threadId,
-		name: sessionThreadName("middle-manager", "Middle manager"),
+	await taskLead.runCommand("discord", "reconnect");
+	assert.deepEqual(taskLeadGateway.threadRequests.at(-1), {
+		channelId: taskLeadMapping.channelId,
+		mappedThreadId: taskLeadMapping.threadId,
+		name: sessionThreadName("task-lead", "Task lead"),
 		subscribeOwner: true,
-	}, "middle-manager reconnect must reuse and resubscribe the exact thread");
-	assert.equal((await new DiscordStateStore(middleManagerStateFile).getSession("middle-manager")).threadId,
-		middleManagerMapping.threadId, "middle-manager reconnect must not create another thread");
-	await middleManager.emit("session_shutdown", { reason: "quit" });
-	await waitFor(() => FakeGateway.activeConnections === 0, "middle-manager relay shutdown");
+	}, "task-lead reconnect must reuse and resubscribe the exact thread");
+	assert.equal((await new DiscordStateStore(taskLeadStateFile).getSession("task-lead")).threadId,
+		taskLeadMapping.threadId, "task-lead reconnect must not create another thread");
+	await taskLead.emit("session_shutdown", { reason: "quit" });
+	await waitFor(() => FakeGateway.activeConnections === 0, "task-lead relay shutdown");
 
 	const primaryRelayDirectory = join(dataDir, "primary-worker-relay");
 	const primaryStateFile = join(primaryRelayDirectory, "state.json");
@@ -1395,7 +1400,7 @@ try {
 	assert.equal(primaryGateway.threadRequests[0].subscribeOwner, undefined,
 		"retained primary workers must not subscribe the owner");
 	assert.equal(primaryMapping.managerTaskSnapshotTaskId, undefined);
-	assert.equal(primaryMapping.managerTaskSnapshot, undefined, "non-middle-manager roles must reject task snapshot events");
+	assert.equal(primaryMapping.managerTaskSnapshot, undefined, "non-task-lead roles must reject task snapshot events");
 	await primaryWorker.runCommand("discord", "reconnect");
 	assert.deepEqual(primaryGateway.threadRequests.at(-1), {
 		channelId: primaryMapping.channelId,

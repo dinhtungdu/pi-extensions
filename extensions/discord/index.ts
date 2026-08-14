@@ -84,8 +84,8 @@ export function shouldPublishManagerTaskSummary(checkoutRoot: string): boolean {
 	return basename(resolve(checkoutRoot)) === "the-manager";
 }
 
-export function shouldSubscribeOwnerToMiddleManagerThread(environment: NodeJS.ProcessEnv = process.env): boolean {
-	return environment.THE_MANAGER_ROLE === "middle-manager";
+export function shouldSubscribeOwnerToTaskLeadThread(environment: NodeJS.ProcessEnv = process.env): boolean {
+	return environment.THE_MANAGER_ROLE === "task-lead";
 }
 
 export interface DiscordExtensionDependencies {
@@ -261,9 +261,9 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 					sessionId: ctx.sessionManager.getSessionId(),
 					sessionName: pi.getSessionName() ?? await discoverTaskTitle(project.checkoutRoot),
 					...(managerWake !== undefined ? { managerWake } : {}),
-					...(environment.THE_MANAGER_ROLE === "middle-manager" && environment.THE_MANAGER_TASK_ID
+					...(environment.THE_MANAGER_ROLE === "task-lead" && environment.THE_MANAGER_TASK_ID
 						? { managerTaskSnapshotTaskId: environment.THE_MANAGER_TASK_ID } : {}),
-					...(shouldSubscribeOwnerToMiddleManagerThread(environment) ? { subscribeOwnerToThread: true as const } : {}),
+					...(shouldSubscribeOwnerToTaskLeadThread(environment) ? { subscribeOwnerToThread: true as const } : {}),
 				},
 			};
 		}

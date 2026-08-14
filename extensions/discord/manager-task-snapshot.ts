@@ -29,7 +29,7 @@ export function acceptedManagerTaskSnapshot(
 	environment: NodeJS.ProcessEnv,
 	value: unknown,
 ): ManagerTaskSnapshot | undefined {
-	if (environment.THE_MANAGER_ROLE !== "middle-manager" || !environment.THE_MANAGER_TASK_ID ||
+	if (environment.THE_MANAGER_ROLE !== "task-lead" || !environment.THE_MANAGER_TASK_ID ||
 		!isManagerTaskSnapshot(value) || value.taskId !== environment.THE_MANAGER_TASK_ID) return undefined;
 	return structuredClone(value);
 }
