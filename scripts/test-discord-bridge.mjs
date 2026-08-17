@@ -106,10 +106,14 @@ try {
 	});
 	const presentationReplies = [];
 	await transport.executePresentationControlInteraction({
-		id: "refresh", guildId: "guild", message: { id: "summary" }, customId: `m:${"b".repeat(64)}:github-refresh-reconcile`,
+		id: "refresh", guildId: "guild", message: { id: "summary", channelId: "project-channel" },
+		customId: `m:${"b".repeat(64)}:github-refresh-reconcile`,
 		async deferReply() {}, async editReply(reply) { presentationReplies.push(reply); },
-	}, "project-channel");
-	assert.equal(presentationRequests.length, 1, "Manager summary button remains routed");
+	}, "wrong-interaction-channel");
+	assert.deepEqual(presentationRequests, [{
+		requestId: "refresh", guildId: "guild", channelId: "project-channel", messageId: "summary",
+		customId: `m:${"b".repeat(64)}:github-refresh-reconcile`,
+	}], "Manager summary button uses its message channel, not conflicting interaction metadata");
 	assert.equal(presentationReplies[0].content, "✅ Refresh started");
 
 	const relayTransport = new TestTransport();
@@ -143,6 +147,56 @@ try {
 	assert.deepEqual(relayTransport.locked, ["session-thread"]);
 	assert.deepEqual(relayTransport.archived, ["session-thread"]);
 	await relay.stop();
+
+	const summaryTransport = new TestTransport();
+	const summaryState = new DiscordStateStore(join(data, "summary-state.json"));
+	const summaryRelay = new DiscordRelayCore(
+		{ token: "token", guildId: "guild", epoch: 1 }, summaryState, summaryTransport,
+	);
+	const invokedCommands = [];
+	const presentation = {
+		schemaVersion: 1, revision: "e".repeat(64), content: "Current manager summary",
+		controls: [{ id: "github-refresh-reconcile", label: "Refresh & Reconcile", style: "secondary", command: "github-refresh-reconcile" }],
+		degraded: false, warnings: [],
+	};
+	await summaryRelay.start();
+	await summaryRelay.prepareRegistration("summary", "summary-generation", {
+		cwd: "/the-manager", projectIdentityResolved: true, sessionId: "summary-session",
+	});
+	await summaryRelay.activateRegistration("summary", "summary-generation", "summary-session", () => true,
+		undefined, false, true, {
+			controlIds: ["github-refresh-reconcile"],
+			execute: async (request) => {
+				invokedCommands.push(request);
+				return { ok: true, message: "Refresh started" };
+			},
+		});
+	await summaryRelay.queueManagerPresentation("summary", "summary-generation", "summary-session", presentation);
+	await waitFor(async () => (await summaryState.projectSummaries())[0]?.summary.delivery?.presentation?.revision === presentation.revision,
+		"current manager summary delivery");
+	const summary = (await summaryState.projectSummaries())[0];
+	assert.ok(summary, "current summary state must remain mapped");
+	const interactionTransport = new DiscordJsTransport();
+	interactionTransport.onPresentationControl((request) => summaryRelay.executeDiscordPresentationControl(request));
+	const summaryReplies = [];
+	await interactionTransport.executePresentationControlInteraction({
+		id: "current-summary-control", guildId: "guild",
+		message: { id: summary.summary.delivery.messageId, channelId: summary.mapping.channelId },
+		customId: `m:${presentation.revision}:github-refresh-reconcile`,
+		async deferReply() {}, async editReply(reply) { summaryReplies.push(reply); },
+	}, "wrong-interaction-channel");
+	assert.deepEqual(invokedCommands, [{
+		requestId: "current-summary-control", revision: presentation.revision,
+		controlId: "github-refresh-reconcile", command: "github-refresh-reconcile",
+	}], "current summary control invokes canonical Manager command");
+	assert.equal(summaryReplies[0].content, "✅ Refresh started");
+	assert.deepEqual(await summaryRelay.executeDiscordPresentationControl({
+		requestId: "unrelated-summary-control", guildId: "guild", channelId: "unrelated-channel",
+		messageId: summary.summary.delivery.messageId,
+		customId: `m:${presentation.revision}:github-refresh-reconcile`,
+	}), { ok: false, message: "This manager presentation control is not mapped to a current project summary." },
+	"unrelated presentation controls remain rejected");
+	await summaryRelay.stop();
 
 	const files = [
 		"extensions/discord/bridge.ts", "extensions/discord/controls.ts", "extensions/discord/index.ts",

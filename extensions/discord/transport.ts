@@ -344,7 +344,7 @@ export class DiscordJsTransport implements DiscordTransport {
 			const channelId = interactionChannels.resolve(interaction);
 			if (interaction.isButton()) {
 				dispatchManagerPresentationButton(interaction, (button) => {
-					void this.executePresentationControlInteraction(button, channelId);
+					void this.executePresentationControlInteraction(button);
 				});
 				return;
 			}
@@ -785,7 +785,6 @@ export class DiscordJsTransport implements DiscordTransport {
 
 	private async executePresentationControlInteraction(
 		interaction: import("discord.js").ButtonInteraction,
-		channelId?: string,
 	): Promise<void> {
 		try {
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds });
@@ -795,7 +794,8 @@ export class DiscordJsTransport implements DiscordTransport {
 		let result: DiscordPresentationControlResult;
 		const listener = this.presentationControlListeners.values().next().value;
 		try {
-			if (!channelId) throw new Error("Discord interaction did not identify its channel.");
+			const channelId = interaction.message.channelId;
+			if (!channelId) throw new Error("Discord interaction did not identify its message channel.");
 			result = listener ? await listener({
 				requestId: interaction.id,
 				...(interaction.guildId ? { guildId: interaction.guildId } : {}),
