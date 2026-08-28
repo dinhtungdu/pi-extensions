@@ -44,6 +44,7 @@ export default function toolVisibilityExtension(pi: ExtensionAPI) {
 		} catch (error) {
 			compatibilityError = error instanceof Error ? error.message : String(error);
 		}
+		if (controller) syncThinkingLabel(ctx, controller);
 		updateStatus(ctx);
 		if (compatibilityError) ctx.ui.notify(compatibilityError, "error");
 	}

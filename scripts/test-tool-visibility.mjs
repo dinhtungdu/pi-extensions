@@ -146,8 +146,8 @@ try {
 	);
 
 	const first = installToolVisibilityShim();
-	assert.equal(first.isVisible(), true, "tool rows must default to visible");
-	assert.deepEqual(existing.render(100), initialRows, "installing must not alter visible rows");
+	assert.equal(first.isVisible(), false, "tool rows must default to hidden");
+	assert.deepEqual(existing.render(100), [], "installing must hide existing tool rows");
 
 	first.setVisible(false);
 	thinkingOnly.setHiddenThinkingLabel(COMPACT_HIDDEN_THINKING_LABEL);
@@ -267,6 +267,7 @@ try {
 	const futureRow = new FutureToolRow();
 	const futureAssistant = new FutureAssistantRow();
 	assert.equal(future.diagnostics().patched, true, "renamed private fields must not affect compatibility");
+	future.setVisible(true);
 	assert.deepEqual(futureRow.render(42, "extra"), ["42:extra"], "compatible future renders must pass through");
 	assert.deepEqual(futureRow.calls, [[42, "extra"]], "the shim must forward every render argument");
 	assert.equal("hideThinkingBlock" in futureAssistant, false, "fixture must not expose Pi's private field names");
@@ -372,15 +373,31 @@ try {
 	);
 	assert.deepEqual(
 		harness.statuses.at(-1),
-		[PACKAGE_FOOTER_STATUS_KEYS.toolVisibility, undefined],
-		"startup must leave the footer clear while tools are shown",
+		[PACKAGE_FOOTER_STATUS_KEYS.toolVisibility, "🧰"],
+		"startup must mark hidden tools in the footer",
 	);
-	assert.deepEqual(harness.thinkingLabelCalls, [], "default mode must not alter Pi's thinking label");
+	assert.deepEqual(
+		harness.thinkingLabelCalls.at(-1),
+		[COMPACT_HIDDEN_THINKING_LABEL],
+		"startup must apply the public thinking-label marker while tools are hidden",
+	);
 	assert.deepEqual(harness.workingCalls, [], "tool visibility must not alter Pi's working indicator");
 
 	const newRow = createToolRow("new_custom_tool");
+	assert.deepEqual(newRow.render(80), [], "startup must hide newly-created arbitrary tool rows");
+	await harness.command("tools", "show");
+	assert.ok(newRow.render(80).length > 0, "/tools show must restore hidden tool rows");
+	const shownLaterRow = createToolRow("shown_later_tool");
+	assert.ok(shownLaterRow.render(80).length > 0, "/tools show must reveal later tool rows");
+	assert.deepEqual(
+		harness.statuses.at(-1),
+		[PACKAGE_FOOTER_STATUS_KEYS.toolVisibility, undefined],
+		"showing tools must clear the footer status",
+	);
+	assert.deepEqual(harness.thinkingLabelCalls.at(-1), [], "shown mode must restore Pi's thinking label");
+
 	await harness.command("tools");
-	assert.deepEqual(newRow.render(80), [], "bare /tools must hide newly-created arbitrary tool rows");
+	assert.deepEqual(newRow.render(80), [], "bare /tools must toggle shown rows back to hidden");
 	assert.deepEqual(harness.notifications.at(-1), ["TOOLS: hidden", "info"]);
 	assert.equal(harness.statuses.at(-1)[1], "🧰", "only hidden mode must use the compact tool icon");
 	assert.deepEqual(
@@ -388,7 +405,6 @@ try {
 		[COMPACT_HIDDEN_THINKING_LABEL],
 		"hidden mode must apply the public thinking-label marker",
 	);
-
 	await harness.command("tools");
 	assert.ok(newRow.render(80).length > 0, "bare /tools must toggle hidden rows back to shown");
 	assert.deepEqual(
