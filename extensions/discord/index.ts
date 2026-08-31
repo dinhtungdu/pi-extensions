@@ -487,9 +487,9 @@ export function createDiscordExtension(dependencies: DiscordExtensionDependencie
 			}
 		}
 
-		pi.on("session_start", async (_event, ctx) => {
+		pi.on("session_start", (_event, ctx) => {
 			currentCtx = ctx;
-			await serialize(() => autoStartForCwd(ctx.cwd) ? startBridge(ctx, false) : stopBridge(ctx));
+			void serialize(() => autoStartForCwd(ctx.cwd) ? startBridge(ctx, false) : stopBridge(ctx));
 		});
 
 		pi.on("session_shutdown", async (_event, ctx) => {

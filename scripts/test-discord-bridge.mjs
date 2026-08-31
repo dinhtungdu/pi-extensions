@@ -61,6 +61,7 @@ try {
 	const importBuilt = (path) => import(pathToFileURL(join(output, path)));
 	const { isClientFrame, isServerFrame } = await importBuilt("extensions/discord/protocol.js");
 	const { DiscordJsTransport } = await importBuilt("extensions/discord/transport.js");
+	const { createDiscordExtension } = await importBuilt("extensions/discord/index.js");
 	const { DiscordRelayCore } = await importBuilt("extensions/discord/relay-core.js");
 	const { DiscordStateStore } = await importBuilt("extensions/discord/state.js");
 
@@ -73,6 +74,28 @@ try {
 		type: "manager_presentation_control", requestId: "presentation", revision: "a".repeat(64),
 		controlId: "github-refresh-reconcile", command: "github-refresh-reconcile",
 	}), true, "Manager presentation buttons retain protocol support");
+
+	const extensionHandlers = new Map();
+	let resolveConfig;
+	let configLoadStarted = false;
+	createDiscordExtension({
+		autoStartForCwd: () => true,
+		loadConfig: () => {
+			configLoadStarted = true;
+			return new Promise((resolveConfigLoad) => { resolveConfig = resolveConfigLoad; });
+		},
+	})({
+		events: { on() { return () => {}; } },
+		on(event, handler) { extensionHandlers.set(event, handler); },
+		registerCommand() {},
+	});
+	const startupResult = extensionHandlers.get("session_start")({}, {
+		cwd: root,
+		ui: { notify() {}, setStatus() {} },
+	});
+	assert.equal(startupResult, undefined, "Discord startup must not delay Pi session startup");
+	await waitFor(() => configLoadStarted, "deferred Discord configuration load");
+	resolveConfig(null);
 
 	const registrationEvents = [];
 	const transport = new DiscordJsTransport();
