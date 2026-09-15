@@ -27,7 +27,7 @@ Selected extensions only:
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
 			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/codex-fast.ts", "extensions/discord/index.ts", "extensions/pstack/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
-			"skills": ["skills/pstack"],
+			"skills": ["skills/pstack/**"],
 			"prompts": [],
 			"themes": []
 		}
@@ -111,7 +111,7 @@ The port preserves all 47 skills from the pinned current upstream and adapts the
 /skill:swarm <task>
 ```
 
-Registers tools: `subagent`, `pstack_config`, and `pstack_sessions`. `subagent` enforces a read/grep/find/ls-only tool set when a task sets `readonly: true`. Child agents run as bounded local Pi processes in the parent's working directory with extensions disabled, no Manager environment variables, and no session persistence. Parallel writers still require isolated worktrees or disjoint scratch paths. Push, PR, merge, deploy, cleanup, and Manager lifecycle authority stay with the parent/user.
+Registers tools: `subagent`, `pstack_config`, and `pstack_sessions`. `subagent` enforces a read/grep/find/ls-only tool set when a task sets `readonly: true`. Child agents run as bounded local Pi processes in the parent's working directory with offline startup, extensions disabled, no Manager environment variables, and no session persistence. Parallel writers still require isolated worktrees or disjoint scratch paths. Push, PR, merge, deploy, cleanup, and Manager lifecycle authority stay with the parent/user.
 
 Model roles default to the parent model and are stored in `~/.pi/agent/pstack/models.json` only after explicit setup. Fixed upstream model slugs are not copied.
 

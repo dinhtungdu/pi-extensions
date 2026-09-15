@@ -28,7 +28,7 @@ Use only integrations already available and authenticated. Missing or unauthoriz
 
 ## Investigate
 
-For a narrow question, search directly. The parent may batch independent MCP reads with the available MCP orchestration tool. For large local source-control histories or already-fetched evidence, call one parallel `subagent` with `poteto-agent` tasks, `role: "why investigators"`, and `readonly: true`, [the investigator prompt](references/investigator-prompt.md). Pass fetched external evidence into the brief; never tell a child to discover or call an MCP. Source playbooks guide the parent query only.
+For a narrow question, search directly. The parent gathers Git history and diffs and may batch independent MCP reads with the available MCP orchestration tool. For large evidence sets, call one parallel `subagent` with `poteto-agent` tasks, `role: "why investigators"`, and `readonly: true`, [the investigator prompt](references/investigator-prompt.md). Pass all fetched Git and external evidence into the brief; children only reduce supplied evidence and inspect named source files. Never tell a child to query Git or discover/call an MCP. Source playbooks guide the parent query only.
 
 Each result returns exact identifiers, dates, links where available, quotations or code locations. Null results are findings. Distinguish "searched and absent" from "not searchable".
 

@@ -1,6 +1,6 @@
 # Investigator Prompt Template
 
-Build each investigator's prompt from this template. Fill in the placeholders. The parent uses `sources/<source>.md` to fetch external evidence before delegation, then includes that evidence here. Isolated Pi children run without extensions: they may inspect local code and Git, but must not discover or call MCPs. If the target looks defensive, the parent also uses `sources/incident-postmortem.md` to collect relevant evidence.
+Build each investigator's prompt from this template. Fill in the placeholders. The parent gathers Git history/diffs and uses `sources/<source>.md` to fetch external evidence before delegation, then includes that evidence here. Isolated Pi children use read-only file tools: they may inspect named source files and reduce the supplied evidence, but cannot query Git or discover/call MCPs. If the target looks defensive, the parent also uses `sources/incident-postmortem.md` to collect relevant evidence.
 
 ---
 
@@ -48,7 +48,7 @@ Gather **evidence**. Don't answer the question directly. The synthesizer weighs 
 
 1. **Cast a wide net first.** Start broad so you don't miss related context, then narrow in on specific items.
 2. **Read the whole available item.** Read local source items or the complete parent-provided PR, ticket, document, or thread evidence, not just a title or summary. If only a summary was provided, report the missing source as a gap.
-3. **Follow local links only.** Follow commits and files available in the checkout. For external PRs, tickets, documents, or threads not included by the parent, record the link under "Additional Leads" rather than querying it yourself.
+3. **Follow supplied evidence and named source files only.** For commits, PRs, tickets, documents, or threads not included by the parent, record the identifier under "Additional Leads" rather than querying it yourself.
 4. **Capture quotes verbatim** with their location (PR number, ticket ID, URL, commit hash, file:line). The synthesizer needs to cite this precisely.
 5. **Note absences.** If you searched for something and came up empty, that's also a finding. Record what you searched for and what you didn't find.
 6. **Watch for contradictions.** If two items in your source disagree, record both. Don't suppress the inconvenient one.

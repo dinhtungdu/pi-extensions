@@ -69,6 +69,12 @@ interface AgentDefinition {
 	prompt: string;
 }
 
+interface PreparedTask {
+	task: TaskInput;
+	agent: AgentDefinition;
+	model?: string;
+}
+
 interface ChildResult {
 	agent: string;
 	task: string;
@@ -216,6 +222,18 @@ async function writeConfig(config: PstackConfig): Promise<void> {
 	await rename(temporary, target);
 }
 
+let configMutationQueue = Promise.resolve();
+
+function mutateConfig(update: (config: PstackConfig) => PstackConfig): Promise<PstackConfig> {
+	const operation = configMutationQueue.then(async () => {
+		const config = update(await readConfig());
+		await writeConfig(config);
+		return config;
+	});
+	configMutationQueue = operation.then(() => undefined, () => undefined);
+	return operation;
+}
+
 function parseTools(value: unknown): string[] | undefined {
 	const values = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
 	const tools = values.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
@@ -337,6 +355,7 @@ async function runChild(
 		"json",
 		"--print",
 		"--no-session",
+		"--offline",
 		"--no-extensions",
 		"--no-skills",
 		"--no-prompt-templates",
@@ -418,14 +437,20 @@ async function mapLimited<T>(
 ): Promise<ChildResult[]> {
 	const results: ChildResult[] = [];
 	let next = 0;
+	let failure: { error: unknown } | undefined;
 	await Promise.all(
 		Array.from({ length: Math.min(MAX_CONCURRENCY, items.length) }, async () => {
-			while (next < items.length && !signal?.aborted) {
+			while (next < items.length && !signal?.aborted && !failure) {
 				const index = next++;
-				results[index] = await fn(items[index], index);
+				try {
+					results[index] = await fn(items[index], index);
+				} catch (error) {
+					failure ??= { error };
+				}
 			}
 		}),
 	);
+	if (failure) throw failure.error;
 	return results;
 }
 
@@ -464,7 +489,7 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 
 	pi.on("input", (event, ctx) => {
 		if (event.source !== "extension") {
-			const activation = event.text.match(/^\/skill:poteto-mode(?:\s+(.*))?$/);
+			const activation = event.text.match(/^\/skill:poteto-mode(?:\s+([\s\S]*))?$/);
 			if (activation) setMode(ctx, !/^(off|disable|stop)$/i.test(activation[1]?.trim() ?? ""));
 		}
 		return { action: "continue" } as const;
@@ -503,7 +528,7 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (action === "reset") {
-				await writeConfig(defaultConfig());
+				await mutateConfig(() => defaultConfig());
 				ctx.ui.notify(`Reset pstack models to inherit the parent model: ${configPath()}`, "info");
 				return;
 			}
@@ -515,9 +540,10 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 			if (!role) return;
 			const model = await ctx.ui.select(`Model for ${role}`, ["inherit-parent", ...availableModels(ctx)]);
 			if (!model) return;
-			const config = await readConfig();
-			config.roles[role as PstackRole] = model;
-			await writeConfig(config);
+			await mutateConfig((config) => {
+				config.roles[role as PstackRole] = model;
+				return config;
+			});
 			ctx.ui.notify(`Saved ${role}: ${model} to ${configPath()}`, "info");
 		},
 	});
@@ -532,17 +558,22 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 			if (params.action === "list-models") {
 				return { content: [{ type: "text", text: ["inherit-parent", ...models].join("\n") }], details: { models } };
 			}
-			if (params.action === "reset") await writeConfig(defaultConfig());
-			const config = await readConfig();
+			if (!["get", "set", "reset"].includes(params.action)) throw new Error("pstack_config action must be get, list-models, set, or reset.");
+			let config: PstackConfig;
 			if (params.action === "set") {
 				if (!params.role || !PSTACK_ROLE_NAMES.includes(params.role as PstackRole)) throw new Error("pstack_config set requires a listed role.");
 				const values = params.models ?? (params.model ? [params.model] : []);
 				if (!values.length || (params.model && params.models)) throw new Error("pstack_config set requires exactly one of model or models.");
 				validateModels(values, models);
-				config.roles[params.role as PstackRole] = params.models ? [...values] : values[0];
-				await writeConfig(config);
+				config = await mutateConfig((current) => {
+					current.roles[params.role as PstackRole] = params.models ? [...values] : values[0];
+					return current;
+				});
+			} else if (params.action === "reset") {
+				config = await mutateConfig(() => defaultConfig());
+			} else {
+				config = await readConfig();
 			}
-			if (!["get", "set", "reset"].includes(params.action)) throw new Error("pstack_config action must be get, list-models, set, or reset.");
 			return { content: [{ type: "text", text: JSON.stringify(config, null, "\t") }], details: config };
 		},
 	});
@@ -581,13 +612,16 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 				if (!agent) throw new Error(`Unknown pstack agent ${JSON.stringify(name)}. Available: ${agents.map((item) => item.name).join(", ")}.`);
 				return agent;
 			};
-			const run = async (task: TaskInput, index: number, update?: (result: ChildResult) => void) => {
+			const prepare = (task: TaskInput, index: number): PreparedTask => {
 				if (!task.task.trim()) throw new Error("Subagent task must not be blank.");
 				if (task.role && !PSTACK_ROLE_NAMES.includes(task.role as PstackRole)) throw new Error(`Unknown pstack role: ${task.role}.`);
 				const model = modelForTask(task, index, config, parentModel);
 				if (model) validateModels([model], knownModels);
-				return runChild(ctx.cwd, task, findAgent(task.agent), model, signal, update);
+				return { task, agent: findAgent(task.agent), model };
 			};
+			const prepared = (params.tasks ?? single!).map(prepare);
+			const run = (item: PreparedTask, update?: (result: ChildResult) => void) =>
+				runChild(ctx.cwd, item.task, item.agent, item.model, signal, update);
 			const emit = (results: ChildResult[]) => onUpdate?.({
 				content: [{ type: "text", text: results.map((result) => `${result.agent}: ${result.output || "(running...)"}`).join("\n\n") }],
 				details: { results },
@@ -595,7 +629,7 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 
 			if (params.tasks?.length) {
 				const updates: ChildResult[] = [];
-				const results = await mapLimited(params.tasks, signal, async (task, index) => run(task, index, (update) => {
+				const results = await mapLimited(prepared, signal, async (item, index) => run(item, (update) => {
 					updates[index] = update;
 					emit(updates.filter(Boolean));
 				}));
@@ -604,8 +638,7 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: limitBytes(report, MAX_OUTPUT_BYTES) }], details: { mode: "parallel", results }, usage: combinedUsage(results) };
 			}
 
-			const task = single![0];
-			const result = await run(task, 0, (update) => emit([update]));
+			const result = await run(prepared[0], (update) => emit([update]));
 			if (childFailed(result)) throw new Error(`Subagent failed: ${childFailure(result)}`);
 			return { content: [{ type: "text", text: limitBytes(result.output, MAX_OUTPUT_BYTES) }], details: { mode: "single", results: [result] }, usage: result.usage };
 		},

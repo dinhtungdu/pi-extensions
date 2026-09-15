@@ -2,7 +2,8 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cp, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -14,6 +15,7 @@ if (process.argv.includes("--mode") && process.argv.includes("--no-session")) {
 	if (
 		!prompt.includes("never mutate it") ||
 		!prompt.includes("pi-port.md") ||
+		!process.argv.includes("--offline") ||
 		!process.argv.includes("--no-extensions") ||
 		!process.argv.includes("--no-skills") ||
 		!process.argv.includes("--no-prompt-templates") ||
@@ -22,6 +24,8 @@ if (process.argv.includes("--mode") && process.argv.includes("--no-session")) {
 		console.error("missing delegated authority isolation");
 		process.exit(3);
 	}
+	const marker = task.match(/spawn-marker:([^\s]+)/)?.[1];
+	if (marker) await writeFile(marker, "spawned");
 	const modelIndex = process.argv.indexOf("--model");
 	const toolsIndex = process.argv.indexOf("--tools");
 	if (task.includes("assert-readonly") && process.argv[toolsIndex + 1] !== "read,grep,find,ls") {
@@ -181,6 +185,9 @@ try {
 	assert.deepEqual(harness.entries.at(-1).data, { enabled: true });
 	await harness.emit("input", { source: "user", text: "/skill:poteto-mode off" });
 	assert.deepEqual(harness.entries.at(-1).data, { enabled: false });
+	await harness.emit("input", { source: "user", text: "/skill:poteto-mode implement this\nThen verify it" });
+	assert.deepEqual(harness.entries.at(-1).data, { enabled: true });
+	await harness.emit("input", { source: "user", text: "/skill:poteto-mode off" });
 	await harness.emit("input", { source: "user", text: "/skill:poteto-mode fix it" });
 	await harness.emit("session_tree");
 	assert.deepEqual(harness.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.pstack, "🥔 poteto"]);
@@ -199,6 +206,13 @@ try {
 		harness.tool("pstack_config", { action: "set", role: "bug-fix", model: "missing/model" }),
 		/Unknown Pi model/,
 	);
+	await Promise.all([
+		harness.tool("pstack_config", { action: "set", role: "bug-fix", model: "test/model" }),
+		harness.tool("pstack_config", { action: "set", role: "perf-issue", model: "other/reviewer" }),
+	]);
+	const concurrentConfig = (await harness.tool("pstack_config", { action: "get" })).details;
+	assert.equal(concurrentConfig.roles["bug-fix"], "test/model");
+	assert.equal(concurrentConfig.roles["perf-issue"], "other/reviewer");
 	await harness.tool("pstack_config", { action: "reset" });
 
 	const single = await harness.tool("subagent", {
@@ -218,6 +232,17 @@ try {
 	assert.match(truncated.content[0].text, /Output truncated/);
 	await assert.rejects(harness.tool("subagent", { agent: "missing", task: "x" }), /Unknown pstack agent/);
 	await assert.rejects(harness.tool("subagent", { agent: "poteto-agent", task: "x", role: "missing" }), /Unknown pstack role/);
+	const spawnMarker = join(output, "invalid-batch-spawned");
+	await assert.rejects(
+		harness.tool("subagent", {
+			tasks: [
+				{ agent: "poteto-agent", task: `spawn-marker:${spawnMarker}` },
+				{ agent: "poteto-agent", task: "invalid model", model: "missing/model" },
+			],
+		}),
+		/Unknown Pi model/,
+	);
+	await assert.rejects(stat(spawnMarker), /ENOENT/);
 	await assert.rejects(
 		harness.tool("subagent", { agent: "poteto-agent", task: "x", tasks: [{ agent: "poteto-agent", task: "y" }] }),
 		/exactly one subagent mode/,
@@ -276,6 +301,12 @@ try {
 	}
 	await collect(skillRoot);
 	markdownFiles.push(join(root, "PSTACK.md"));
+	const whySkill = await readFile(join(skillRoot, "why", "SKILL.md"), "utf8");
+	const investigatorPrompt = await readFile(join(skillRoot, "why", "references", "investigator-prompt.md"), "utf8");
+	assert.match(whySkill, /parent gathers Git history and diffs/);
+	assert.match(whySkill, /Pass all fetched Git and external evidence/);
+	assert.match(investigatorPrompt, /cannot query Git/);
+	assert.doesNotMatch(investigatorPrompt, /may inspect local code and Git/i);
 	const forbidden = /(subagent_type|run_in_background|is_background|AskQuestion|grok-4|claude-fable|cursor-team-kit|scripts\/(?:orch|watch-pr)|worktree-audit|\.cursor\/)/;
 	for (const file of markdownFiles) {
 		const text = await readFile(file, "utf8");
@@ -288,10 +319,34 @@ try {
 	}
 	await assert.rejects(readdir(join(skillRoot, "poteto-mode", "scripts")), /ENOENT/);
 
+	const readme = await readFile(join(root, "README.md"), "utf8");
+	const skillFilter = readme.match(/"skills": \["(skills\/pstack\/\*\*)"\]/)?.[1];
+	assert.equal(skillFilter, "skills/pstack/**");
+	const loader = new DefaultResourceLoader({
+		cwd: root,
+		agentDir: join(output, "loader-agent"),
+		settingsManager: SettingsManager.inMemory({ packages: [{ source: root, extensions: [], skills: [skillFilter] }] }),
+		noExtensions: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		noContextFiles: true,
+	});
+	await loader.reload();
+	const loadedSkills = loader.getSkills();
+	assert.equal(loadedSkills.diagnostics.length, 0);
+	assert.equal(loadedSkills.skills.filter((skill) => skill.filePath.startsWith(skillRoot)).length, 47);
+
+	const smokeAgent = join(output, "smoke-agent");
+	await mkdir(smokeAgent, { recursive: true });
+	await writeFile(
+		join(smokeAgent, "settings.json"),
+		JSON.stringify({ packages: ["git:github.com/pi-pstack-tests/definitely-missing"] }),
+	);
 	const smoke = spawnSync(
 		"pi",
 		[
 			"--no-session",
+			"--offline",
 			"--no-extensions",
 			"--no-skills",
 			"--extension",
@@ -301,10 +356,11 @@ try {
 			"--print",
 			"/poteto-mode off",
 		],
-		{ cwd: root, encoding: "utf8", env: { ...process.env, PI_CODING_AGENT_DIR: join(output, "smoke-agent") } },
+		{ cwd: root, encoding: "utf8", env: { ...process.env, PI_CODING_AGENT_DIR: smokeAgent } },
 	);
 	assert.equal(smoke.status, 0, `Pi smoke failed:\n${smoke.stdout}\n${smoke.stderr}`);
 	assert.doesNotMatch(`${smoke.stdout}\n${smoke.stderr}`, /(?:failed|error).*(?:skill|extension)/i);
+	await assert.rejects(stat(join(smokeAgent, "git", "github.com", "pi-pstack-tests", "definitely-missing")), /ENOENT/);
 
 	console.log("pstack tests passed");
 } finally {

@@ -18,7 +18,7 @@ Upstream is MIT licensed, Copyright © 2026 Lauren Tan. Its exact notice is reta
 ## Local integration
 
 - `package.json` discovers all 47 adapted skill directories through `skills/pstack/`.
-- `extensions/pstack/index.ts` owns sticky `/poteto-mode`, `/setup-pstack`, model-role configuration, current-workspace session listing, and bounded isolated child Pi execution. Read-only tasks receive only read/grep/find/ls tools.
+- `extensions/pstack/index.ts` owns sticky `/poteto-mode`, `/setup-pstack`, model-role configuration, current-workspace session listing, and bounded isolated child Pi execution. Child startup is offline; read-only tasks receive only read/grep/find/ls tools.
 - `agents/pstack/` contains the two bundled child prompts.
 - `skills/pstack/poteto-mode/references/pi-port.md` is the runtime authority/capability contract applied to imported workflows.
 - Existing theme, Codemode, goal, Codex, Discord, tool-visibility, voice, Git, browser, and Manager behavior remains owned by existing project machinery.
@@ -57,7 +57,7 @@ Manager owns the weekly cron notification and routes the agent: reuse active tas
    npm pack --dry-run
    ```
 
-   `test:pstack` checks all 47 skill resources, internal Markdown links, unsupported vocabulary, license hash, sticky state, configuration, delegated success/failure/cancellation/policy isolation, and a fresh Pi load/command smoke.
+   `test:pstack` checks all 47 skill resources, recursive package filtering, internal Markdown links, unsupported vocabulary, license hash, multiline sticky state, concurrent configuration, delegated preflight/success/failure/cancellation/policy isolation, offline startup, and a fresh Pi load/command smoke.
 
 6. Inspect `git diff --check`, the full diff, and `git status --short`. Commit intended files only:
 

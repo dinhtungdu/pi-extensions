@@ -9,7 +9,7 @@ This package ports pstack to Pi. These rules override incompatible assumptions i
 - Model roles default to the parent model. `/setup-pstack` configures one role interactively. `pstack_config` lists valid `provider/model` identifiers and supports explicit configuration.
 - The active transcript is `$PI_SESSION_FILE`. `pstack_sessions` lists saved sessions for the current working directory. Do not scan another project's session store.
 - Optional MCP, browser, forge, simulator, observability, issue-tracker, or chat integrations are used only when available and authorized. Missing capability is a reported gap, never invented evidence.
-- Pi has no native background cloud-agent lifecycle in this port. A `subagent` call waits for isolated child processes and returns their terminal results.
+- Pi has no native background cloud-agent lifecycle in this port. A `subagent` call waits for isolated child processes with offline startup and returns their terminal results.
 - Use the repository's available checks and skills. If a named upstream helper is absent, perform its documented intent with native tools or report the exact missing capability.
 
 ## Authority boundary
