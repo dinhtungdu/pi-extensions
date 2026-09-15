@@ -1,7 +1,7 @@
 {
 	"name": "pi-extensions",
 	"version": "0.1.1",
-	"description": "Pi extensions for macOS themes, Codemode orchestration, persisted goals, OpenAI Codex fast mode, Discord bridging, and local hands-free voice.",
+	"description": "Pi extensions for themes, orchestration, persisted goals, pstack workflows, Codex fast mode, Discord bridging, and voice.",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -20,6 +20,8 @@
 		"dark-mode",
 		"codemode",
 		"goal",
+		"pstack",
+		"poteto-mode",
 		"openai-codex",
 		"fast-mode",
 		"discord",
@@ -34,8 +36,12 @@
 			"./extensions/goal.ts",
 			"./extensions/codex-fast.ts",
 			"./extensions/discord/index.ts",
+			"./extensions/pstack/index.ts",
 			"./extensions/tool-visibility/index.ts",
 			"./extensions/voice/index.ts"
+		],
+		"skills": [
+			"./skills/pstack"
 		]
 	},
 	"peerDependencies": {
@@ -51,9 +57,10 @@
 	},
 	"scripts": {
 		"check": "tsc --noEmit",
-		"lint": "oxlint extensions/codex-fast.ts extensions/discord scripts/test-codex-fast.mjs scripts/test-discord*.mjs scripts/fixtures/discord-*.mjs",
+		"lint": "oxlint extensions/codex-fast.ts extensions/discord extensions/pstack scripts/test-codex-fast.mjs scripts/test-discord*.mjs scripts/test-pstack.mjs scripts/fixtures/discord-*.mjs",
 		"test:codex-fast": "node ./scripts/test-codex-fast.mjs",
 		"test:discord": "node ./scripts/test-discord-config.mjs && node ./scripts/test-discord-bridge.mjs && node ./scripts/test-discord-relay-child.mjs",
+		"test:pstack": "node ./scripts/test-pstack.mjs",
 		"test:tool-visibility": "node ./scripts/test-tool-visibility.mjs",
 		"setup:voice": "node ./scripts/setup-voice.mjs",
 		"uninstall:voice": "node ./scripts/uninstall-voice.mjs",

@@ -5,6 +5,7 @@ Pi extensions:
 - `auto-dark-mode` — macOS dark/light theme switching
 - `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 - `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
+- `pstack` — 47 adapted engineering workflow skills, sticky Poteto Mode, model roles, and isolated Pi subagents
 - `codex-fast` — persistently toggle OpenAI Codex Fast mode and show `⚡` while active
 - `discord` — automatic Discord project channels and Pi session threads with bidirectional text mirroring
 - `tool-visibility` — hide/show all tool execution rows without changing tools, messages, or session history
@@ -25,8 +26,8 @@ Selected extensions only:
 	"packages": [
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
-			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/codex-fast.ts", "extensions/discord/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
-			"skills": [],
+			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/codex-fast.ts", "extensions/discord/index.ts", "extensions/pstack/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
+			"skills": ["skills/pstack"],
 			"prompts": [],
 			"themes": []
 		}
@@ -44,6 +45,7 @@ pi -e ./extensions/code-mode.ts
 pi -e ./extensions/goal.ts
 pi -e ./extensions/codex-fast.ts
 pi -e ./extensions/discord/index.ts
+pi -e ./extensions/pstack/index.ts --skill ./skills/pstack
 pi -e ./extensions/tool-visibility/index.ts
 pi -e ./extensions/voice/index.ts
 pi install /path/to/pi-extensions
@@ -93,6 +95,27 @@ Notes:
 - Active goals auto-continue with hidden continuation messages until `update_goal({ status: "complete" })`, `/goal pause`, `/goal clear`, budget exhaustion, or a no-tool continuation.
 - Goal state is stored in the pi session branch via custom entries; it survives reload/resume/fork.
 - Objectives should include scope, success criteria, constraints, and verification commands.
+
+## Pstack
+
+The port preserves all 47 skills from the pinned current upstream and adapts their commands, model selection, session handling, delegation, and authority rules to Pi.
+
+```text
+/poteto-mode <task>       # enable sticky mode and start the task
+/poteto-mode off          # disable it for this session
+/setup-pstack             # configure one model role
+/setup-pstack status
+/setup-pstack reset
+/skill:architect <task>
+/skill:interrogate <scope>
+/skill:swarm <task>
+```
+
+Registers tools: `subagent`, `pstack_config`, and `pstack_sessions`. `subagent` enforces a read/grep/find/ls-only tool set when a task sets `readonly: true`. Child agents run as bounded local Pi processes in the parent's working directory with extensions disabled, no Manager environment variables, and no session persistence. Parallel writers still require isolated worktrees or disjoint scratch paths. Push, PR, merge, deploy, cleanup, and Manager lifecycle authority stay with the parent/user.
+
+Model roles default to the parent model and are stored in `~/.pi/agent/pstack/models.json` only after explicit setup. Fixed upstream model slugs are not copied.
+
+See [`PSTACK.md`](PSTACK.md) for exact upstream/reference revisions, drift, omissions, license provenance, and the weekly agent maintenance procedure.
 
 ## OpenAI Codex fast mode
 
