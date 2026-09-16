@@ -11,13 +11,17 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { PACKAGE_FOOTER_STATUS_KEYS } from "../footer-status.js";
 
 const MODE_ENTRY = "pi-extensions-pstack-mode";
+const TASK_WIDGET_KEY = "pi-extensions-pstack-tasks";
+const TASK_COMPLETE_MESSAGE = "pi-extensions-pstack-batch-complete";
 const STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.pstack;
 const MAX_TASKS = 8;
 const MAX_CONCURRENCY = 4;
+const MAX_OUTSTANDING_TASKS = 16;
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_STDERR_BYTES = 16 * 1024;
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -87,6 +91,31 @@ interface ChildResult {
 	usage: Usage;
 }
 
+type BackgroundTaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+
+interface BackgroundTask {
+	id: string;
+	batchId: string;
+	prepared: PreparedTask;
+	status: BackgroundTaskStatus;
+	createdAt: number;
+	startedAt?: number;
+	finishedAt?: number;
+	latest: string;
+	controller: AbortController;
+	cancelRequested: boolean;
+	result?: ChildResult;
+	completion?: Promise<void>;
+	generation: number;
+}
+
+interface BackgroundBatch {
+	id: string;
+	taskIds: string[];
+	notified: boolean;
+	generation: number;
+}
+
 interface ChildMessage {
 	role?: string;
 	content?: Array<{ type?: string; text?: string }>;
@@ -146,6 +175,16 @@ const ConfigParams = Type.Object(
 
 type ConfigInput = Static<typeof ConfigParams>;
 
+const TasksParams = Type.Object(
+	{
+		action: Type.String({ description: "list, get, or cancel" }),
+		id: Type.Optional(Type.String({ description: "Batch or task ID for get/cancel." })),
+	},
+	{ additionalProperties: false },
+);
+
+type TasksInput = Static<typeof TasksParams>;
+
 function emptyUsage(): Usage {
 	return {
 		input: 0,
@@ -169,12 +208,6 @@ function addUsage(target: Usage, value: Usage | undefined): void {
 	target.cost.cacheRead += value.cost?.cacheRead ?? 0;
 	target.cost.cacheWrite += value.cost?.cacheWrite ?? 0;
 	target.cost.total += value.cost?.total ?? 0;
-}
-
-function combinedUsage(results: ChildResult[]): Usage {
-	const usage = emptyUsage();
-	for (const result of results) addUsage(usage, result.usage);
-	return usage;
 }
 
 function configPath(): string {
@@ -311,21 +344,69 @@ function piInvocation(args: string[]): { command: string; args: string[] } {
 		: { command: process.execPath, args };
 }
 
-function processJsonLine(line: string, result: ChildResult): boolean {
-	if (!line.trim()) return false;
+function latestLine(text: string): string {
+	const line = text.split(/\r?\n/).map((item) => item.trim()).filter(Boolean).at(-1) ?? "";
+	return [...line].slice(-120).join("");
+}
+
+function processJsonLine(
+	line: string,
+	result: ChildResult,
+	stream: { draft: string },
+	onProgress?: (status: string) => void,
+): void {
+	if (!line.trim()) return;
 	try {
-		const event = JSON.parse(line) as { type?: string; message?: ChildMessage };
-		if (event.type !== "message_end" || event.message?.role !== "assistant") return false;
+		const event = JSON.parse(line) as {
+			type?: string;
+			message?: ChildMessage;
+			assistantMessageEvent?: { type?: string; delta?: string; content?: string };
+			toolName?: string;
+			isError?: boolean;
+			attempt?: number;
+			maxAttempts?: number;
+		};
+		if (event.type === "message_update") {
+			const update = event.assistantMessageEvent;
+			if (update?.type === "text_start") stream.draft = "";
+			if (update?.type === "text_delta" && update.delta) {
+				stream.draft = [...stream.draft, ...update.delta].slice(-2_000).join("");
+				const status = latestLine(stream.draft);
+				if (status) onProgress?.(status);
+			}
+			if (update?.type === "text_end" && update.content) onProgress?.(latestLine(update.content));
+			if (update?.type === "thinking_start") onProgress?.("thinking");
+			return;
+		}
+		if (event.type === "tool_execution_start" && event.toolName) {
+			onProgress?.(`running ${event.toolName}`);
+			return;
+		}
+		if (event.type === "tool_execution_end" && event.toolName) {
+			onProgress?.(`${event.toolName} ${event.isError ? "failed" : "finished"}`);
+			return;
+		}
+		if (event.type === "compaction_start") {
+			onProgress?.("compacting context");
+			return;
+		}
+		if (event.type === "auto_retry_start") {
+			onProgress?.(`retrying ${event.attempt ?? "?"}/${event.maxAttempts ?? "?"}`);
+			return;
+		}
+		if (event.type !== "message_end" || event.message?.role !== "assistant") return;
 		const message = event.message;
 		const output = message.content?.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n").trim();
-		if (output) result.output = limitBytes(output, MAX_OUTPUT_BYTES);
+		if (output) {
+			result.output = limitBytes(output, MAX_OUTPUT_BYTES);
+			onProgress?.(latestLine(output));
+		}
 		if (message.model) result.model = message.model;
 		if (message.stopReason) result.stopReason = message.stopReason;
 		if (message.errorMessage) result.errorMessage = message.errorMessage;
 		addUsage(result.usage, message.usage);
-		return true;
 	} catch {
-		return false;
+		// Ignore malformed or unrelated child output; process exit remains authoritative.
 	}
 }
 
@@ -335,7 +416,7 @@ async function runChild(
 	agent: AgentDefinition,
 	model: string | undefined,
 	signal: AbortSignal | undefined,
-	onUpdate: ((result: ChildResult) => void) | undefined,
+	onProgress?: (status: string) => void,
 ): Promise<ChildResult> {
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-pstack-"));
 	const promptPath = join(temporaryDirectory, "agent.md");
@@ -377,10 +458,12 @@ async function runChild(
 	};
 
 	try {
+		const stream = { draft: "" };
 		await new Promise<void>((resolveProcess) => {
 			const invocation = piInvocation(args);
 			const child = spawn(invocation.command, invocation.args, {
 				cwd: parentCwd,
+				detached: process.platform !== "win32",
 				env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("THE_MANAGER_"))),
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
@@ -389,20 +472,46 @@ async function runChild(
 			let settled = false;
 			let aborted = false;
 			let killTimer: ReturnType<typeof setTimeout> | undefined;
+			const processGroupAlive = () => {
+				if (process.platform === "win32" || !child.pid) return false;
+				try {
+					process.kill(-child.pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			};
 			const finish = (exitCode: number) => {
 				if (settled) return;
 				settled = true;
+				if (aborted && processGroupAlive()) kill("SIGKILL");
 				if (killTimer) clearTimeout(killTimer);
 				signal?.removeEventListener("abort", abort);
-				if (stdout.trim()) processJsonLine(stdout, result);
+				if (stdout.trim()) processJsonLine(stdout, result, stream, onProgress);
 				result.exitCode = exitCode;
 				if (aborted) result.stopReason = "aborted";
 				resolveProcess();
 			};
+			const kill = (killSignal: NodeJS.Signals) => {
+				if (process.platform === "win32" && child.pid) {
+					const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+					killer.once("error", () => child.kill(killSignal));
+					return;
+				}
+				if (child.pid) {
+					try {
+						process.kill(-child.pid, killSignal);
+						return;
+					} catch {
+						// The process may have exited between the abort and signal.
+					}
+				}
+				child.kill(killSignal);
+			};
 			const abort = () => {
 				aborted = true;
-				child.kill("SIGTERM");
-				killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+				kill("SIGTERM");
+				killTimer = setTimeout(() => kill("SIGKILL"), 5_000);
 				killTimer.unref();
 			};
 			child.stdout.setEncoding("utf8");
@@ -410,7 +519,7 @@ async function runChild(
 				stdout += chunk;
 				const lines = stdout.split("\n");
 				stdout = lines.pop() ?? "";
-				for (const line of lines) if (processJsonLine(line, result)) onUpdate?.(result);
+				for (const line of lines) processJsonLine(line, result, stream, onProgress);
 			});
 			child.stderr.setEncoding("utf8");
 			child.stderr.on("data", (chunk: string) => {
@@ -430,30 +539,6 @@ async function runChild(
 	}
 }
 
-async function mapLimited<T>(
-	items: T[],
-	signal: AbortSignal | undefined,
-	fn: (item: T, index: number) => Promise<ChildResult>,
-): Promise<ChildResult[]> {
-	const results: ChildResult[] = [];
-	let next = 0;
-	let failure: { error: unknown } | undefined;
-	await Promise.all(
-		Array.from({ length: Math.min(MAX_CONCURRENCY, items.length) }, async () => {
-			while (next < items.length && !signal?.aborted && !failure) {
-				const index = next++;
-				try {
-					results[index] = await fn(items[index], index);
-				} catch (error) {
-					failure ??= { error };
-				}
-			}
-		}),
-	);
-	if (failure) throw failure.error;
-	return results;
-}
-
 export function latestPotetoMode(entries: ModeEntry[]): boolean {
 	let enabled = false;
 	for (const entry of entries) {
@@ -465,6 +550,215 @@ export function latestPotetoMode(entries: ModeEntry[]): boolean {
 
 export default function pstackExtension(pi: ExtensionAPI): void {
 	let potetoMode = false;
+	let generation = 0;
+	let nextBatchId = 1;
+	let runningTasks = 0;
+	let sessionActive = false;
+	let taskContext: ExtensionContext | undefined;
+	let renderTimer: ReturnType<typeof setTimeout> | undefined;
+	const tasks = new Map<string, BackgroundTask>();
+	const batches = new Map<string, BackgroundBatch>();
+	const queue: BackgroundTask[] = [];
+
+	function isTerminal(task: BackgroundTask): boolean {
+		return task.status === "completed" || task.status === "failed" || task.status === "cancelled";
+	}
+
+	function publicTask(task: BackgroundTask, includeResult = false): Record<string, unknown> {
+		return {
+			id: task.id,
+			batchId: task.batchId,
+			agent: task.prepared.agent.name,
+			task: limitBytes(task.prepared.task.task, 2_000),
+			model: task.prepared.model,
+			readonly: task.prepared.task.readonly === true,
+			status: task.status,
+			latest: task.latest,
+			createdAt: task.createdAt,
+			startedAt: task.startedAt,
+			finishedAt: task.finishedAt,
+			...(includeResult ? { result: task.result } : {}),
+		};
+	}
+
+	function batchStatus(batch: BackgroundBatch): string {
+		const batchTasks = batch.taskIds.map((id) => tasks.get(id)).filter((task): task is BackgroundTask => Boolean(task));
+		if (batchTasks.some((task) => !isTerminal(task))) return "running";
+		if (batchTasks.some((task) => task.status === "failed")) return "failed";
+		if (batchTasks.some((task) => task.status === "cancelled")) return "cancelled";
+		return "completed";
+	}
+
+	function batchReport(batch: BackgroundBatch): string {
+		const status = batchStatus(batch);
+		const sections = [`Pstack batch ${batch.id} ${status}.`];
+		for (const id of batch.taskIds) {
+			const task = tasks.get(id);
+			if (!task) continue;
+			if (!task.result) {
+				sections.push(`- ${task.id} ${task.prepared.agent.name}: ${task.status}${task.latest ? ` — ${task.latest}` : ""}`);
+				continue;
+			}
+			const label = task.status === "completed" ? "completed" : task.status;
+			const output = task.status === "completed" ? task.result.output : childFailure(task.result);
+			sections.push(`### ${task.prepared.agent.name} ${label} (${task.id})\n\n${output || "(no output)"}`);
+		}
+		return limitBytes(sections.join("\n\n"), MAX_OUTPUT_BYTES);
+	}
+
+	function renderTasks(ctx: ExtensionContext): void {
+		if (!ctx.hasUI) return;
+		const outstanding = [...tasks.values()].filter((task) => !isTerminal(task));
+		if (!outstanding.length) {
+			ctx.ui.setWidget(TASK_WIDGET_KEY, undefined);
+			return;
+		}
+		const running = outstanding.filter((task) => task.status === "running").length;
+		const queued = outstanding.length - running;
+		const lines = [`pstack: ${running} running${queued ? ` · ${queued} queued` : ""}`];
+		for (const task of outstanding) {
+			const elapsed = Math.floor((Date.now() - (task.startedAt ?? task.createdAt)) / 1_000);
+			const glyph = task.status === "running" ? "↻" : "…";
+			const status = task.cancelRequested ? "cancelling" : task.latest || task.status;
+			lines.push(`${glyph} ${task.id} ${task.prepared.agent.name} · ${status} · ${elapsed}s`);
+		}
+		ctx.ui.setWidget(TASK_WIDGET_KEY, lines, { placement: "belowEditor" });
+	}
+
+	function scheduleRender(): void {
+		if (!sessionActive || !taskContext?.hasUI || renderTimer) return;
+		const scheduledGeneration = generation;
+		renderTimer = setTimeout(() => {
+			renderTimer = undefined;
+			if (sessionActive && scheduledGeneration === generation && taskContext) renderTasks(taskContext);
+		}, 100);
+		renderTimer.unref();
+	}
+
+	function notifyBatch(batch: BackgroundBatch): void {
+		if (batch.notified || batch.generation !== generation || !sessionActive) return;
+		const batchTasks = batch.taskIds.map((id) => tasks.get(id)).filter((task): task is BackgroundTask => Boolean(task));
+		if (!batchTasks.length || batchTasks.some((task) => !isTerminal(task))) return;
+		batch.notified = true;
+		const status = batchStatus(batch);
+		try {
+			pi.sendMessage(
+				{
+					customType: TASK_COMPLETE_MESSAGE,
+					content: batchReport(batch),
+					display: true,
+					details: { batchId: batch.id, status, tasks: batchTasks.map((task) => publicTask(task)) },
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		} catch (error) {
+			console.error("[pstack] completion notification failed:", error);
+		}
+	}
+
+	function failedResult(task: BackgroundTask, error: unknown): ChildResult {
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			agent: task.prepared.agent.name,
+			task: task.prepared.task.task,
+			model: task.prepared.model,
+			exitCode: 1,
+			output: "",
+			stderr: message,
+			stopReason: task.cancelRequested ? "aborted" : "error",
+			errorMessage: task.cancelRequested ? "Cancelled." : message,
+			usage: emptyUsage(),
+		};
+	}
+
+	function settleTask(task: BackgroundTask, result: ChildResult): void {
+		if (task.generation !== generation || isTerminal(task)) return;
+		task.result = result;
+		task.finishedAt = Date.now();
+		task.status = task.cancelRequested || result.stopReason === "aborted"
+			? "cancelled"
+			: childFailed(result) ? "failed" : "completed";
+		task.latest = task.status;
+		runningTasks = Math.max(0, runningTasks - 1);
+		scheduleRender();
+		const batch = batches.get(task.batchId);
+		if (batch) notifyBatch(batch);
+		pumpQueue();
+	}
+
+	function startTask(task: BackgroundTask): void {
+		task.status = "running";
+		task.startedAt = Date.now();
+		task.latest = "starting";
+		runningTasks++;
+		task.completion = runChild(
+			taskContext?.cwd ?? process.cwd(),
+			task.prepared.task,
+			task.prepared.agent,
+			task.prepared.model,
+			task.controller.signal,
+			(status) => {
+				if (task.generation !== generation || task.status !== "running") return;
+				task.latest = status;
+				scheduleRender();
+			},
+		).then(
+			(result) => settleTask(task, result),
+			(error) => settleTask(task, failedResult(task, error)),
+		);
+	}
+
+	function pumpQueue(): void {
+		if (!sessionActive) return;
+		while (runningTasks < MAX_CONCURRENCY && queue.length) {
+			const task = queue.shift()!;
+			if (!isTerminal(task)) startTask(task);
+		}
+		scheduleRender();
+	}
+
+	function cancelTask(task: BackgroundTask): boolean {
+		if (isTerminal(task)) return false;
+		task.cancelRequested = true;
+		task.latest = "cancelling";
+		if (task.status === "queued") {
+			task.status = "cancelled";
+			task.finishedAt = Date.now();
+			task.result = failedResult(task, new Error("Cancelled before start."));
+			const batch = batches.get(task.batchId);
+			if (batch) notifyBatch(batch);
+		} else {
+			task.controller.abort();
+		}
+		scheduleRender();
+		return true;
+	}
+
+	async function shutdownTasks(ctx: ExtensionContext): Promise<void> {
+		sessionActive = false;
+		if (renderTimer) {
+			clearTimeout(renderTimer);
+			renderTimer = undefined;
+		}
+		for (const task of tasks.values()) cancelTask(task);
+		const completions = [...tasks.values()].flatMap((task) => task.completion ? [task.completion] : []);
+		if (completions.length) {
+			await new Promise<void>((resolveShutdown) => {
+				const timeout = setTimeout(resolveShutdown, 5_250);
+				void Promise.allSettled(completions).then(() => {
+					clearTimeout(timeout);
+					resolveShutdown();
+				});
+			});
+		}
+		generation++;
+		runningTasks = 0;
+		queue.length = 0;
+		tasks.clear();
+		batches.clear();
+		taskContext = undefined;
+		if (ctx.hasUI) ctx.ui.setWidget(TASK_WIDGET_KEY, undefined);
+	}
 
 	function syncMode(ctx: ExtensionContext): void {
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, potetoMode ? "🥔 poteto" : undefined);
@@ -481,10 +775,33 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 		syncMode(ctx);
 	}
 
-	pi.on("session_start", (_event, ctx) => restoreMode(ctx));
-	pi.on("session_tree", (_event, ctx) => restoreMode(ctx));
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.registerMessageRenderer(TASK_COMPLETE_MESSAGE, (message, _options, theme) => {
+		const status = (message.details as { status?: string } | undefined)?.status;
+		const content = typeof message.content === "string"
+			? message.content
+			: message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+		const [heading, ...body] = content.split("\n");
+		return new Text(`${theme.fg(status === "completed" ? "success" : "warning", heading)}${body.length ? `\n${body.join("\n")}` : ""}`, 0, 0);
+	});
+
+	pi.on("session_start", (_event, ctx) => {
+		generation++;
+		sessionActive = true;
+		taskContext = ctx;
+		restoreMode(ctx);
+	});
+	pi.on("session_before_tree", async (_event, ctx) => {
+		await shutdownTasks(ctx);
+	});
+	pi.on("session_tree", (_event, ctx) => {
+		sessionActive = true;
+		taskContext = ctx;
+		restoreMode(ctx);
+		scheduleRender();
+	});
+	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+		await shutdownTasks(ctx);
 	});
 
 	pi.on("input", (event, ctx) => {
@@ -593,9 +910,11 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent",
 		label: "Pstack Subagent",
-		description: `Run bundled pstack agents in isolated local Pi processes. Provide agent+task, or tasks for up to ${MAX_TASKS} parallel tasks (${MAX_CONCURRENCY} at once). Set readonly=true for analysis/review. Parallel writes require isolated worktrees or disjoint scratch paths. Children stay in the parent working directory.`,
+		description: `Start bundled pstack agents in background Pi processes and return task IDs immediately. Provide agent+task, or tasks for up to ${MAX_TASKS} tasks (${MAX_CONCURRENCY} running at once). Set readonly=true for analysis/review. Writers keep their existing tools and working directory; the parent must avoid overlapping edits.`,
 		parameters: SubagentParams,
-		async execute(_id, params: SubagentInput, signal, onUpdate, ctx) {
+		executionMode: "sequential",
+		async execute(_id, params: SubagentInput, signal, _onUpdate, ctx) {
+			if (signal?.aborted) throw new Error("Subagent start cancelled.");
 			const hasSingleFields = [params.agent, params.task, params.role, params.model, params.readonly].some((value) => value !== undefined);
 			if ((params.tasks?.length && hasSingleFields) || (!params.tasks?.length && (!params.agent || !params.task))) {
 				throw new Error("Provide exactly one subagent mode: agent + task, or tasks.");
@@ -620,27 +939,93 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 				return { task, agent: findAgent(task.agent), model };
 			};
 			const prepared = (params.tasks ?? single!).map(prepare);
-			const run = (item: PreparedTask, update?: (result: ChildResult) => void) =>
-				runChild(ctx.cwd, item.task, item.agent, item.model, signal, update);
-			const emit = (results: ChildResult[]) => onUpdate?.({
-				content: [{ type: "text", text: results.map((result) => `${result.agent}: ${result.output || "(running...)"}`).join("\n\n") }],
-				details: { results },
-			});
-
-			if (params.tasks?.length) {
-				const updates: ChildResult[] = [];
-				const results = await mapLimited(prepared, signal, async (item, index) => run(item, (update) => {
-					updates[index] = update;
-					emit(updates.filter(Boolean));
-				}));
-				if (signal?.aborted) throw new Error("Subagent parallel run cancelled.");
-				const report = results.map((result) => `### ${result.agent} ${childFailed(result) ? "failed" : "completed"}\n\n${limitBytes(childFailed(result) ? childFailure(result) : result.output, MAX_OUTPUT_BYTES)}`).join("\n\n---\n\n");
-				return { content: [{ type: "text", text: limitBytes(report, MAX_OUTPUT_BYTES) }], details: { mode: "parallel", results }, usage: combinedUsage(results) };
+			if (signal?.aborted) throw new Error("Subagent start cancelled.");
+			const outstanding = [...tasks.values()].filter((task) => !isTerminal(task)).length;
+			if (outstanding + prepared.length > MAX_OUTSTANDING_TASKS) {
+				throw new Error(`Pstack supports at most ${MAX_OUTSTANDING_TASKS} unfinished background tasks.`);
 			}
+			taskContext = ctx;
+			const createdAt = Date.now();
+			const batchId = `b${nextBatchId++}`;
+			const batch: BackgroundBatch = { id: batchId, taskIds: [], notified: false, generation };
+			for (const [index, item] of prepared.entries()) {
+				const task: BackgroundTask = {
+					id: `${batchId}.${index + 1}`,
+					batchId,
+					prepared: item,
+					status: "queued",
+					createdAt,
+					latest: "queued",
+					controller: new AbortController(),
+					cancelRequested: false,
+					generation,
+				};
+				batch.taskIds.push(task.id);
+				tasks.set(task.id, task);
+				queue.push(task);
+			}
+			batches.set(batchId, batch);
+			pumpQueue();
+			const lines = batch.taskIds.map((id) => {
+				const task = tasks.get(id)!;
+				return `- ${id}: ${task.prepared.agent.name}${task.prepared.model ? ` (${task.prepared.model})` : ""}`;
+			});
+			return {
+				content: [{ type: "text", text: `Started pstack batch ${batchId} in the background.\n${lines.join("\n")}\nUse pstack_tasks get/cancel with a batch or task ID. A completion message will arrive when the batch finishes.` }],
+				details: { batchId, taskIds: batch.taskIds },
+			};
+		},
+	});
 
-			const result = await run(prepared[0], (update) => emit([update]));
-			if (childFailed(result)) throw new Error(`Subagent failed: ${childFailure(result)}`);
-			return { content: [{ type: "text", text: limitBytes(result.output, MAX_OUTPUT_BYTES) }], details: { mode: "single", results: [result] }, usage: result.usage };
+	pi.registerTool({
+		name: "pstack_tasks",
+		label: "Pstack Tasks",
+		description: "List, inspect, or cancel background pstack batches and tasks from this Pi session.",
+		parameters: TasksParams,
+		executionMode: "sequential",
+		async execute(_id, params: TasksInput) {
+			if (params.action === "list") {
+				const summaries = [...batches.values()].map((batch) => ({
+					id: batch.id,
+					status: batchStatus(batch),
+					tasks: batch.taskIds.map((id) => tasks.get(id)).filter((task): task is BackgroundTask => Boolean(task)).map((task) => publicTask(task)),
+				}));
+				const text = summaries.map((batch) => `${batch.id} ${batch.status} · ${batch.tasks.map((task) => `${task.id} ${task.status}`).join(", ")}`).join("\n");
+				return { content: [{ type: "text", text: text || "No pstack tasks in this session." }], details: { batches: summaries } };
+			}
+			if (params.action !== "get" && params.action !== "cancel") {
+				throw new Error("pstack_tasks action must be list, get, or cancel.");
+			}
+			if (!params.id) throw new Error(`pstack_tasks ${params.action} requires an id.`);
+			const task = tasks.get(params.id);
+			const batch = batches.get(params.id);
+			if (!task && !batch) throw new Error(`Unknown pstack task or batch: ${params.id}.`);
+			if (params.action === "get") {
+				if (task) {
+					const output = task.result
+						? task.status === "completed" ? task.result.output : childFailure(task.result)
+						: task.latest;
+					return {
+						content: [{ type: "text", text: limitBytes(`${task.id} ${task.status}\n\n${output || "(no output yet)"}`, MAX_OUTPUT_BYTES) }],
+						details: publicTask(task, true),
+					};
+				}
+				return {
+					content: [{ type: "text", text: batchReport(batch!) }],
+					details: {
+						id: batch!.id,
+						status: batchStatus(batch!),
+						tasks: batch!.taskIds.map((id) => tasks.get(id)).filter((item): item is BackgroundTask => Boolean(item)).map((item) => publicTask(item)),
+					},
+				};
+			}
+			const targets = task ? [task] : batch!.taskIds.map((id) => tasks.get(id)).filter((item): item is BackgroundTask => Boolean(item));
+			const cancelled = targets.filter((item) => cancelTask(item)).map((item) => item.id);
+			pumpQueue();
+			return {
+				content: [{ type: "text", text: cancelled.length ? `Cancelling: ${cancelled.join(", ")}` : "All selected pstack tasks were already terminal." }],
+				details: { cancelled },
+			};
 		},
 	});
 }

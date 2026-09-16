@@ -18,12 +18,12 @@ Upstream is MIT licensed, Copyright © 2026 Lauren Tan. Its exact notice is reta
 ## Local integration
 
 - `package.json` discovers all 47 adapted skill directories through `skills/pstack/`.
-- `extensions/pstack/index.ts` owns sticky `/poteto-mode`, `/setup-pstack`, model-role configuration, current-workspace session listing, and bounded isolated child Pi execution. Child startup is offline; read-only tasks receive only read/grep/find/ls tools.
+- `extensions/pstack/index.ts` owns sticky `/poteto-mode`, `/setup-pstack`, model-role configuration, current-workspace session listing, and bounded background child Pi execution. Child startup is offline; read-only tasks receive only read/grep/find/ls tools. `pstack_tasks` exposes session-local inspection and cancellation, while a compact widget and completion message provide visibility.
 - `agents/pstack/` contains the two bundled child prompts.
 - `skills/pstack/poteto-mode/references/pi-port.md` is the runtime authority/capability contract applied to imported workflows.
 - Existing theme, Codemode, goal, Codex, Discord, tool-visibility, voice, Git, browser, and Manager behavior remains owned by existing project machinery.
 
-Deliberate omissions: the upstream plugin manifest, guide/assets, Benny automation pack, and `poteto-mode/scripts/` orchestration/PR-watch/worktree-delete machinery. The reference's duplicate todo state is omitted because this package already has `/goal` and Manager owns tracked task state. The child runner supports only bundled agents and bounded single/parallel calls in the parent cwd; unused chain mode, arbitrary child cwd, and project/user agent overrides are omitted. The product-specific `make-bot-ui` skill reports its capability unavailable instead of faking it. No update daemon, queue, patch framework, automatic publication, or global installation is included.
+Deliberate omissions: the upstream plugin manifest, guide/assets, Benny automation pack, and `poteto-mode/scripts/` orchestration/PR-watch/worktree-delete machinery. The reference's duplicate todo state is omitted because this package already has `/goal` and Manager owns tracked task state. The child runner supports only bundled agents and bounded single/parallel batches in the parent cwd; unused chain mode, arbitrary child cwd, persistence/resume, and project/user agent overrides are omitted. The product-specific `make-bot-ui` skill reports its capability unavailable instead of faking it. No update daemon, patch framework, automatic publication, or global installation is included.
 
 ## Weekly agent maintenance
 

@@ -111,7 +111,7 @@ The port preserves all 47 skills from the pinned current upstream and adapts the
 /skill:swarm <task>
 ```
 
-Registers tools: `subagent`, `pstack_config`, and `pstack_sessions`. `subagent` enforces a read/grep/find/ls-only tool set when a task sets `readonly: true`. Child agents run as bounded local Pi processes in the parent's working directory with offline startup, extensions disabled, no Manager environment variables, and no session persistence. Parallel writers still require isolated worktrees or disjoint scratch paths. Push, PR, merge, deploy, cleanup, and Manager lifecycle authority stay with the parent/user.
+Registers tools: `subagent`, `pstack_tasks`, `pstack_config`, and `pstack_sessions`. `subagent` starts bounded child Pi processes in the background and immediately returns batch/task IDs; `pstack_tasks` lists, inspects, or cancels them. Active tasks appear below the editor and one completion message returns each batch's terminal results. `readonly: true` enforces a read/grep/find/ls-only tool set. Children otherwise keep their configured tools and run in the parent's working directory with offline startup, extensions disabled, no Manager environment variables, and no session persistence. Parent and parallel writers must avoid overlapping files. Push, PR, merge, deploy, cleanup, and Manager lifecycle authority stay with the parent/user.
 
 Model roles default to the parent model and are stored in `~/.pi/agent/pstack/models.json` only after explicit setup. Fixed upstream model slugs are not copied.
 

@@ -5,11 +5,11 @@ This package ports pstack to Pi. These rules override incompatible assumptions i
 ## Runtime contract
 
 - Invoke skills as `/skill:<name>`. `/poteto-mode [task]` enables the sticky session mode; `/poteto-mode off` disables it.
-- Delegate bounded work with `subagent`. Its bundled agents are `poteto-agent` and `comment-sicko`. Parallel writers need separate worktrees or disjoint scratch paths; otherwise set `readonly: true`.
+- Delegate bounded work with `subagent`. It starts bundled `poteto-agent` or `comment-sicko` children in the background and immediately returns batch/task IDs. Use `pstack_tasks` to list, inspect, or cancel them. Parallel writers need separate worktrees or disjoint scratch paths; otherwise set `readonly: true`.
 - Model roles default to the parent model. `/setup-pstack` configures one role interactively. `pstack_config` lists valid `provider/model` identifiers and supports explicit configuration.
 - The active transcript is `$PI_SESSION_FILE`. `pstack_sessions` lists saved sessions for the current working directory. Do not scan another project's session store.
 - Optional MCP, browser, forge, simulator, observability, issue-tracker, or chat integrations are used only when available and authorized. Missing capability is a reported gap, never invented evidence.
-- Pi has no native background cloud-agent lifecycle in this port. A `subagent` call waits for isolated child processes with offline startup and returns their terminal results.
+- Pstack supplies a session-local background lifecycle around isolated child Pi processes with offline startup. A completion message returns each batch's terminal results; session shutdown or tree navigation cancels unfinished children. Tasks are not persisted or resumable across sessions.
 - Use the repository's available checks and skills. If a named upstream helper is absent, perform its documented intent with native tools or report the exact missing capability.
 
 ## Authority boundary
@@ -33,6 +33,6 @@ The current upstream was the resource baseline. The older reference informed Pi-
 - Omitted the Cursor plugin manifest, marketing assets, guide, and Benny automation pack: Pi package discovery and existing project automation replace them.
 - Omitted upstream `poteto-mode/scripts/` orchestration, PR watchers, worktree deletion, and bootstrap machinery: existing Manager/Git workflows own those responsibilities.
 - Kept all 47 current skill directories and required references/scripts outside that omitted orchestration subtree.
-- Normalized skill names and commands for Pi, replaced fixed model slugs with configured roles, and converted unsupported cloud-agent/background instructions to bounded `subagent` calls or explicit capability gaps.
+- Normalized skill names and commands for Pi, replaced fixed model slugs with configured roles, and converted cloud-agent instructions to bounded session-local `subagent` tasks or explicit capability gaps.
 - `make-bot-ui` remains as an accurate unavailable-capability notice; this package does not pretend Pi supplies Cursor Automations.
 - Existing package extensions for themes, Codemode, goals, Codex fast mode, Discord, tool visibility, and voice are unchanged except for registering this isolated pstack extension and its footer status key.

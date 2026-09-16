@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
@@ -40,8 +40,21 @@ if (process.argv.includes("--mode") && process.argv.includes("--no-session")) {
 		console.error("auto model should omit override");
 		process.exit(5);
 	}
+	if (task.includes("assert-writer") && toolsIndex >= 0) {
+		console.error("writer tools should remain unrestricted");
+		process.exit(7);
+	}
+	const descendantMarker = task.match(/descendant-marker:([^\s]+)/)?.[1];
+	if (descendantMarker) {
+		const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		await writeFile(descendantMarker, String(descendant.pid));
+	}
 	if (task.includes("hang")) {
+		if (task.includes("progress")) {
+			console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "fixture-tool", toolName: "read", args: {} }));
+		}
 		setInterval(() => {}, 1_000);
+		await new Promise(() => {});
 	} else {
 		const failed = task.includes("fail-child");
 		const message = {
@@ -103,9 +116,13 @@ try {
 		const tools = new Map();
 		const entries = [];
 		const sent = [];
+		const messages = [];
 		const statuses = [];
 		const notifications = [];
 		const selections = [];
+		const widgets = [];
+		const messageWaiters = [];
+		const widgetWaiters = [];
 		const pi = {
 			on(name, handler) {
 				const handlers = events.get(name) ?? [];
@@ -118,11 +135,17 @@ try {
 			registerTool(tool) {
 				tools.set(tool.name, tool);
 			},
+			registerMessageRenderer() {},
 			appendEntry(customType, data) {
 				entries.push({ type: "custom", customType, data });
 			},
 			sendUserMessage(text, options) {
 				sent.push({ text, options });
+			},
+			sendMessage(message, options) {
+				const value = { message, options };
+				messages.push(value);
+				for (const waiter of messageWaiters.filter((waiter) => waiter.predicate(value))) waiter.resolve(value);
 			},
 		};
 		const ctx = {
@@ -137,6 +160,10 @@ try {
 			isIdle: () => true,
 			ui: {
 				setStatus: (...args) => statuses.push(args),
+				setWidget: (...args) => {
+					widgets.push(args);
+					for (const waiter of widgetWaiters.filter((waiter) => waiter.predicate(args))) waiter.resolve(args);
+				},
 				notify: (...args) => notifications.push(args),
 				select: async () => selections.shift(),
 			},
@@ -160,12 +187,34 @@ try {
 			return tools.get(name).execute("test-call", params, signal, () => {}, ctx);
 		}
 
-		return { command, commands, ctx, emit, entries, notifications, selections, sent, statuses, tool, tools };
+		function waitFor(collection, waiters, predicate, label) {
+			const existing = collection.find(predicate);
+			if (existing) return Promise.resolve(existing);
+			return new Promise((resolveWait, rejectWait) => {
+				const waiter = {
+					predicate,
+					resolve(value) {
+						clearTimeout(timeout);
+						waiters.splice(waiters.indexOf(waiter), 1);
+						resolveWait(value);
+					},
+				};
+				const timeout = setTimeout(() => {
+					waiters.splice(waiters.indexOf(waiter), 1);
+					rejectWait(new Error(`Timed out waiting for ${label}`));
+				}, 5_000);
+				waiters.push(waiter);
+			});
+		}
+
+		const waitForMessage = (predicate) => waitFor(messages, messageWaiters, predicate, "message");
+		const waitForWidget = (predicate) => waitFor(widgets, widgetWaiters, predicate, "widget");
+		return { command, commands, ctx, emit, entries, messages, notifications, selections, sent, statuses, tool, tools, waitForMessage, waitForWidget, widgets };
 	}
 
 	const harness = createHarness();
 	for (const command of ["poteto-mode", "setup-pstack"]) assert.ok(harness.commands.has(command));
-	for (const tool of ["pstack_config", "pstack_sessions", "subagent"]) assert.ok(harness.tools.has(tool));
+	for (const tool of ["pstack_config", "pstack_sessions", "subagent", "pstack_tasks"]) assert.ok(harness.tools.has(tool));
 
 	await harness.emit("session_start");
 	assert.deepEqual(harness.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.pstack, undefined]);
@@ -189,10 +238,12 @@ try {
 	assert.deepEqual(harness.entries.at(-1).data, { enabled: true });
 	await harness.emit("input", { source: "user", text: "/skill:poteto-mode off" });
 	await harness.emit("input", { source: "user", text: "/skill:poteto-mode fix it" });
+	await harness.emit("session_before_tree");
 	await harness.emit("session_tree");
 	assert.deepEqual(harness.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.pstack, "🥔 poteto"]);
 	await harness.emit("session_shutdown");
 	assert.deepEqual(harness.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.pstack, undefined]);
+	await harness.emit("session_start");
 
 	harness.selections.push("bug-fix", "other/reviewer");
 	await harness.command("setup-pstack");
@@ -215,21 +266,36 @@ try {
 	assert.equal(concurrentConfig.roles["perf-issue"], "other/reviewer");
 	await harness.tool("pstack_config", { action: "reset" });
 
-	const single = await harness.tool("subagent", {
+	async function runBatch(params) {
+		const started = await harness.tool("subagent", params);
+		assert.match(started.content[0].text, /Started pstack batch .* in the background/);
+		const completion = await harness.waitForMessage(({ message }) =>
+			message.customType === "pi-extensions-pstack-batch-complete" && message.details.batchId === started.details.batchId,
+		);
+		return { started, completion };
+	}
+
+	const single = await runBatch({
 		agent: "poteto-agent",
 		task: "assert-policy assert-parent-model assert-readonly",
 		readonly: true,
 	});
-	assert.equal(single.content[0].text, "child:assert-policy assert-parent-model assert-readonly");
-	assert.equal(
-		(await harness.tool("subagent", { agent: "poteto-agent", task: "assert-auto-model", model: "auto" })).content[0].text,
-		"child:assert-auto-model",
-	);
-	assert.equal(single.usage.totalTokens, 5);
-	const truncated = await harness.tool("subagent", { agent: "poteto-agent", task: "😀".repeat(20_000) });
-	assert.ok(Buffer.byteLength(truncated.content[0].text, "utf8") < 52_000);
-	assert.doesNotMatch(truncated.content[0].text, /�/);
-	assert.match(truncated.content[0].text, /Output truncated/);
+	assert.deepEqual(single.completion.options, { deliverAs: "followUp", triggerTurn: true });
+	const singleTask = await harness.tool("pstack_tasks", { action: "get", id: single.started.details.taskIds[0] });
+	assert.equal(singleTask.details.status, "completed");
+	assert.equal(singleTask.details.result.output, "child:assert-policy assert-parent-model assert-readonly");
+	assert.equal(singleTask.details.result.usage.totalTokens, 5);
+
+	const automatic = await runBatch({ agent: "poteto-agent", task: "assert-auto-model assert-writer", model: "auto" });
+	const automaticTask = await harness.tool("pstack_tasks", { action: "get", id: automatic.started.details.taskIds[0] });
+	assert.equal(automaticTask.details.result.output, "child:assert-auto-model assert-writer");
+
+	const truncated = await runBatch({ agent: "poteto-agent", task: "😀".repeat(20_000) });
+	const truncatedTask = await harness.tool("pstack_tasks", { action: "get", id: truncated.started.details.taskIds[0] });
+	assert.ok(Buffer.byteLength(truncatedTask.content[0].text, "utf8") < 52_000);
+	assert.doesNotMatch(truncatedTask.content[0].text, /�/);
+	assert.match(truncatedTask.content[0].text, /Output truncated/);
+
 	await assert.rejects(harness.tool("subagent", { agent: "missing", task: "x" }), /Unknown pstack agent/);
 	await assert.rejects(harness.tool("subagent", { agent: "poteto-agent", task: "x", role: "missing" }), /Unknown pstack role/);
 	const spawnMarker = join(output, "invalid-batch-spawned");
@@ -247,31 +313,91 @@ try {
 		harness.tool("subagent", { agent: "poteto-agent", task: "x", tasks: [{ agent: "poteto-agent", task: "y" }] }),
 		/exactly one subagent mode/,
 	);
-	await assert.rejects(harness.tool("subagent", { agent: "poteto-agent", task: "fail-child" }), /fixture failure/);
 
-	const parallel = await harness.tool("subagent", {
+	const failed = await runBatch({ agent: "poteto-agent", task: "fail-child" });
+	const failedTask = await harness.tool("pstack_tasks", { action: "get", id: failed.started.details.taskIds[0] });
+	assert.equal(failedTask.details.status, "failed");
+	assert.match(failedTask.content[0].text, /fixture failure/);
+
+	const parallel = await runBatch({
 		tasks: [
 			{ agent: "poteto-agent", task: "one", role: "swarm workers" },
 			{ agent: "comment-sicko", task: "fail-child" },
 		],
 	});
-	assert.match(parallel.content[0].text, /poteto-agent completed/);
-	assert.match(parallel.content[0].text, /comment-sicko failed/);
-	assert.equal(parallel.details.results.length, 2);
-	assert.equal(parallel.usage.totalTokens, 10);
+	assert.match(parallel.completion.message.content, /poteto-agent completed/);
+	assert.match(parallel.completion.message.content, /comment-sicko failed/);
+	assert.equal(parallel.completion.message.details.status, "failed");
+	const parallelList = await harness.tool("pstack_tasks", { action: "list" });
+	assert.match(parallelList.content[0].text, new RegExp(`${parallel.started.details.batchId} failed`));
 
-	const controller = new AbortController();
-	const cancellation = harness.tool("subagent", { agent: "poteto-agent", task: "hang" }, controller.signal);
-	setImmediate(() => controller.abort());
-	await assert.rejects(cancellation, /Subagent failed/);
-	const parallelController = new AbortController();
-	const parallelCancellation = harness.tool(
-		"subagent",
-		{ tasks: [{ agent: "poteto-agent", task: "hang" }, { agent: "poteto-agent", task: "hang" }] },
-		parallelController.signal,
+	const descendantMarker = join(output, "descendant.pid");
+	const hanging = await harness.tool("subagent", { agent: "poteto-agent", task: `progress hang descendant-marker:${descendantMarker}` });
+	assert.match(hanging.content[0].text, /Started pstack batch/);
+	await harness.waitForWidget(([key, lines]) =>
+		key === "pi-extensions-pstack-tasks" && Array.isArray(lines) && lines.some((line) => line.includes("running read")),
 	);
-	setImmediate(() => parallelController.abort());
-	await assert.rejects(parallelCancellation, /parallel run cancelled/);
+	const hangingTaskId = hanging.details.taskIds[0];
+	const running = await harness.tool("pstack_tasks", { action: "get", id: hangingTaskId });
+	assert.equal(running.details.status, "running");
+	assert.match(running.content[0].text, /running read/);
+	await harness.tool("pstack_tasks", { action: "cancel", id: hangingTaskId });
+	await harness.waitForMessage(({ message }) =>
+		message.customType === "pi-extensions-pstack-batch-complete" && message.details.batchId === hanging.details.batchId,
+	);
+	const cancelled = await harness.tool("pstack_tasks", { action: "get", id: hangingTaskId });
+	assert.equal(cancelled.details.status, "cancelled");
+	const descendantPid = Number(await readFile(descendantMarker, "utf8"));
+	await new Promise((resolveExit, rejectExit) => {
+		const deadline = Date.now() + 5_000;
+		const check = () => {
+			try {
+				process.kill(descendantPid, 0);
+				if (Date.now() >= deadline) {
+					try { process.kill(descendantPid, "SIGKILL"); } catch { /* already gone */ }
+					rejectExit(new Error(`Descendant ${descendantPid} survived cancellation`));
+				} else setTimeout(check, 50);
+			} catch {
+				resolveExit();
+			}
+		};
+		check();
+	});
+
+	const queued = await harness.tool("subagent", {
+		tasks: Array.from({ length: 5 }, (_, index) => ({ agent: "poteto-agent", task: `hang ${index}` })),
+	});
+	await harness.waitForWidget(([key, lines]) =>
+		key === "pi-extensions-pstack-tasks" && Array.isArray(lines) && lines[0] === "pstack: 4 running · 1 queued",
+	);
+	await harness.tool("pstack_tasks", { action: "cancel", id: queued.details.batchId });
+	await harness.waitForMessage(({ message }) =>
+		message.customType === "pi-extensions-pstack-batch-complete" && message.details.batchId === queued.details.batchId,
+	);
+	assert.match((await harness.tool("pstack_tasks", { action: "get", id: queued.details.batchId })).content[0].text, /cancelled/);
+
+	const preAborted = new AbortController();
+	preAborted.abort();
+	await assert.rejects(
+		harness.tool("subagent", { agent: "poteto-agent", task: "never starts" }, preAborted.signal),
+		/start cancelled/,
+	);
+
+	const treeTask = await harness.tool("subagent", { agent: "poteto-agent", task: "hang" });
+	await harness.emit("session_before_tree");
+	await harness.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
+	assert.equal(
+		harness.messages.some(({ message }) => message.customType === "pi-extensions-pstack-batch-complete" && message.details.batchId === treeTask.details.batchId),
+		false,
+	);
+	assert.equal((await harness.tool("pstack_tasks", { action: "list" })).content[0].text, "No pstack tasks in this session.");
+
+	const shutdownTask = await harness.tool("subagent", { agent: "poteto-agent", task: "hang" });
+	assert.ok(shutdownTask.details.taskIds[0]);
+	await harness.emit("session_shutdown");
+	const afterShutdown = await harness.tool("pstack_tasks", { action: "list" });
+	assert.equal(afterShutdown.content[0].text, "No pstack tasks in this session.");
+	await harness.emit("session_start");
 
 	const skillRoot = join(root, "skills", "pstack");
 	const skillDirs = (await readdir(skillRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory());
