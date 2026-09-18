@@ -1,28 +1,20 @@
 ---
 name: how
-description: "Use for how does X work, code walkthroughs before changing something, ownership and layering questions, runtime flow, or architecture critique. Produces a sourced mental model; use why for historical motivation."
+description: "Trace how a symbol, module, or subsystem works and return a sourced mental model. Use for code walkthroughs, ownership, runtime flow, or architecture critique."
 disable-model-invocation: true
 ---
 
 # How
 
-## Explain
+1. Pin the question and likely boundary. Read the entry point, callers, core types, and effects directly for a narrow symbol or module.
+2. For a broad subsystem with genuinely independent slices, call at most two read-only `bounded` children using [the explorer prompt](references/explorer-prompt.md). Give each a distinct angle and exact paths.
+3. The parent reconciles their findings against code. Do not launch a separate explainer or synthesizer.
+4. If historical motivation matters, use `/skill:why`. Current code can prove mechanics, not intent.
 
-1. Parse the question and state a best-guess scope. Do not ask unless product ambiguity blocks a truthful answer.
-2. For one module or narrow symbol, call one `subagent` using `agent: "poteto-agent"`, `role: "how explainer"`, and `readonly: true`, and [the explainer prompt](references/explainer-prompt.md).
-3. For a cross-file subsystem, split it into 2-4 distinct angles and call one parallel `subagent` with `role: "how explorer"` and `readonly: true` on every task and [the explorer prompt](references/explorer-prompt.md). Then call one explainer with the terminal findings and exact source paths.
-4. Verify the explanation's decisive claims against code. Parent edits for clarity but never invents missing links.
+Return:
 
-Explorers start broad, follow actual callers and callees, trace input to effect, read definitions, and cite files and symbols. Keep them read-only.
-
-## Critique
-
-Explain first. Then run `/skill:interrogate` on the architecture with the stated goals and relevant files. Categorize confirmed issues as act on, consider, noted, or dismissed. Do not critique architecture you have not traced.
-
-## Output
-
-- **Overview:** what it is and the boundary it owns
-- **Key concepts:** only the types/services needed for the model
-- **How it works:** trigger, flow, decisions, data, and effects with file references
-- **Where it lives:** small path map
-- **Gotchas:** non-obvious behavior supported by source
+- **Overview:** owned boundary and purpose
+- **Key concepts:** only types and services needed for the model
+- **Flow:** trigger, decisions, data, and effects with file references
+- **Locations:** a small path map
+- **Gotchas and gaps:** non-obvious behavior and anything not traced

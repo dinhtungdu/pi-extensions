@@ -13,8 +13,8 @@ if (process.argv.includes("--mode") && process.argv.includes("--no-session")) {
 	const promptIndex = process.argv.indexOf("--append-system-prompt");
 	const prompt = promptIndex >= 0 ? await readFile(process.argv[promptIndex + 1], "utf8") : "";
 	if (
-		!prompt.includes("never mutate it") ||
-		!prompt.includes("pi-port.md") ||
+		!prompt.includes("mutate Manager state") ||
+		prompt.includes("pi-port.md") ||
 		!process.argv.includes("--offline") ||
 		!process.argv.includes("--no-extensions") ||
 		!process.argv.includes("--no-skills") ||
@@ -27,6 +27,7 @@ if (process.argv.includes("--mode") && process.argv.includes("--no-session")) {
 	const marker = task.match(/spawn-marker:([^\s]+)/)?.[1];
 	if (marker) await writeFile(marker, "spawned");
 	const modelIndex = process.argv.indexOf("--model");
+	const thinkingIndex = process.argv.indexOf("--thinking");
 	const toolsIndex = process.argv.indexOf("--tools");
 	if (task.includes("assert-readonly") && process.argv[toolsIndex + 1] !== "read,grep,find,ls") {
 		console.error("readonly tools not enforced");
@@ -36,9 +37,17 @@ if (process.argv.includes("--mode") && process.argv.includes("--no-session")) {
 		console.error("parent model not inherited");
 		process.exit(4);
 	}
-	if (task.includes("assert-auto-model") && modelIndex >= 0) {
-		console.error("auto model should omit override");
+	if (task.includes("assert-parent-thinking") && process.argv[thinkingIndex + 1] !== "high") {
+		console.error("parent thinking not inherited");
 		process.exit(5);
+	}
+	if (task.includes("assert-mechanical-route") && (process.argv[modelIndex + 1] !== "openai-codex/gpt-5.6-luna" || process.argv[thinkingIndex + 1] !== "medium")) {
+		console.error("mechanical route not applied");
+		process.exit(8);
+	}
+	if ((task.includes("assert-configured-route") || task.includes("assert-explicit-model")) && (process.argv[modelIndex + 1] !== "other/reviewer" || process.argv[thinkingIndex + 1] !== "low")) {
+		console.error("configured or explicit model override not applied");
+		process.exit(9);
 	}
 	if (task.includes("assert-writer") && toolsIndex >= 0) {
 		console.error("writer tools should remain unrestricted");
@@ -97,10 +106,10 @@ try {
 	await cp(join(root, "skills"), join(output, "skills"), { recursive: true });
 
 	const { PACKAGE_FOOTER_STATUS_KEYS } = await import(pathToFileURL(join(output, "extensions", "footer-status.js")));
-	const { default: pstackExtension, latestPotetoMode, PSTACK_ROLE_NAMES } = await import(
+	const { default: pstackExtension, latestPotetoMode, PSTACK_ROUTE_NAMES } = await import(
 		pathToFileURL(join(output, "extensions", "pstack", "index.js"))
 	);
-	assert.equal(PSTACK_ROLE_NAMES.length, 17);
+	assert.deepEqual(PSTACK_ROUTE_NAMES, ["mechanical", "bounded", "complex", "critical"]);
 	assert.equal(latestPotetoMode([]), false);
 	assert.equal(
 		latestPotetoMode([
@@ -152,9 +161,17 @@ try {
 			cwd: root,
 			hasUI: true,
 			model: { provider: "test", id: "model" },
+			thinkingLevel: "high",
 			scopedModels: [],
 			modelRegistry: {
-				getAvailable: () => [{ provider: "test", id: "model" }, { provider: "other", id: "reviewer" }],
+				getAvailable: () => [
+					{ provider: "test", id: "model" },
+					{ provider: "other", id: "reviewer" },
+					{ provider: "openai-codex", id: "gpt-5.6-luna" },
+					{ provider: "openai-codex", id: "gpt-5.6-terra" },
+					{ provider: "openai-codex", id: "gpt-5.6-sol" },
+					{ provider: "openai-codex", id: "gpt-6-astra" },
+				],
 			},
 			sessionManager: { getBranch: () => entries },
 			isIdle: () => true,
@@ -245,27 +262,26 @@ try {
 	assert.deepEqual(harness.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.pstack, undefined]);
 	await harness.emit("session_start");
 
-	harness.selections.push("bug-fix", "other/reviewer");
+	harness.selections.push("bounded", "other/reviewer", "medium");
 	await harness.command("setup-pstack");
 	const config = JSON.parse(await readFile(join(process.env.PI_CODING_AGENT_DIR, "pstack", "models.json"), "utf8"));
-	assert.equal(config.roles["bug-fix"], "other/reviewer");
+	assert.equal(config.version, 2);
+	assert.deepEqual(config.routes.bounded, { model: "other/reviewer", thinking: "medium" });
 	const listed = await harness.tool("pstack_config", { action: "list-models" });
 	assert.match(listed.content[0].text, /test\/model/);
 	const sessions = await harness.tool("pstack_sessions", {});
 	assert.deepEqual(sessions.details.files, []);
 	await assert.rejects(
-		harness.tool("pstack_config", { action: "set", role: "bug-fix", model: "missing/model" }),
+		harness.tool("pstack_config", { action: "set", route: "bounded", model: "missing/model" }),
 		/Unknown Pi model/,
 	);
 	await Promise.all([
-		harness.tool("pstack_config", { action: "set", role: "bug-fix", model: "test/model" }),
-		harness.tool("pstack_config", { action: "set", role: "perf-issue", model: "other/reviewer" }),
+		harness.tool("pstack_config", { action: "set", route: "mechanical", model: "test/model" }),
+		harness.tool("pstack_config", { action: "set", route: "critical", model: "other/reviewer", thinking: "xhigh" }),
 	]);
 	const concurrentConfig = (await harness.tool("pstack_config", { action: "get" })).details;
-	assert.equal(concurrentConfig.roles["bug-fix"], "test/model");
-	assert.equal(concurrentConfig.roles["perf-issue"], "other/reviewer");
-	await harness.tool("pstack_config", { action: "reset" });
-
+	assert.equal(concurrentConfig.routes.mechanical.model, "test/model");
+	assert.deepEqual(concurrentConfig.routes.critical, { model: "other/reviewer", thinking: "xhigh" });
 	async function runBatch(params) {
 		const started = await harness.tool("subagent", params);
 		assert.match(started.content[0].text, /Started pstack batch .* in the background/);
@@ -275,29 +291,44 @@ try {
 		return { started, completion };
 	}
 
+	await harness.tool("pstack_config", { action: "set", route: "bounded", model: "other/reviewer", thinking: "low" });
+	const configured = await runBatch({ agent: "poteto-agent", task: "assert-configured-route", route: "bounded" });
+	const configuredTask = await harness.tool("pstack_tasks", { action: "get", id: configured.started.details.taskIds[0] });
+	assert.equal(configuredTask.details.result.output, "child:assert-configured-route");
+	const resetConfig = (await harness.tool("pstack_config", { action: "reset" })).details;
+	assert.equal(resetConfig.routes.mechanical.model, "openai-codex/gpt-5.6-luna");
+
 	const single = await runBatch({
 		agent: "poteto-agent",
-		task: "assert-policy assert-parent-model assert-readonly",
+		task: "assert-policy assert-parent-model assert-parent-thinking assert-readonly",
 		readonly: true,
 	});
 	assert.deepEqual(single.completion.options, { deliverAs: "followUp", triggerTurn: true });
 	const singleTask = await harness.tool("pstack_tasks", { action: "get", id: single.started.details.taskIds[0] });
 	assert.equal(singleTask.details.status, "completed");
-	assert.equal(singleTask.details.result.output, "child:assert-policy assert-parent-model assert-readonly");
+	assert.equal(singleTask.details.result.output, "child:assert-policy assert-parent-model assert-parent-thinking assert-readonly");
 	assert.equal(singleTask.details.result.usage.totalTokens, 5);
+	assert.match(single.completion.message.content, /Total child usage: ↑2 ↓3/);
 
-	const automatic = await runBatch({ agent: "poteto-agent", task: "assert-auto-model assert-writer", model: "auto" });
-	const automaticTask = await harness.tool("pstack_tasks", { action: "get", id: automatic.started.details.taskIds[0] });
-	assert.equal(automaticTask.details.result.output, "child:assert-auto-model assert-writer");
+	const routed = await runBatch({ agent: "poteto-agent", task: "assert-mechanical-route assert-readonly", route: "mechanical", readonly: true });
+	const routedTask = await harness.tool("pstack_tasks", { action: "get", id: routed.started.details.taskIds[0] });
+	assert.equal(routedTask.details.result.output, "child:assert-mechanical-route assert-readonly");
+	assert.equal(routedTask.details.thinking, "medium");
 
-	const truncated = await runBatch({ agent: "poteto-agent", task: "😀".repeat(20_000) });
+	const overridden = await runBatch({ agent: "poteto-agent", task: "assert-explicit-model assert-writer", model: "other/reviewer", thinking: "low" });
+	const overriddenTask = await harness.tool("pstack_tasks", { action: "get", id: overridden.started.details.taskIds[0] });
+	assert.equal(overriddenTask.details.result.output, "child:assert-explicit-model assert-writer");
+
+	const truncated = await runBatch({ agent: "poteto-agent", task: "😀".repeat(6_000) });
 	const truncatedTask = await harness.tool("pstack_tasks", { action: "get", id: truncated.started.details.taskIds[0] });
-	assert.ok(Buffer.byteLength(truncatedTask.content[0].text, "utf8") < 52_000);
+	assert.ok(Buffer.byteLength(truncatedTask.content[0].text, "utf8") < 18_000);
 	assert.doesNotMatch(truncatedTask.content[0].text, /�/);
 	assert.match(truncatedTask.content[0].text, /Output truncated/);
 
 	await assert.rejects(harness.tool("subagent", { agent: "missing", task: "x" }), /Unknown pstack agent/);
-	await assert.rejects(harness.tool("subagent", { agent: "poteto-agent", task: "x", role: "missing" }), /Unknown pstack role/);
+	await assert.rejects(harness.tool("subagent", { agent: "poteto-agent", task: "x", route: "missing" }), /Unknown pstack route/);
+	await assert.rejects(harness.tool("subagent", { agent: "poteto-agent", task: "x", model: "missing/model" }), /Unknown Pi model/);
+	await assert.rejects(harness.tool("subagent", { agent: "poteto-agent", task: "x", thinking: "absurd" }), /Unknown thinking level/);
 	const spawnMarker = join(output, "invalid-batch-spawned");
 	await assert.rejects(
 		harness.tool("subagent", {
@@ -321,7 +352,7 @@ try {
 
 	const parallel = await runBatch({
 		tasks: [
-			{ agent: "poteto-agent", task: "one", role: "swarm workers" },
+			{ agent: "poteto-agent", task: "one", route: "bounded" },
 			{ agent: "comment-sicko", task: "fail-child" },
 		],
 	});
@@ -365,10 +396,10 @@ try {
 	});
 
 	const queued = await harness.tool("subagent", {
-		tasks: Array.from({ length: 5 }, (_, index) => ({ agent: "poteto-agent", task: `hang ${index}` })),
+		tasks: Array.from({ length: 4 }, (_, index) => ({ agent: "poteto-agent", task: `hang ${index}` })),
 	});
 	await harness.waitForWidget(([key, lines]) =>
-		key === "pi-extensions-pstack-tasks" && Array.isArray(lines) && lines[0] === "pstack: 4 running · 1 queued",
+		key === "pi-extensions-pstack-tasks" && Array.isArray(lines) && lines[0] === "pstack: 3 running · 1 queued",
 	);
 	await harness.tool("pstack_tasks", { action: "cancel", id: queued.details.batchId });
 	await harness.waitForMessage(({ message }) =>
@@ -401,7 +432,7 @@ try {
 
 	const skillRoot = join(root, "skills", "pstack");
 	const skillDirs = (await readdir(skillRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory());
-	assert.equal(skillDirs.length, 47, "current upstream has 47 skill directories");
+	assert.equal(skillDirs.length, 14, "curated pstack has 14 skill directories");
 	for (const directory of skillDirs) {
 		const file = join(skillRoot, directory.name, "SKILL.md");
 		const text = await readFile(file, "utf8");
@@ -409,8 +440,7 @@ try {
 		assert.match(text, new RegExp(`^name: ${directory.name}$`, "m"));
 		assert.match(text, /^description:\s*.+$/m);
 		assert.doesNotMatch(text.match(/^---\n([\s\S]*?)\n---\n/)[1], /^(?:paths|mode|icon|color|reminder):/m);
-		if (directory.name === "setup-pstack") assert.doesNotMatch(text, /^disable-model-invocation:/m);
-		else assert.match(text, /^disable-model-invocation: true$/m);
+		assert.match(text, /^disable-model-invocation: true$/m);
 	}
 	assert.equal(
 		createHash("sha256").update(await readFile(join(root, "licenses", "pstack-MIT.txt"))).digest("hex"),
@@ -429,8 +459,8 @@ try {
 	markdownFiles.push(join(root, "PSTACK.md"));
 	const whySkill = await readFile(join(skillRoot, "why", "SKILL.md"), "utf8");
 	const investigatorPrompt = await readFile(join(skillRoot, "why", "references", "investigator-prompt.md"), "utf8");
-	assert.match(whySkill, /parent gathers Git history and diffs/);
-	assert.match(whySkill, /Pass all fetched Git and external evidence/);
+	assert.match(whySkill, /Always inspect local source history/);
+	assert.match(whySkill, /parent fetches Git and external evidence first/);
 	assert.match(investigatorPrompt, /cannot query Git/);
 	assert.doesNotMatch(investigatorPrompt, /may inspect local code and Git/i);
 	const forbidden = /(subagent_type|run_in_background|is_background|AskQuestion|grok-4|claude-fable|cursor-team-kit|scripts\/(?:orch|watch-pr)|worktree-audit|\.cursor\/)/;
@@ -460,7 +490,7 @@ try {
 	await loader.reload();
 	const loadedSkills = loader.getSkills();
 	assert.equal(loadedSkills.diagnostics.length, 0);
-	assert.equal(loadedSkills.skills.filter((skill) => skill.filePath.startsWith(skillRoot)).length, 47);
+	assert.equal(loadedSkills.skills.filter((skill) => skill.filePath.startsWith(skillRoot)).length, 14);
 
 	const smokeAgent = join(output, "smoke-agent");
 	await mkdir(smokeAgent, { recursive: true });

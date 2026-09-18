@@ -1,12 +1,11 @@
-# Prototype
+# Prototype, visual comparison, and evaluation
 
-A prototype answers one design question and is throwaway.
+A prototype answers one decision and is disposable.
 
-1. State the decision: layout, interaction, density, behavior, timing, or technical feasibility. Without a decision, use the feature playbook.
-2. Gather prior art only when the design direction is open.
-3. Build the smallest artifact in an isolated scratch directory. Prefer vanilla platform features and already-installed tools. Do not touch production source.
-4. Put alternatives behind one simple switch when side-by-side comparison matters.
-5. Exercise the matching surface with authorized available tools and capture screenshots, output, or timings that answer the decision.
-6. Present variants, tradeoffs, recommendation, evidence, and scratch path. Mark it throwaway; the chosen direction returns to feature or architect for production work.
-
-No production dependencies, migrations, publication, or infrastructure changes.
+1. State the decision and gradeable criteria: experience, layout, interaction, timing, feasibility, or output quality.
+2. Build the smallest artifact in scratch space. Do not modify production code or add production dependencies.
+3. Create at most two `bounded` candidates by default. Give each the same contract and isolated path. Add a third only when it tests a genuinely different premise.
+4. Put visual or interaction variants behind one simple switch when side-by-side comparison helps.
+5. Drive the real surface with the project's verification skill. Keep viewport, data, commands, versions, and scoring fixed. Capture screenshots, traces, outputs, or timings.
+6. Let the parent judge the evidence. Use one `critical` judge only for a consequential decision with material disagreement.
+7. Return variants, evidence, tradeoffs, recommendation, and scratch paths. Move the chosen direction to feature or architect for production work.

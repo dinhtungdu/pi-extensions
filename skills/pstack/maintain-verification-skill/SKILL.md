@@ -1,19 +1,16 @@
 ---
 name: maintain-verification-skill
-description: "Keep a project's verification skill and feature map honest through parallel source review and one serial live pass. Use for /skill:maintain-verification-skill or audit the verification skill."
+description: "Keep a project's verification CLI and feature map aligned with recent product changes and confirmed live behavior."
 disable-model-invocation: true
 ---
 
-# Maintain a Verification Skill
+# Maintain verification skill
 
-Edit only the verification skill directory. Product regressions are reported, never hidden by documentation changes.
+1. Locate the project verification skill, usually `.pi/skills/verify-*/`. If none exists, use `/skill:create-verification-skill`.
+2. Inspect product changes since the last maintenance point and map them to affected feature entries. Do not rescan every feature by default.
+3. Reconcile the feature index, linked pages, CLI help, selectors, commands, and expected evidence. For a large map, use one read-only `bounded` child on explicitly affected sections.
+4. Run the skill's doctor command, then drive affected features serially against the real app. Preserve screenshots, terminal output, responses, logs, or state changes that prove behavior.
+5. Fix confirmed documentation or harness drift inside the verification skill. Rerun every changed recipe. Report product failures separately.
+6. Run a full feature sweep only when explicitly requested, after a major product rewrite, or when repeated drift shows incremental maintenance is insufficient.
 
-1. Locate the project-local verification skill, usually `.pi/skills/verify-*/`. Ask only when several candidates exist; if none, use `/skill:create-verification-skill`.
-2. Reconcile the feature index with sibling files.
-3. Call one parallel `subagent` with a `poteto-agent` task per feature and `readonly: true`. Each task cites source behavior, likely documentation drift, and one live recipe. Use isolated child context; children do not drive the shared app or edit.
-4. Verify material source claims. Sweep recent user-facing changes for concrete missing features.
-5. Follow the skill's own launch, doctor, drive, evidence, and cleanup instructions serially. Exercise every mapped feature. Preserve evidence across cleanup and clean only processes/state this run created.
-6. Fix confirmed documentation, map, or harness drift inside the skill directory. Re-drive every harness fix. Report product failures separately.
-7. Run frontmatter/link/resource checks and one final live proof.
-
-Outcome is `clean`, `changed`, or `blocked`, with per-feature source/live evidence. Prepare a commit or PR description only when requested. Push and PR creation remain parent-only and require exact authority.
+Return changed paths, recent changes covered, live evidence, product failures, and untested surfaces.

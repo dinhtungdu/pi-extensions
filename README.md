@@ -5,7 +5,7 @@ Pi extensions:
 - `auto-dark-mode` — macOS dark/light theme switching
 - `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 - `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
-- `pstack` — 47 adapted engineering workflow skills, sticky Poteto Mode, model roles, and isolated Pi subagents
+- `pstack` — curated evidence-driven engineering skills, sticky Poteto Mode, workload routing, and isolated Pi subagents
 - `codex-fast` — persistently toggle OpenAI Codex Fast mode and show `⚡` while active
 - `discord` — automatic Discord project channels and Pi session threads with bidirectional text mirroring
 - `tool-visibility` — hide/show all tool execution rows without changing tools, messages, or session history
@@ -98,12 +98,12 @@ Notes:
 
 ## Pstack
 
-The port preserves all 47 skills from the pinned current upstream and adapts their commands, model selection, session handling, delegation, and authority rules to Pi.
+The port keeps pstack's verification, grounding, empirical design, review, and selective parallelism while removing overlapping workflows and provider-scale orchestration.
 
 ```text
 /poteto-mode <task>       # enable sticky mode and start the task
 /poteto-mode off          # disable it for this session
-/setup-pstack             # configure one model role
+/setup-pstack             # configure one workload route
 /setup-pstack status
 /setup-pstack reset
 /skill:architect <task>
@@ -111,11 +111,11 @@ The port preserves all 47 skills from the pinned current upstream and adapts the
 /skill:swarm <task>
 ```
 
-Registers tools: `subagent`, `pstack_tasks`, `pstack_config`, and `pstack_sessions`. `subagent` starts bounded child Pi processes in the background and immediately returns batch/task IDs; `pstack_tasks` lists, inspects, or cancels them. Active tasks appear below the editor and one completion message returns each batch's terminal results. `readonly: true` enforces a read/grep/find/ls-only tool set. Children otherwise keep their configured tools and run in the parent's working directory with offline startup, extensions disabled, no Manager environment variables, and no session persistence. Parent and parallel writers must avoid overlapping files. Push, PR, merge, deploy, cleanup, and Manager lifecycle authority stay with the parent/user.
+Registers tools: `subagent`, `pstack_tasks`, `pstack_config`, and `pstack_sessions`. `subagent` starts up to four bounded child Pi processes in the background, with three running concurrently. `pstack_tasks` lists, inspects, or cancels them. Active tasks appear below the editor; completion reports include model and child token usage. `readonly: true` enforces read/grep/find/ls-only tools. Children run in the parent's working directory with offline startup, extensions disabled, no Manager environment variables, and no session persistence. Parent and parallel writers must avoid overlapping files. Push, PR, merge, deploy, cleanup, and Manager lifecycle authority stay with the parent/user.
 
-Model roles default to the parent model and are stored in `~/.pi/agent/pstack/models.json` only after explicit setup. Fixed upstream model slugs are not copied.
+Delegated tasks use four configurable routes: `mechanical`, `bounded`, `complex`, and `critical`. Defaults are OpenAI Codex Luna, Terra, Sol, and Astra respectively, with active-parent fallback when a model is unavailable. `/setup-pstack` can map any route to any available provider/model or `inherit-parent`; task-level `model` and `thinking` values override the route.
 
-See [`PSTACK.md`](PSTACK.md) for exact upstream/reference revisions, drift, omissions, license provenance, and the weekly agent maintenance procedure.
+See [`PSTACK.md`](PSTACK.md) for source revisions, curation, routing, license provenance, and maintenance.
 
 ## OpenAI Codex fast mode
 

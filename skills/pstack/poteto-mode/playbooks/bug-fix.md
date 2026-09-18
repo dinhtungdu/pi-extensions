@@ -1,10 +1,10 @@
 # Bug fix
 
-1. Reproduce the symptom with the smallest realistic case. Preserve it as a regression check when non-trivial.
-2. Read every caller of the function or boundary likely involved. Use `/skill:how` for flow and `/skill:why` for regression history. Form competing hypotheses and eliminate them with runtime evidence; do not patch the report's surface blindly.
-3. Confirm one root mechanism. Use `/skill:architect` only if the fix crosses a meaningful boundary.
-4. Delegate a bounded writer with `agent: "poteto-agent"` and `role: "bug-fix"`. Name exact scope, reproduction, invariant, and checks.
-5. Inspect the diff, rerun the reproduction and nearby regressions, and remove temporary instrumentation.
-6. Verify sibling callers route through the shared fix. Report any path not covered.
+1. Reproduce the symptom with the smallest realistic case. Keep one regression check when it is cheap and behavior-focused.
+2. Trace every caller of the likely boundary and form competing mechanisms. Do not patch the report's surface blindly.
+3. Confirm the root mechanism with runtime or source evidence.
+4. Fix directly when local. Otherwise delegate one end-to-end `complex` worker for diagnosis, implementation, and verification. Use `bounded` only when the cause is already proved.
+5. Rerun the reproduction, sibling paths, and nearby regressions. Remove temporary instrumentation.
+6. Exercise the real surface when available and report any path not covered.
 
-A passing test without a demonstrated pre-fix failure is weak evidence. Publication remains parent-only.
+A passing test without a demonstrated pre-fix failure is weak evidence.

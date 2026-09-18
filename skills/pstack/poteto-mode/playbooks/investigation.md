@@ -1,7 +1,11 @@
-# Investigation
+# Investigation and forensics
 
-Investigation is read-only. Use `/skill:how` for current behavior and `/skill:why` for motivation/history. For independent slices, use one parallel `subagent` call with `readonly: true` on every task and verify the returned claims.
+Investigation is read-only unless the user separately asks for a fix.
 
-Return either the How structure (overview, concepts, flow, locations, gotchas) or a recommendation with alternatives and tradeoffs. Cite source paths and external identifiers. Report missing evidence instead of guessing.
+1. Pin the question, source, time window, and evidence needed to distinguish hypotheses.
+2. Search directly for a narrow question. For independent code or evidence slices, use at most two read-only `bounded` or `complex` children.
+3. For a fixed large trace, profile, heap snapshot, log, or transcript, use one `mechanical` reducer only when the parser and output contract are explicit. Keep artifact paths, not raw payloads, in parent context.
+4. Resolve runtime evidence to source files and symbols. Compare with a baseline when available.
+5. Confirm the mechanism with non-destructive observation or narrow instrumentation. Missing symbols, integrations, or provenance are explicit gaps.
 
-Do not edit, open a PR, or launch a long watcher. If the answer leads to a code change, hand it to the matching feature, bug-fix, refactoring, or performance playbook.
+Return the question, evidence, strongest supported mechanism, source locations, confidence, artifacts, and next check. Hand confirmed causes to bug-fix or performance.

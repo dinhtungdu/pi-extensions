@@ -1,17 +1,17 @@
-# Multi-phase plan
+# Multi-phase work
 
-Plan only when the work genuinely has dependent phases. A flat task needs no ceremony.
+Use phases only when dependencies require them. A flat task needs no ceremony.
 
 For each phase record:
 
 - outcome and non-goals
-- exact files/surfaces
+- exact files or user surfaces
 - dependencies and ordering
-- one writer and any read-only reviewers
-- smallest check that proves completion
-- evidence artifact
+- one writer and any justified read-only reviewer
+- smallest behavior check
+- live evidence artifact
 - stop condition or user decision
 
-Sequence phases so each leaves the repository valid and reviewable. Parallelize only independent read-only work or isolated writers. Use existing Manager tracking when active; otherwise keep the plan in the conversation or a user-requested file.
+Sequence phases so each leaves the repository valid and reviewable. Parallelize only independent read-only work or isolated writers. Keep the plan in the active tracker when one exists; otherwise keep it in chat or a user-requested file.
 
-Before execution, run `/skill:interrogate` on risky cross-boundary assumptions. During execution, update the plan from verified evidence rather than child status. At the end, audit every phase predicate and report unmet items plainly.
+Use `/skill:architect` before planning a hard-to-reverse boundary. During execution, update the plan from verified artifacts, not child status. Audit every phase predicate before completion.

@@ -1,10 +1,10 @@
 # Refactoring
 
-1. State the behavior that must remain unchanged and pin it with an existing integration test or one small characterization check.
-2. Read every caller, string reference, config key, and documentation back-reference affected by the move or rename.
-3. Choose the smallest target shape. No compatibility shim or parallel old/new API unless explicitly required.
-4. Delegate one mechanical writer with `agent: "poteto-agent"` and `role: "feature, refactoring"`, exact paths, rename map, and behavior pin.
-5. Move in small steps that keep the pin green. Migrate all callers, then delete the old API in the same wave.
-6. Inspect the full diff, search for stale names, run lint and relevant tests, and report anything intentionally left.
+1. State the behavior that must remain unchanged and pin it with an existing integration check or one small characterization check.
+2. Read callers, string references, configuration, and documentation affected by the move.
+3. Choose the smallest target shape. Do not keep parallel old and new internal APIs unless compatibility is explicit.
+4. Use one `bounded` writer for a long mechanical migration. Use `complex` only when ownership or boundaries must change.
+5. Migrate callers and delete the old path in the same wave. Keep the behavior pin green.
+6. Search for stale names, inspect the full diff, run lint and relevant tests, then verify the real behavior.
 
-Do not smuggle behavior changes into a refactor.
+Do not hide behavior changes inside a refactor.

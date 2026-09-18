@@ -19,38 +19,40 @@ const MODE_ENTRY = "pi-extensions-pstack-mode";
 const TASK_WIDGET_KEY = "pi-extensions-pstack-tasks";
 const TASK_COMPLETE_MESSAGE = "pi-extensions-pstack-batch-complete";
 const STATUS_KEY = PACKAGE_FOOTER_STATUS_KEYS.pstack;
-const MAX_TASKS = 8;
-const MAX_CONCURRENCY = 4;
-const MAX_OUTSTANDING_TASKS = 16;
-const MAX_OUTPUT_BYTES = 50 * 1024;
+const MAX_TASKS = 4;
+const MAX_CONCURRENCY = 3;
+const MAX_OUTSTANDING_TASKS = 8;
+const MAX_TASK_OUTPUT_BYTES = 16 * 1024;
+const MAX_BATCH_OUTPUT_BYTES = 32 * 1024;
 const MAX_STDERR_BYTES = 16 * 1024;
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SKILL_PATH = join(PACKAGE_ROOT, "skills", "pstack", "poteto-mode", "SKILL.md");
 const PORTABILITY_PATH = join(PACKAGE_ROOT, "skills", "pstack", "poteto-mode", "references", "pi-port.md");
 const AGENT_DIR = join(PACKAGE_ROOT, "agents", "pstack");
 
-export const PSTACK_ROLE_NAMES = [
-	"feature, refactoring",
-	"bug-fix",
-	"perf-issue",
-	"hillclimb",
-	"judgment and prose",
-	"hardest tasks",
-	"how explorer",
-	"how explainer",
-	"why investigators",
-	"why synthesizer",
-	"reflect tooling",
-	"reflect judgment, divergent, synthesizer",
-	"arena runners",
-	"arena cross-judge pool",
-	"swarm workers",
-	"architect runners",
-	"interrogate reviewers",
-] as const;
+export const PSTACK_ROUTE_NAMES = ["mechanical", "bounded", "complex", "critical"] as const;
 
-type PstackRole = (typeof PSTACK_ROLE_NAMES)[number];
-type RoleValue = string | string[];
+type PstackRoute = (typeof PSTACK_ROUTE_NAMES)[number];
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+interface RouteConfig {
+	model: string;
+	thinking: ThinkingLevel;
+}
+
+interface PstackConfig {
+	version: 2;
+	routes: Record<PstackRoute, RouteConfig>;
+}
+
+const DEFAULT_ROUTES: Record<PstackRoute, RouteConfig> = {
+	mechanical: { model: "openai-codex/gpt-5.6-luna", thinking: "medium" },
+	bounded: { model: "openai-codex/gpt-5.6-terra", thinking: "high" },
+	complex: { model: "openai-codex/gpt-5.6-sol", thinking: "high" },
+	critical: { model: "openai-codex/gpt-6-astra", thinking: "high" },
+};
+
+const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 interface Usage {
 	input: number;
@@ -59,11 +61,6 @@ interface Usage {
 	cacheWrite: number;
 	totalTokens: number;
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
-}
-
-interface PstackConfig {
-	version: 1;
-	roles: Record<PstackRole, RoleValue>;
 }
 
 interface AgentDefinition {
@@ -77,6 +74,7 @@ interface PreparedTask {
 	task: TaskInput;
 	agent: AgentDefinition;
 	model?: string;
+	thinking?: ThinkingLevel;
 }
 
 interface ChildResult {
@@ -141,8 +139,9 @@ const TaskSchema = Type.Object(
 	{
 		agent: Type.String({ minLength: 1, description: "Bundled agent name: poteto-agent or comment-sicko." }),
 		task: Type.String({ minLength: 1, description: "Self-contained delegated task with file pointers and authority limits." }),
-		role: Type.Optional(Type.String({ description: "Role configured by /setup-pstack or pstack_config." })),
-		model: Type.Optional(Type.String({ description: "One listed Pi provider/model override." })),
+		route: Type.Optional(Type.String({ description: "Workload route: mechanical, bounded, complex, or critical." })),
+		model: Type.Optional(Type.String({ description: "Exact listed Pi provider/model override." })),
+		thinking: Type.Optional(Type.String({ description: "Thinking override: off, minimal, low, medium, high, xhigh, or max." })),
 		readonly: Type.Optional(Type.Boolean({ description: "Restrict the child to read, grep, find, and ls." })),
 	},
 	{ additionalProperties: false },
@@ -152,8 +151,9 @@ const SubagentParams = Type.Object(
 	{
 		agent: Type.Optional(TaskSchema.properties.agent),
 		task: Type.Optional(TaskSchema.properties.task),
-		role: Type.Optional(TaskSchema.properties.role),
+		route: Type.Optional(TaskSchema.properties.route),
 		model: Type.Optional(TaskSchema.properties.model),
+		thinking: Type.Optional(TaskSchema.properties.thinking),
 		readonly: Type.Optional(TaskSchema.properties.readonly),
 		tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: MAX_TASKS })),
 	},
@@ -166,9 +166,9 @@ type SubagentInput = Static<typeof SubagentParams>;
 const ConfigParams = Type.Object(
 	{
 		action: Type.String({ description: "get, list-models, set, or reset" }),
-		role: Type.Optional(Type.String()),
-		model: Type.Optional(Type.String()),
-		models: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: MAX_TASKS })),
+		route: Type.Optional(Type.String({ description: "mechanical, bounded, complex, or critical" })),
+		model: Type.Optional(Type.String({ description: "Exact listed Pi provider/model or inherit-parent." })),
+		thinking: Type.Optional(Type.String({ description: "off, minimal, low, medium, high, xhigh, or max" })),
 	},
 	{ additionalProperties: false },
 );
@@ -216,24 +216,26 @@ function configPath(): string {
 
 function defaultConfig(): PstackConfig {
 	return {
-		version: 1,
-		roles: Object.fromEntries(PSTACK_ROLE_NAMES.map((role) => [role, "inherit-parent"])) as Record<
-			PstackRole,
-			RoleValue
-		>,
+		version: 2,
+		routes: Object.fromEntries(
+			PSTACK_ROUTE_NAMES.map((route) => [route, { ...DEFAULT_ROUTES[route] }]),
+		) as Record<PstackRoute, RouteConfig>,
 	};
 }
 
 function parseConfig(value: unknown): PstackConfig {
 	const config = defaultConfig();
-	if (!value || typeof value !== "object" || (value as { version?: unknown }).version !== 1) return config;
-	const roles = (value as { roles?: unknown }).roles;
-	if (!roles || typeof roles !== "object" || Array.isArray(roles)) return config;
-	for (const role of PSTACK_ROLE_NAMES) {
-		const candidate = (roles as Record<string, unknown>)[role];
-		if (typeof candidate === "string" && candidate.trim()) config.roles[role] = candidate;
-		if (Array.isArray(candidate) && candidate.length > 0 && candidate.every((item) => typeof item === "string" && item.trim())) {
-			config.roles[role] = [...candidate];
+	if (!value || typeof value !== "object" || (value as { version?: unknown }).version !== 2) return config;
+	const routes = (value as { routes?: unknown }).routes;
+	if (!routes || typeof routes !== "object" || Array.isArray(routes)) return config;
+	for (const route of PSTACK_ROUTE_NAMES) {
+		const candidate = (routes as Record<string, unknown>)[route];
+		if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+		const model = (candidate as { model?: unknown }).model;
+		const thinking = (candidate as { thinking?: unknown }).thinking;
+		if (typeof model === "string" && model.trim()) config.routes[route].model = model;
+		if (typeof thinking === "string" && THINKING_LEVELS.has(thinking as ThinkingLevel)) {
+			config.routes[route].thinking = thinking as ThinkingLevel;
 		}
 	}
 	return config;
@@ -290,12 +292,6 @@ async function loadAgents(): Promise<AgentDefinition[]> {
 	return agents;
 }
 
-function configuredModels(config: PstackConfig, role: string | undefined): string[] {
-	if (!role || !PSTACK_ROLE_NAMES.includes(role as PstackRole)) return [];
-	const value = config.roles[role as PstackRole];
-	return typeof value === "string" ? [value] : value;
-}
-
 function availableModels(ctx: ExtensionContext): string[] {
 	const models = ctx.scopedModels.length ? ctx.scopedModels.map((entry) => entry.model) : ctx.modelRegistry.getAvailable();
 	const available = new Set(models.map((model) => `${model.provider}/${model.id}`));
@@ -303,18 +299,41 @@ function availableModels(ctx: ExtensionContext): string[] {
 	return [...available];
 }
 
-function validateModels(models: string[], available: string[]): void {
-	const choices = new Set(["inherit-parent", "auto", ...available]);
-	const invalid = models.filter((model) => !choices.has(model));
-	if (invalid.length) throw new Error(`Unknown Pi model: ${invalid.join(", ")}. Use pstack_config action=list-models.`);
+function routeForTask(
+	task: TaskInput,
+	config: PstackConfig,
+	available: string[],
+	parentModel: string | undefined,
+	parentThinking: ThinkingLevel | undefined,
+): { model: string | undefined; thinking: ThinkingLevel | undefined } {
+	if (task.route && !PSTACK_ROUTE_NAMES.includes(task.route as PstackRoute)) {
+		throw new Error(`Unknown pstack route: ${task.route}. Use mechanical, bounded, complex, or critical.`);
+	}
+	if (task.model && !available.includes(task.model)) {
+		throw new Error(`Unknown Pi model: ${task.model}. Use pstack_config action=list-models.`);
+	}
+	if (task.thinking && !THINKING_LEVELS.has(task.thinking as ThinkingLevel)) {
+		throw new Error(`Unknown thinking level: ${task.thinking}.`);
+	}
+	const route = task.route ? config.routes[task.route as PstackRoute] : undefined;
+	const configuredModel = route?.model === "inherit-parent" ? parentModel : route?.model;
+	return {
+		model: task.model ?? (configuredModel && available.includes(configuredModel) ? configuredModel : parentModel),
+		thinking: (task.thinking as ThinkingLevel | undefined) ?? route?.thinking ?? parentThinking,
+	};
 }
 
-function modelForTask(task: TaskInput, index: number, config: PstackConfig, parentModel: string | undefined): string | undefined {
-	if (task.model) return task.model === "auto" ? undefined : task.model === "inherit-parent" ? parentModel : task.model;
-	const configured = configuredModels(config, task.role);
-	if (!configured.length) return parentModel;
-	const selected = configured[index % configured.length];
-	return selected === "auto" ? undefined : selected === "inherit-parent" ? parentModel : selected;
+function formatTokens(count: number): string {
+	if (count < 1_000) return String(count);
+	if (count < 1_000_000) return `${(count / 1_000).toFixed(count < 10_000 ? 1 : 0)}k`;
+	return `${(count / 1_000_000).toFixed(1)}m`;
+}
+
+function formatUsage(usage: Usage): string {
+	const parts = [`↑${formatTokens(usage.input)}`, `↓${formatTokens(usage.output)}`];
+	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
+	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
+	return parts.join(" ");
 }
 
 function limitBytes(text: string, limit: number): string {
@@ -398,7 +417,7 @@ function processJsonLine(
 		const message = event.message;
 		const output = message.content?.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n").trim();
 		if (output) {
-			result.output = limitBytes(output, MAX_OUTPUT_BYTES);
+			result.output = limitBytes(output, MAX_TASK_OUTPUT_BYTES);
 			onProgress?.(latestLine(output));
 		}
 		if (message.model) result.model = message.model;
@@ -415,22 +434,18 @@ async function runChild(
 	task: TaskInput,
 	agent: AgentDefinition,
 	model: string | undefined,
+	thinking: ThinkingLevel | undefined,
 	signal: AbortSignal | undefined,
 	onProgress?: (status: string) => void,
 ): Promise<ChildResult> {
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-pstack-"));
 	const promptPath = join(temporaryDirectory, "agent.md");
 	const authority = [
-		"Follow the user, repository, and active task authority in this working directory.",
-		"Do not push, create or alter pull requests, merge, deploy, delete user data, or mutate infrastructure unless the parent task grants that exact action.",
-		"When a Manager or supervisor owns canonical task state, never mutate it. Return evidence to the parent task lead.",
-		"Parallel children may write only in explicitly isolated worktrees or disjoint scratch paths. Otherwise remain read-only.",
+		"Stay inside the delegated scope and checkout.",
+		"Do not push, create or alter pull requests, merge, deploy, delete user data, change infrastructure, or mutate Manager state unless the task grants that exact action.",
+		"Return evidence to the parent; the parent owns external side effects and final judgment.",
 	].join("\n");
-	await writeFile(
-		promptPath,
-		`${agent.prompt}\n\nRead ${PORTABILITY_PATH} before working.\n\n${authority}\n`,
-		{ encoding: "utf8", mode: 0o600 },
-	);
+	await writeFile(promptPath, `${agent.prompt}\n\n${authority}\n`, { encoding: "utf8", mode: 0o600 });
 	const args = [
 		"--mode",
 		"json",
@@ -444,6 +459,7 @@ async function runChild(
 		promptPath,
 	];
 	if (model) args.push("--model", model);
+	if (thinking) args.push("--thinking", thinking);
 	const tools = task.readonly ? ["read", "grep", "find", "ls"] : agent.tools;
 	if (tools?.length) args.push("--tools", tools.join(","));
 	args.push(`Delegated task:\n${task.task}`);
@@ -570,7 +586,9 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 			batchId: task.batchId,
 			agent: task.prepared.agent.name,
 			task: limitBytes(task.prepared.task.task, 2_000),
+			route: task.prepared.task.route,
 			model: task.prepared.model,
+			thinking: task.prepared.thinking,
 			readonly: task.prepared.task.readonly === true,
 			status: task.status,
 			latest: task.latest,
@@ -591,7 +609,12 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 
 	function batchReport(batch: BackgroundBatch): string {
 		const status = batchStatus(batch);
-		const sections = [`Pstack batch ${batch.id} ${status}.`];
+		const total = emptyUsage();
+		for (const id of batch.taskIds) addUsage(total, tasks.get(id)?.result?.usage);
+		const sections = [
+			`Pstack batch ${batch.id} ${status}.`,
+			...(total.input || total.output || total.cacheRead || total.cacheWrite ? [`Total child usage: ${formatUsage(total)}`] : []),
+		];
 		for (const id of batch.taskIds) {
 			const task = tasks.get(id);
 			if (!task) continue;
@@ -601,9 +624,11 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 			}
 			const label = task.status === "completed" ? "completed" : task.status;
 			const output = task.status === "completed" ? task.result.output : childFailure(task.result);
-			sections.push(`### ${task.prepared.agent.name} ${label} (${task.id})\n\n${output || "(no output)"}`);
+			const route = task.prepared.task.route ? ` · ${task.prepared.task.route}` : "";
+			const model = task.result.model ?? task.prepared.model ?? "default";
+			sections.push(`### ${task.prepared.agent.name} ${label} (${task.id})\n\n${model}${route} · ${task.prepared.thinking ?? "default"} · ${formatUsage(task.result.usage)}\n\n${output || "(no output)"}`);
 		}
-		return limitBytes(sections.join("\n\n"), MAX_OUTPUT_BYTES);
+		return limitBytes(sections.join("\n\n"), MAX_BATCH_OUTPUT_BYTES);
 	}
 
 	function renderTasks(ctx: ExtensionContext): void {
@@ -696,6 +721,7 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 			task.prepared.task,
 			task.prepared.agent,
 			task.prepared.model,
+			task.prepared.thinking,
 			task.controller.signal,
 			(status) => {
 				if (task.generation !== generation || task.status !== "running") return;
@@ -836,7 +862,7 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("setup-pstack", {
-		description: "Configure one pstack model role from Pi's available models; use status or reset for maintenance",
+		description: "Configure one pstack workload route; use status or reset for maintenance",
 		getArgumentCompletions: (prefix) => ["status", "reset"].filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
@@ -846,29 +872,31 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 			}
 			if (action === "reset") {
 				await mutateConfig(() => defaultConfig());
-				ctx.ui.notify(`Reset pstack models to inherit the parent model: ${configPath()}`, "info");
+				ctx.ui.notify(`Reset pstack routes to OpenAI defaults: ${configPath()}`, "info");
 				return;
 			}
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Run /setup-pstack in interactive Pi, or use pstack_config.", "warning");
 				return;
 			}
-			const role = await ctx.ui.select("Pstack role", [...PSTACK_ROLE_NAMES]);
-			if (!role) return;
-			const model = await ctx.ui.select(`Model for ${role}`, ["inherit-parent", ...availableModels(ctx)]);
+			const route = await ctx.ui.select("Pstack route", [...PSTACK_ROUTE_NAMES]);
+			if (!route) return;
+			const model = await ctx.ui.select(`Model for ${route}`, ["inherit-parent", ...availableModels(ctx)]);
 			if (!model) return;
+			const thinking = await ctx.ui.select(`Thinking for ${route}`, [...THINKING_LEVELS]);
+			if (!thinking) return;
 			await mutateConfig((config) => {
-				config.roles[role as PstackRole] = model;
+				config.routes[route as PstackRoute] = { model, thinking: thinking as ThinkingLevel };
 				return config;
 			});
-			ctx.ui.notify(`Saved ${role}: ${model} to ${configPath()}`, "info");
+			ctx.ui.notify(`Saved ${route}: ${model}:${thinking} to ${configPath()}`, "info");
 		},
 	});
 
 	pi.registerTool({
 		name: "pstack_config",
 		label: "Pstack Config",
-		description: "List Pi models or inspect pstack role mappings. Set/reset mappings only when the user explicitly asks to configure pstack.",
+		description: "List Pi models or inspect pstack's four workload routes. Set/reset routes only when the user explicitly asks to configure pstack.",
 		parameters: ConfigParams,
 		async execute(_id, params: ConfigInput, _signal, _update, ctx) {
 			const models = availableModels(ctx);
@@ -878,12 +906,16 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 			if (!["get", "set", "reset"].includes(params.action)) throw new Error("pstack_config action must be get, list-models, set, or reset.");
 			let config: PstackConfig;
 			if (params.action === "set") {
-				if (!params.role || !PSTACK_ROLE_NAMES.includes(params.role as PstackRole)) throw new Error("pstack_config set requires a listed role.");
-				const values = params.models ?? (params.model ? [params.model] : []);
-				if (!values.length || (params.model && params.models)) throw new Error("pstack_config set requires exactly one of model or models.");
-				validateModels(values, models);
+				if (!params.route || !PSTACK_ROUTE_NAMES.includes(params.route as PstackRoute)) throw new Error("pstack_config set requires a listed route.");
+				if (!params.model && !params.thinking) throw new Error("pstack_config set requires model, thinking, or both.");
+				if (params.model && params.model !== "inherit-parent" && !models.includes(params.model)) {
+					throw new Error(`Unknown Pi model: ${params.model}. Use pstack_config action=list-models.`);
+				}
+				if (params.thinking && !THINKING_LEVELS.has(params.thinking as ThinkingLevel)) throw new Error(`Unknown thinking level: ${params.thinking}.`);
 				config = await mutateConfig((current) => {
-					current.roles[params.role as PstackRole] = params.models ? [...values] : values[0];
+					const route = current.routes[params.route as PstackRoute];
+					if (params.model) route.model = params.model;
+					if (params.thinking) route.thinking = params.thinking as ThinkingLevel;
 					return current;
 				});
 			} else if (params.action === "reset") {
@@ -910,33 +942,32 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent",
 		label: "Pstack Subagent",
-		description: `Start bundled pstack agents in background Pi processes and return task IDs immediately. Provide agent+task, or tasks for up to ${MAX_TASKS} tasks (${MAX_CONCURRENCY} running at once). Set readonly=true for analysis/review. Writers keep their existing tools and working directory; the parent must avoid overlapping edits.`,
+		description: `Start bundled pstack agents in background Pi processes and return task IDs immediately. Provide agent+task, or up to ${MAX_TASKS} tasks (${MAX_CONCURRENCY} running at once). Routes: mechanical, bounded, complex, critical. Explicit model/thinking overrides route config. Set readonly=true for analysis/review; isolate parallel writers.`,
 		parameters: SubagentParams,
 		executionMode: "sequential",
 		async execute(_id, params: SubagentInput, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Subagent start cancelled.");
-			const hasSingleFields = [params.agent, params.task, params.role, params.model, params.readonly].some((value) => value !== undefined);
+			const hasSingleFields = [params.agent, params.task, params.route, params.model, params.thinking, params.readonly].some((value) => value !== undefined);
 			if ((params.tasks?.length && hasSingleFields) || (!params.tasks?.length && (!params.agent || !params.task))) {
 				throw new Error("Provide exactly one subagent mode: agent + task, or tasks.");
 			}
 			const single = params.tasks?.length
 				? undefined
-				: [{ agent: params.agent!, task: params.task!, role: params.role, model: params.model, readonly: params.readonly }];
+				: [{ agent: params.agent!, task: params.task!, route: params.route, model: params.model, thinking: params.thinking, readonly: params.readonly }];
 			const agents = await loadAgents();
 			const config = await readConfig();
 			const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			const parentThinking = ctx.thinkingLevel as ThinkingLevel | undefined;
 			const knownModels = availableModels(ctx);
 			const findAgent = (name: string) => {
 				const agent = agents.find((candidate) => candidate.name === name);
 				if (!agent) throw new Error(`Unknown pstack agent ${JSON.stringify(name)}. Available: ${agents.map((item) => item.name).join(", ")}.`);
 				return agent;
 			};
-			const prepare = (task: TaskInput, index: number): PreparedTask => {
+			const prepare = (task: TaskInput): PreparedTask => {
 				if (!task.task.trim()) throw new Error("Subagent task must not be blank.");
-				if (task.role && !PSTACK_ROLE_NAMES.includes(task.role as PstackRole)) throw new Error(`Unknown pstack role: ${task.role}.`);
-				const model = modelForTask(task, index, config, parentModel);
-				if (model) validateModels([model], knownModels);
-				return { task, agent: findAgent(task.agent), model };
+				const { model, thinking } = routeForTask(task, config, knownModels, parentModel, parentThinking);
+				return { task, agent: findAgent(task.agent), model, thinking };
 			};
 			const prepared = (params.tasks ?? single!).map(prepare);
 			if (signal?.aborted) throw new Error("Subagent start cancelled.");
@@ -968,7 +999,7 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 			pumpQueue();
 			const lines = batch.taskIds.map((id) => {
 				const task = tasks.get(id)!;
-				return `- ${id}: ${task.prepared.agent.name}${task.prepared.model ? ` (${task.prepared.model})` : ""}`;
+				return `- ${id}: ${task.prepared.agent.name}${task.prepared.task.route ? ` [${task.prepared.task.route}]` : ""}${task.prepared.model ? ` (${task.prepared.model}:${task.prepared.thinking ?? "default"})` : ""}`;
 			});
 			return {
 				content: [{ type: "text", text: `Started pstack batch ${batchId} in the background.\n${lines.join("\n")}\nUse pstack_tasks get/cancel with a batch or task ID. A completion message will arrive when the batch finishes.` }],
@@ -1006,7 +1037,7 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 						? task.status === "completed" ? task.result.output : childFailure(task.result)
 						: task.latest;
 					return {
-						content: [{ type: "text", text: limitBytes(`${task.id} ${task.status}\n\n${output || "(no output yet)"}`, MAX_OUTPUT_BYTES) }],
+						content: [{ type: "text", text: limitBytes(`${task.id} ${task.status}\n\n${output || "(no output yet)"}`, MAX_TASK_OUTPUT_BYTES) }],
 						details: publicTask(task, true),
 					};
 				}

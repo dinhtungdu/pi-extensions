@@ -1,25 +1,17 @@
 ---
 name: swarm
-description: "Fan out bounded parallel workers, drain every result, and return one evidenced report. Use for /skill:swarm, 'swarm this', parallel coverage, races, gauntlets, or broad read-only exploration."
+description: "Fan out up to four independent workers for real coverage, measured samples, or disjoint work, then return one evidenced report."
 disable-model-invocation: true
 ---
 
 # Swarm
 
-## Frame
+Use a swarm only when work has independent slices or a meaningful sample size. One difficult task is not a swarm.
 
-State the done predicate and final report. Choose one shape: disjoint coverage, identical race, or a mix. For a race, declare `first pass`, `rank all`, or `best of` before launch. Derive N from the work, capped by the `subagent` tool.
+1. State the done predicate, required coverage, and aggregation rule.
+2. Derive the smallest useful N, capped at four.
+3. Route fixed extraction or repeated verification to `mechanical`, well-specified exploration or implementation to `bounded`, and ambiguous slices to `complex`. Never use `critical` as a swarm default.
+4. Give every task a standalone goal, exact slice, paths, authority, verification, and output contract. Parallel writers need isolated worktrees or disjoint paths; otherwise use `readonly: true`.
+5. Drain every result. Treat failures as explicit dropouts and verify material claims against source or runtime.
 
-Use the configured `swarm workers` role. If workers write, every worker needs a separate worktree or disjoint scratch path. Otherwise keep the swarm read-only.
-
-## Fan out
-
-Call `subagent` once with a parallel `tasks` array. Use `agent: "poteto-agent"` and `role: "swarm workers"`. Every brief stands alone: goal, exact slice or race arm, paths, authority, verification, and required report. Results use `PASS`, `ISSUES`, or `BLOCKED` with evidence.
-
-A child failure is a reported dropout. Continue with remaining results unless its slice is required for coverage.
-
-## Aggregate
-
-Read every terminal result. For coverage, every required slice needs evidence. For a race, apply the declared selection rule. Verify material claims against source or runtime. Do not paste raw child dumps.
-
-Return one compact table, one-line confirmed issues, explicit gaps/dropouts, and the race rule when used.
+Return one compact coverage table, confirmed findings, gaps, dropouts, and the selection rule for races. Do not paste raw child reports.
