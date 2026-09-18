@@ -44,6 +44,7 @@ Escalate instead of retrying weak work indefinitely: mechanical failure goes to 
 Follow [the engineering standard](references/engineering-standard.md). Load one matching playbook, not all of them:
 
 - [Issue implementation](playbooks/issue-implementation.md)
+- [Pull request review](playbooks/pr-review.md)
 - [Feature](playbooks/feature.md)
 - [Bug fix](playbooks/bug-fix.md)
 - [Refactoring](playbooks/refactoring.md)

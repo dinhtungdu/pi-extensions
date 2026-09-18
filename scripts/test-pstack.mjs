@@ -93,8 +93,14 @@ if (process.argv.includes("--mode") && process.argv.includes("--no-session")) {
 const root = resolve(import.meta.dirname, "..");
 const potetoSkillPath = "skills/pstack/poteto-mode/SKILL.md";
 const issuePlaybookPath = "skills/pstack/poteto-mode/playbooks/issue-implementation.md";
-assert.match(await readFile(join(root, potetoSkillPath), "utf8"), /\[Issue implementation\]\(playbooks\/issue-implementation\.md\)/);
+const prReviewPlaybookPath = "skills/pstack/poteto-mode/playbooks/pr-review.md";
+const potetoSkill = await readFile(join(root, potetoSkillPath), "utf8");
+assert.match(potetoSkill, /\[Issue implementation\]\(playbooks\/issue-implementation\.md\)/);
+assert.match(potetoSkill, /\[Pull request review\]\(playbooks\/pr-review\.md\)/);
 const issuePlaybook = await readFile(join(root, issuePlaybookPath), "utf8");
+assert.match(issuePlaybook, /The driver supplies task context, the issue, and the path to the project's verification skill\./);
+const prReviewPlaybook = await readFile(join(root, prReviewPlaybookPath), "utf8");
+assert.match(prReviewPlaybook, /The driver supplies task context and the pull request target\./);
 assert.ok(
 	issuePlaybook.includes(
 		"Read [How](../../how/SKILL.md) directly to ground current mechanics. Trace the affected entry point, callers, data, effects, constraints, and user-visible acceptance criteria. When prior work is relevant, read [Recall](../../recall/SKILL.md) directly. When historical intent affects the decision, read [Why](../../why/SKILL.md) directly.",
@@ -113,7 +119,7 @@ assert.ok(
 const pack = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8" });
 assert.equal(pack.status, 0, `npm pack failed:\n${pack.stdout}\n${pack.stderr}`);
 const packedFiles = new Set(JSON.parse(pack.stdout)[0].files.map(({ path }) => path));
-for (const path of [potetoSkillPath, issuePlaybookPath]) assert.ok(packedFiles.has(path), `${path} missing from npm package`);
+for (const path of [potetoSkillPath, issuePlaybookPath, prReviewPlaybookPath]) assert.ok(packedFiles.has(path), `${path} missing from npm package`);
 
 const output = await mkdtemp(join(root, ".pstack-test-"));
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;

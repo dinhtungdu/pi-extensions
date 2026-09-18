@@ -1,6 +1,6 @@
 # Issue implementation
 
-The driver supplies the issue and the path to the project's verification skill. Treat both as required inputs. Read each supporting skill file only when its stage begins; do not front-load them.
+The driver supplies task context, the issue, and the path to the project's verification skill. Treat all as required inputs. Task context includes objective, constraints, acceptance, current evidence, and current stage; when a Manager task provides a canonical `Stages` ledger, use it as context, not an execution workflow or lifecycle state machine. Read each supporting skill file only when its stage begins; do not front-load them.
 
 ## 1. Ground + verification preflight
 
