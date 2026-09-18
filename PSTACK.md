@@ -13,16 +13,17 @@ Upstream is MIT licensed, Copyright © 2026 Lauren Tan. Its notice remains at `l
 
 ## Curated product
 
-The package ships 14 skills and eight Poteto Mode playbooks. The retained core is:
+The package ships 14 skills and nine Poteto Mode playbooks. The retained core is:
 
 - project-specific verification CLIs and feature maps
+- staged issue implementation with driver-supplied verification and live before/after evidence
 - current-code, historical, and session grounding
 - empirical prototypes and architecture sketches
 - proportionate independent review
 - selective swarms for real coverage or measured samples
 - concise teaching, technical writing, reflection, automation discovery, and `/bro`
 
-Fine-grained principle skills are consolidated into `skills/pstack/poteto-mode/references/engineering-standard.md`. Overlapping agent lifecycle, planning, forensics, visual, evaluation, and shipping playbooks are consolidated under eight routes. Product-specific bot UI, duplicate orchestration, generic language/style packs, and provider-scale cloud automation are omitted.
+Fine-grained principle skills are consolidated into `skills/pstack/poteto-mode/references/engineering-standard.md`. Overlapping agent lifecycle, planning, forensics, visual, evaluation, and shipping workflows are consolidated under nine playbooks. Product-specific bot UI, duplicate orchestration, generic language/style packs, and provider-scale cloud automation are omitted.
 
 ## Model routing
 

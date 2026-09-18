@@ -91,6 +91,14 @@ if (process.argv.includes("--mode") && process.argv.includes("--no-session")) {
 }
 
 const root = resolve(import.meta.dirname, "..");
+const potetoSkillPath = "skills/pstack/poteto-mode/SKILL.md";
+const issuePlaybookPath = "skills/pstack/poteto-mode/playbooks/issue-implementation.md";
+assert.match(await readFile(join(root, potetoSkillPath), "utf8"), /\[Issue implementation\]\(playbooks\/issue-implementation\.md\)/);
+const pack = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8" });
+assert.equal(pack.status, 0, `npm pack failed:\n${pack.stdout}\n${pack.stderr}`);
+const packedFiles = new Set(JSON.parse(pack.stdout)[0].files.map(({ path }) => path));
+for (const path of [potetoSkillPath, issuePlaybookPath]) assert.ok(packedFiles.has(path), `${path} missing from npm package`);
+
 const output = await mkdtemp(join(root, ".pstack-test-"));
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 process.env.PI_CODING_AGENT_DIR = join(output, "agent");
