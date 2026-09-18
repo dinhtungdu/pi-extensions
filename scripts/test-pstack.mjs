@@ -94,6 +94,22 @@ const root = resolve(import.meta.dirname, "..");
 const potetoSkillPath = "skills/pstack/poteto-mode/SKILL.md";
 const issuePlaybookPath = "skills/pstack/poteto-mode/playbooks/issue-implementation.md";
 assert.match(await readFile(join(root, potetoSkillPath), "utf8"), /\[Issue implementation\]\(playbooks\/issue-implementation\.md\)/);
+const issuePlaybook = await readFile(join(root, issuePlaybookPath), "utf8");
+assert.ok(
+	issuePlaybook.includes(
+		"Read [How](../../how/SKILL.md) directly to ground current mechanics. Trace the affected entry point, callers, data, effects, constraints, and user-visible acceptance criteria. When prior work is relevant, read [Recall](../../recall/SKILL.md) directly. When historical intent affects the decision, read [Why](../../why/SKILL.md) directly.",
+	),
+);
+assert.ok(
+	issuePlaybook.includes(
+		"Design directly by default. Turn the observed behavior and traced flow into the smallest empirical design: affected boundary and callers, expected observable delta, implementation units, focused checks, and live verification recipe. Read [Architect](../../architect/SKILL.md) directly only when the boundary is consequential or hard to reverse, or when materially competing boundaries require comparison.",
+	),
+);
+assert.ok(
+	issuePlaybook.includes(
+		"Always inspect and review the generated code directly in its full diff and caller context against the issue, design, checks, and before/after evidence. Read [Interrogate](../../interrogate/SKILL.md) directly only when the change is material or risky, or when independent review is explicitly requested.",
+	),
+);
 const pack = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8" });
 assert.equal(pack.status, 0, `npm pack failed:\n${pack.stdout}\n${pack.stderr}`);
 const packedFiles = new Set(JSON.parse(pack.stdout)[0].files.map(({ path }) => path));
