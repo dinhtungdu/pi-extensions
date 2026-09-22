@@ -200,7 +200,7 @@ There is intentionally no user or app allowlist. Discord channel/thread permissi
 
 ## Tool visibility
 
-Tool rows are hidden by default. The extension changes only TUI rendering: tools still execute, stream, complete, and remain unchanged in messages, results, and session history. Existing and future rows—including custom tools and image results—return immediately when shown. While tool rows are hidden, the compact presentation also removes collapsed thinking-only placeholders; expanded thinking and assistant text stay visible.
+Tool rows are shown by default. The extension changes only TUI rendering: tools still execute, stream, complete, and remain unchanged in messages, results, and session history. Existing and future rows—including custom tools and image results—hide immediately with `/tools hide` and return with `/tools show`. While tool rows are hidden, the compact presentation also removes collapsed thinking-only placeholders; expanded thinking and assistant text stay visible.
 
 ```text
 /tools                  # toggle

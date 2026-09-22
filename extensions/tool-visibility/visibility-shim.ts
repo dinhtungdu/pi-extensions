@@ -270,7 +270,7 @@ export function installToolVisibilityShim(options: InstallOptions = {}): ToolVis
 		}
 	}
 
-	const owner: Owner = { visible: false };
+	const owner: Owner = { visible: true };
 	record.owners.add(owner);
 	let disposed = false;
 
