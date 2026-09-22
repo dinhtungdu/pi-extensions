@@ -22,6 +22,6 @@ For each coherent unit: implement the smallest change, run the cheapest relevant
 
 ## 5. Review and finish
 
-Always inspect and review the generated code directly in its full diff and caller context against the issue, design, checks, and before/after evidence. Read [Interrogate](../../interrogate/SKILL.md) directly only when the change is material or risky, or when independent review is explicitly requested. Verify every material finding, fix confirmed findings, then rerun affected checks and the live recipe after the final edit.
+Always inspect and review the generated code directly in its full diff and caller context against the issue, design, checks, and before/after evidence. Keep routine post-change review in the parent. Read [Interrogate](../../interrogate/SKILL.md) only when the user explicitly requests independent review, or when concrete security, data-loss, concurrency, irreversible-boundary risk, or unresolved evidence-based disagreement requires independent judgment. Verify every material finding, fix confirmed findings, then rerun affected checks and the live recipe after the final edit.
 
 Return changed paths, exact checks, live before/after evidence, review disposition, and remaining gaps. Never report runnable behavior as verified without live after evidence; report the exact blocked prerequisite instead.

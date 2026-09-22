@@ -97,6 +97,8 @@ const prReviewPlaybookPath = "skills/pstack/poteto-mode/playbooks/pr-review.md";
 const potetoSkill = await readFile(join(root, potetoSkillPath), "utf8");
 assert.match(potetoSkill, /\[Issue implementation\]\(playbooks\/issue-implementation\.md\)/);
 assert.match(potetoSkill, /\[Pull request review\]\(playbooks\/pr-review\.md\)/);
+assert.match(potetoSkill, /Default to direct work\. Do not turn routine implementation phases, compatibility scans, test planning, or post-change review into helper tasks\./);
+assert.match(potetoSkill, /Independent review is opt-in:.*explicitly requests it, or when concrete security, data-loss, concurrency, irreversible-boundary risk, or unresolved evidence-based disagreement requires independent judgment\./);
 const issuePlaybook = await readFile(join(root, issuePlaybookPath), "utf8");
 assert.match(issuePlaybook, /The driver supplies task context, the issue, and the path to the project's verification skill\./);
 const prReviewPlaybook = await readFile(join(root, prReviewPlaybookPath), "utf8");
@@ -113,7 +115,7 @@ assert.ok(
 );
 assert.ok(
 	issuePlaybook.includes(
-		"Always inspect and review the generated code directly in its full diff and caller context against the issue, design, checks, and before/after evidence. Read [Interrogate](../../interrogate/SKILL.md) directly only when the change is material or risky, or when independent review is explicitly requested.",
+		"Always inspect and review the generated code directly in its full diff and caller context against the issue, design, checks, and before/after evidence. Keep routine post-change review in the parent. Read [Interrogate](../../interrogate/SKILL.md) only when the user explicitly requests independent review, or when concrete security, data-loss, concurrency, irreversible-boundary risk, or unresolved evidence-based disagreement requires independent judgment.",
 	),
 );
 const pack = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8" });
@@ -262,6 +264,7 @@ try {
 	const harness = createHarness();
 	for (const command of ["poteto-mode", "setup-pstack"]) assert.ok(harness.commands.has(command));
 	for (const tool of ["pstack_config", "pstack_sessions", "subagent", "pstack_tasks"]) assert.ok(harness.tools.has(tool));
+	assert.match(harness.tools.get("subagent").description, /Default to direct parent work: do not delegate routine implementation phases, compatibility scans, test planning, or post-change review\./);
 
 	await harness.emit("session_start");
 	assert.deepEqual(harness.statuses.at(-1), [PACKAGE_FOOTER_STATUS_KEYS.pstack, undefined]);
@@ -272,6 +275,7 @@ try {
 	const injected = await harness.emit("before_agent_start", { systemPrompt: "base" });
 	assert.match(injected.systemPrompt, /Poteto Mode is enabled/);
 	assert.match(injected.systemPrompt, /pi-port\.md/);
+	assert.equal((await harness.tool("pstack_tasks", { action: "list" })).content[0].text, "No pstack tasks in this session.");
 
 	await harness.command("poteto-mode", "off");
 	assert.deepEqual(harness.entries.at(-1).data, { enabled: false });

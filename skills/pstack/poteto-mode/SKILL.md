@@ -12,14 +12,14 @@ Read [the Pi port contract](references/pi-port.md) first. The parent owns decisi
 
 1. **Frame.** State the user-visible outcome, constraints, non-goals, and smallest proof.
 2. **Ground.** Read the affected flow. Use `/skill:how`, `/skill:why`, or `/skill:recall` only when current code, history, or prior work is genuinely missing.
-3. **Choose one execution shape.**
+3. **Choose one execution shape.** Default to direct work. Do not turn routine implementation phases, compatibility scans, test planning, or post-change review into helper tasks.
    - Work directly for a small local change.
    - Delegate one end-to-end worker when isolation protects context or the task is long enough to justify another process. Do not make the parent and child repeat the same investigation.
    - Run two candidates only when competing designs or prototypes could materially differ.
    - Use `/skill:swarm` only for independent coverage, a measured sample, or genuinely disjoint work.
 4. **Build.** Reuse existing code and native features. Keep the change small and coherent.
 5. **Verify.** Use the project's verification skill when present. Exercise the real behavior, not only compilation or unit tests.
-6. **Judge.** Inspect the artifact and decisive evidence. Use `/skill:interrogate` only for risky changes or explicit review requests.
+6. **Judge.** Inspect the artifact and decisive evidence. Independent review is opt-in: use `/skill:interrogate` only when the user explicitly requests it, or when concrete security, data-loss, concurrency, irreversible-boundary risk, or unresolved evidence-based disagreement requires independent judgment.
 7. **Report.** Return changed paths, checks, live evidence, and remaining gaps.
 
 ## Workload routes

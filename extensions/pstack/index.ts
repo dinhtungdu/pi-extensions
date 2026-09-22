@@ -942,7 +942,7 @@ export default function pstackExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent",
 		label: "Pstack Subagent",
-		description: `Start bundled pstack agents in background Pi processes and return task IDs immediately. Provide agent+task, or up to ${MAX_TASKS} tasks (${MAX_CONCURRENCY} running at once). Routes: mechanical, bounded, complex, critical. Explicit model/thinking overrides route config. Set readonly=true for analysis/review; isolate parallel writers.`,
+		description: `Start bundled pstack agents in background Pi processes and return task IDs immediately. Provide agent+task, or up to ${MAX_TASKS} tasks (${MAX_CONCURRENCY} running at once). Routes: mechanical, bounded, complex, critical. Explicit model/thinking overrides route config. Set readonly=true for analysis/review; isolate parallel writers. Default to direct parent work: do not delegate routine implementation phases, compatibility scans, test planning, or post-change review. Use review children only when explicitly requested or concrete high-consequence risk or unresolved evidence requires independent judgment.`,
 		parameters: SubagentParams,
 		executionMode: "sequential",
 		async execute(_id, params: SubagentInput, signal, _onUpdate, ctx) {
