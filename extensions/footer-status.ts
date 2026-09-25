@@ -5,7 +5,6 @@ export const PACKAGE_FOOTER_STATUS_KEYS = {
 	codexFast: `${PACKAGE_FOOTER_STATUS_PREFIX}-codex-fast`,
 	discord: `${PACKAGE_FOOTER_STATUS_PREFIX}-discord`,
 	goal: `${PACKAGE_FOOTER_STATUS_PREFIX}-goal`,
-	pstack: `${PACKAGE_FOOTER_STATUS_PREFIX}-pstack`,
 	toolVisibility: `${PACKAGE_FOOTER_STATUS_PREFIX}-tool-visibility`,
 	voice: `${PACKAGE_FOOTER_STATUS_PREFIX}-voice`,
 } as const;
