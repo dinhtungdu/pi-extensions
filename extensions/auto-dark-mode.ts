@@ -160,7 +160,7 @@ export default function autoDarkMode(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (!ctx.hasUI) return;
+		if (ctx.mode !== "tui") return;
 
 		stop();
 		const config = loadConfig(ctx.cwd);
