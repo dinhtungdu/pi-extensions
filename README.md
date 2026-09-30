@@ -2,8 +2,6 @@
 
 Pi extensions:
 
-- `auto-dark-mode` — macOS dark/light theme switching
-- `codemode` — Cloudflare-Codemode-style JS tool orchestration for pi built-in tools
 - `goal` — Codex-style persisted goals with `/goal`, goal tools, and hidden continuation
 - `codex-fast` — persistently toggle OpenAI Codex Fast mode and show `⚡` while active
 - `discord` — automatic Discord project channels and Pi session threads with bidirectional text mirroring
@@ -25,7 +23,7 @@ Selected extensions only:
 	"packages": [
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
-			"extensions": ["extensions/auto-dark-mode.ts", "extensions/code-mode.ts", "extensions/goal.ts", "extensions/codex-fast.ts", "extensions/discord/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
+			"extensions": ["extensions/goal.ts", "extensions/codex-fast.ts", "extensions/discord/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
 			"prompts": [],
 			"themes": []
 		}
@@ -38,8 +36,6 @@ Put that in `~/.pi/agent/settings.json` for global install, or `.pi/settings.jso
 Local development:
 
 ```bash
-pi -e ./extensions/auto-dark-mode.ts
-pi -e ./extensions/code-mode.ts
 pi -e ./extensions/goal.ts
 pi -e ./extensions/codex-fast.ts
 pi -e ./extensions/discord/index.ts
@@ -47,27 +43,6 @@ pi -e ./extensions/tool-visibility/index.ts
 pi -e ./extensions/voice/index.ts
 pi install /path/to/pi-extensions
 ```
-
-## Codemode
-
-Registers tool: `codemode`.
-
-Use for multi-step logic over active built-in pi tools:
-
-```js
-async () => {
-	const files = await codemode.ls({ path: "." });
-	const matches = await codemode.grep({ pattern: "TODO", path: ".", limit: 20 });
-	return { files, matches };
-}
-```
-
-Notes:
-
-- Exposes only active built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
-- JavaScript only. No TypeScript syntax.
-- Local Node worker/vm isolation, not Cloudflare Workers security. Do not run hostile code. Tiny sandbox, not Fort Knox.
-- Output truncated to pi defaults; full output saved to temp when needed.
 
 ## Goal
 
@@ -273,28 +248,3 @@ Model cleanup receives only the transcript and cleanup instructions—no convers
 The setup pins and builds MIT-licensed `parakeet.cpp`, installs MIT-licensed `mlx-audio` in an isolated environment, and downloads model weights from Hugging Face. Parakeet GGUF weights are CC-BY-4.0; Qwen3-TTS has its own model license. No unlicensed `pibot` source is copied.
 
 Hands-free input cannot identify who is speaking. While Pi is thinking, running tools, or speaking, all microphone audio is ignored. Listening resumes after playback and a short cooldown, so speaker echo cannot become user input. In noisy or shared rooms, use VoiceInk or another explicit dictation input instead.
-
-## Auto dark mode config
-
-Global: `~/.pi/agent/auto-dark-mode.json`
-Project override: `<cwd>/.pi/auto-dark-mode.json`
-
-```json
-{
-	"darkTheme": "dark",
-	"lightTheme": "light",
-	"intervalMs": 2000,
-	"notify": false
-}
-```
-
-Project config overrides global config.
-
-## Commands
-
-- `/auto-theme` or `/auto-theme status` — show current mapping
-- `/auto-theme pick` — choose dark/light themes interactively
-- `/auto-theme dark <theme>` — save dark-mode theme
-- `/auto-theme light <theme>` — save light-mode theme
-
-If project config exists, commands write there; otherwise they write global config.

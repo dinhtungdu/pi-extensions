@@ -1,7 +1,7 @@
 {
 	"name": "pi-extensions",
 	"version": "0.1.1",
-	"description": "Pi extensions for themes, orchestration, persisted goals, Codex fast mode, Discord bridging, and voice.",
+	"description": "Pi extensions for persisted goals, Codex fast mode, Discord bridging, and voice.",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -16,9 +16,6 @@
 		"pi-package",
 		"pi",
 		"extension",
-		"theme",
-		"dark-mode",
-		"codemode",
 		"goal",
 		"openai-codex",
 		"fast-mode",
@@ -29,8 +26,6 @@
 	],
 	"pi": {
 		"extensions": [
-			"./extensions/auto-dark-mode.ts",
-			"./extensions/code-mode.ts",
 			"./extensions/goal.ts",
 			"./extensions/codex-fast.ts",
 			"./extensions/discord/index.ts",
