@@ -1,7 +1,7 @@
 {
 	"name": "pi-extensions",
 	"version": "0.1.1",
-	"description": "Pi extensions for persisted goals, Codex fast mode, Discord bridging, and voice.",
+	"description": "Pi extensions for persisted goals, tree memory, Codex fast mode, Discord bridging, and voice.",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -21,6 +21,8 @@
 		"fast-mode",
 		"discord",
 		"voice",
+		"memory",
+		"tree-memory",
 		"speech-to-text",
 		"text-to-speech"
 	],
@@ -30,7 +32,8 @@
 			"./extensions/codex-fast.ts",
 			"./extensions/discord/index.ts",
 			"./extensions/tool-visibility/index.ts",
-			"./extensions/voice/index.ts"
+			"./extensions/voice/index.ts",
+			"./extensions/tree-memory/index.ts"
 		]
 	},
 	"peerDependencies": {
@@ -47,9 +50,12 @@
 	"scripts": {
 		"check": "tsc --noEmit",
 		"lint": "oxlint extensions/codex-fast.ts extensions/discord scripts/test-codex-fast.mjs scripts/test-discord*.mjs scripts/fixtures/discord-*.mjs",
+		"lint:tree-memory": "oxlint extensions/tree-memory scripts/test-tree-memory*.mjs scripts/fixtures/tree-memory-provider.ts",
 		"test:codex-fast": "node ./scripts/test-codex-fast.mjs",
 		"test:discord": "node ./scripts/test-discord-config.mjs && node ./scripts/test-discord-bridge.mjs && node ./scripts/test-discord-relay-child.mjs",
 		"test:tool-visibility": "node ./scripts/test-tool-visibility.mjs",
+		"test:tree-memory": "node ./scripts/test-tree-memory.mjs",
+		"test:tree-memory:pi": "node ./scripts/test-tree-memory-pi.mjs",
 		"setup:voice": "node ./scripts/setup-voice.mjs",
 		"uninstall:voice": "node ./scripts/uninstall-voice.mjs",
 		"test:voice": "node ./scripts/test-voice.mjs",

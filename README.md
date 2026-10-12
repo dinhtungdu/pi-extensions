@@ -7,6 +7,7 @@ Pi extensions:
 - `discord` — automatic Discord project channels and Pi session threads with bidirectional text mirroring
 - `tool-visibility` — hide/show all tool execution rows without changing tools, messages, or session history
 - `voice` — local hands-free STT/TTS for Apple Silicon with streaming speech and deterministic keyboard interruption
+- `tree-memory` — opt-in, branch-local binary summary memory with exact Pi-session recall
 
 ## Install
 
@@ -23,7 +24,7 @@ Selected extensions only:
 	"packages": [
 		{
 			"source": "git:github.com/dinhtungdu/pi-extensions",
-			"extensions": ["extensions/goal.ts", "extensions/codex-fast.ts", "extensions/discord/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts"],
+			"extensions": ["extensions/goal.ts", "extensions/codex-fast.ts", "extensions/discord/index.ts", "extensions/tool-visibility/index.ts", "extensions/voice/index.ts", "extensions/tree-memory/index.ts"],
 			"prompts": [],
 			"themes": []
 		}
@@ -41,6 +42,7 @@ pi -e ./extensions/codex-fast.ts
 pi -e ./extensions/discord/index.ts
 pi -e ./extensions/tool-visibility/index.ts
 pi -e ./extensions/voice/index.ts
+pi -e ./extensions/tree-memory/index.ts
 pi install /path/to/pi-extensions
 ```
 
@@ -67,6 +69,32 @@ Notes:
 - Active goals auto-continue with hidden continuation messages until `update_goal({ status: "complete" })`, `/goal pause`, `/goal clear`, budget exhaustion, or a no-tool continuation.
 - Goal state is stored in the pi session branch via custom entries; it survives reload/resume/fork.
 - Objectives should include scope, success criteria, constraints, and verification commands.
+
+## Tree memory
+
+Tree memory is disabled by default in every session. It uses Pi's native session JSONL as the durable source of exact visible originals and stores branch-local configuration and summary nodes as Pi custom entries. It never reads Pi Pocket, `~/.pi-pocket/pocket.sqlite`, another Pi session, or another BB thread.
+
+```text
+/tree-memory status
+/tree-memory enable                 # only when the branch has no visible history
+/tree-memory enable --backfill      # explicit consent to summarize existing history
+/tree-memory retry                  # retry a visible compressor failure
+/tree-memory view
+/tree-memory disable                # immediately restore native context/compaction
+```
+
+Enabling consents to compressor calls for this branch. Backfill requires the explicit `--backfill` form and may make many paid calls. Compression uses the currently selected Pi model and its configured provider credentials; switching providers affects future summaries, while existing summaries remain durable. A failed or oversized summary is never silently accepted: the turn falls back to Pi's complete native context and native compaction, the error appears in status, and exact originals remain untouched.
+
+The model receives a bounded summary view between turns and retains the current user/tool loop. It can call `tree_seek` (bounded lexical search of originals), `tree_zoom` (summary children or paginated exact visible evidence), `tree_date`, and read-only `tree_memory` status. Summary text is navigation, not proof; exact originals exclude hidden reasoning and opaque image bytes but retain visible text, tool calls/results, and image references.
+
+Scope and branches:
+
+- State follows Pi's active in-file branch and is reconstructed on resume, reload, and `/tree` navigation.
+- A new Pi fork is disabled automatically and must be explicitly enabled; its inherited Pi originals are not copied elsewhere.
+- Native compaction is cancelled only while a complete tree view is ready. Disablement or compressor failure leaves native compaction enabled.
+- Pi session files remain the only original-evidence store. Deleting a Pi session deletes the originals; this extension adds no backup service.
+
+Install only this extension with the object-form package filter shown above, or test it directly with `pi -e ./extensions/tree-memory/index.ts`. Installing the package does **not** enable memory in existing or new sessions.
 
 ## OpenAI Codex fast mode
 
