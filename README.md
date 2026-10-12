@@ -76,6 +76,7 @@ Tree memory is disabled by default in every session. It uses Pi's native session
 
 ```text
 /tree-memory status
+/tree-memory model openai-codex/gpt-6-luna  # optional; default cheap compressor
 /tree-memory enable                 # only when the branch has no visible history
 /tree-memory enable --backfill      # explicit consent to summarize existing history
 /tree-memory retry                  # retry a visible compressor failure
@@ -83,7 +84,9 @@ Tree memory is disabled by default in every session. It uses Pi's native session
 /tree-memory disable                # immediately restore native context/compaction
 ```
 
-Enabling consents to compressor calls for this branch. Backfill requires the explicit `--backfill` form and may make many paid calls. Compression uses the currently selected Pi model and its configured provider credentials; switching providers affects future summaries, while existing summaries remain durable. A failed or oversized summary is never silently accepted: the turn falls back to Pi's complete native context and native compaction, the error appears in status, and exact originals remain untouched.
+Enabling consents to compressor calls for this branch. Backfill requires the explicit `--backfill` form and may make many paid calls. Compression uses a separate cheap model, defaulting to `openai-codex/gpt-6-luna` (Pocket's default), with its configured Pi provider credentials and minimal reasoning. `/tree-memory model provider/model` selects a different compressor for this branch; it does not enable memory or backfill. Selection survives resume and remains independent of Alfred's active model. Changing the compressor affects only new summaries; existing summaries remain durable.
+
+Status reports the compressor's exact provider/model. No automatic fallback to the agent model: an unavailable compressor, authentication error, or failed/oversized summary leaves Pi's native context and compaction enabled, reports the error, and keeps exact originals untouched. Configure an available compressor and use `/tree-memory retry`.
 
 The model receives a bounded summary view between turns and retains the current user/tool loop. It can call `tree_seek` (bounded lexical search of originals), `tree_zoom` (summary children or paginated exact visible evidence), `tree_date`, and read-only `tree_memory` status. Summary text is navigation, not proof; exact originals exclude hidden reasoning and opaque image bytes but retain visible text, tool calls/results, and image references.
 

@@ -5,6 +5,7 @@ export const NODE_ENTRY = "pi-extensions-tree-memory-node-v1";
 export const NODE_BYTES = 512;
 export const VIEW_BYTES = 64_000;
 export const SEARCH_SCAN_LIMIT = 2_048;
+export const DEFAULT_COMPRESSOR = "openai-codex/gpt-6-luna";
 
 export interface TreeConfig {
 	epoch: string;
@@ -12,6 +13,7 @@ export interface TreeConfig {
 	phase: "ready" | "error" | "disabled";
 	backfill: boolean;
 	createdAt: string;
+	compressor?: string;
 	error?: string;
 }
 

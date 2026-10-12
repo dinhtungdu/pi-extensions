@@ -21,7 +21,8 @@ function harness(extension, session, providerReply = { stopReason: "stop", conte
 	const notifications = [];
 	let providerCalls = 0;
 	let maxPromptBytes = 0;
-	const providersSeen = [];
+	const modelsSeen = [];
+	const authModelsSeen = [];
 	const pi = {
 		on(name, handler) { const list = events.get(name) ?? []; list.push(handler); events.set(name, list); },
 		registerCommand(name, command) { commands.set(name, command); },
@@ -31,7 +32,7 @@ function harness(extension, session, providerReply = { stopReason: "stop", conte
 	const provider = {
 		streamSimple(model, context) {
 			providerCalls++;
-			providersSeen.push(model.provider);
+			modelsSeen.push(`${model.provider}/${model.id}`);
 			maxPromptBytes = Math.max(maxPromptBytes, Buffer.byteLength(JSON.stringify(context), "utf8"));
 			return {
 				async *[Symbol.asyncIterator]() {},
@@ -43,7 +44,12 @@ function harness(extension, session, providerReply = { stopReason: "stop", conte
 		mode: "print", hasUI: false, cwd: root, sessionManager: session,
 		model: { provider: "fixture-a", id: "fixture", contextWindow: 100000 },
 		modelRegistry: {
-			async getApiKeyAndHeaders() { return { ok: true, apiKey: "fixture" }; },
+			find(provider, id) {
+				if ((provider === "openai-codex" && id === "gpt-6-luna") || (["fixture-a", "fixture-b"].includes(provider) && id === "fixture")) {
+					return { provider, id, contextWindow: 100000 };
+				}
+			},
+			async getApiKeyAndHeaders(model) { authModelsSeen.push(`${model.provider}/${model.id}`); return { ok: true, apiKey: "fixture" }; },
 			getProvider() { return provider; },
 		},
 		ui: { notify(...args) { notifications.push(args); } },
@@ -54,7 +60,7 @@ function harness(extension, session, providerReply = { stopReason: "stop", conte
 		commands, tools, notifications, ctx,
 		get providerCalls() { return providerCalls; },
 		get maxPromptBytes() { return maxPromptBytes; },
-		providersSeen,
+		modelsSeen, authModelsSeen,
 		async emit(name, event = {}) {
 			let result;
 			for (const handler of events.get(name) ?? []) {
@@ -108,12 +114,13 @@ try {
 	assert.ok(JSON.stringify(session.getBranch()).includes("PRIVATE_CHAIN"), "Pi originals remain intact");
 	assert.ok(saved.evidence.every((entry) => !entry.text.includes("PRIVATE_CHAIN")), "tree evidence excludes hidden reasoning");
 
+	assert.equal((await app.tool("tree_memory", { action: "status" })).details.phase, "ready");
 	const transformed = await app.emit("context", { messages: [
 		{ role: "user", content: "Remember project Cobalt.", timestamp: 1 },
 		{ role: "assistant", content: [{ type: "text", text: "Decision: launch Friday." }], timestamp: 2 },
 		{ role: "user", content: "What did we decide?", timestamp: 3 },
 	] });
-	assert.equal(transformed.messages.length, 2, "bounded view plus current turn replaces old inference messages");
+	assert.equal(transformed.messages.length, 2, "status must preserve the bounded view for subsequent tool-loop requests");
 	assert.match(JSON.stringify(transformed.messages[0].content), /<chat>/);
 	assert.match(transformed.messages[1].content, /What did we decide/);
 	const zoom = await app.tool("tree_zoom", { id: 1, n: 1, offset: 0 });
@@ -134,6 +141,8 @@ try {
 	persisted.appendMessage({ role: "user", content: "restart original", timestamp: 1 });
 	const restartApp = harness(extension, persisted);
 	await restartApp.emit("session_start", { reason: "startup" });
+	await restartApp.command("model fixture-b/fixture");
+	assert.equal(core.latestConfig(persisted.getBranch()).enabled, false, "selecting a compressor does not enable or backfill memory");
 	await restartApp.command("enable --backfill");
 	await restartApp.emit("before_agent_start", { prompt: "current" });
 	persisted.appendMessage({ role: "user", content: "current", timestamp: 2 });
@@ -143,7 +152,9 @@ try {
 	assert.equal(core.latestConfig(reopened.getBranch()).phase, "ready");
 	const resumed = harness(extension, reopened);
 	await resumed.emit("session_start", { reason: "resume" });
-	assert.equal((await resumed.tool("tree_memory", { action: "status" })).details.phase, "ready");
+	const resumedStatus = (await resumed.tool("tree_memory", { action: "status" })).details;
+	assert.equal(resumedStatus.phase, "ready");
+	assert.equal(resumedStatus.compressor, "fixture-b/fixture", "compressor selection survives reopen");
 	assert.match((await resumed.tool("tree_zoom", { id: 0, n: 1, offset: 0 })).content[0].text, /restart original/);
 
 	// Huge tool/message records are fully covered through bounded compressor pages.
@@ -155,11 +166,36 @@ try {
 	await paged.emit("before_agent_start", { prompt: "current" });
 	assert.equal(core.latestConfig(pagedSession.getBranch()).phase, "ready");
 	assert.equal(paged.providerCalls, 3);
+	assert.ok(paged.modelsSeen.every(model => model === core.DEFAULT_COMPRESSOR), "default cheap compressor, not main agent model");
+	assert.deepEqual(paged.authModelsSeen, paged.modelsSeen, "credentials resolve for the compressor model");
 	assert.ok(paged.maxPromptBytes < 30_000, "compressor source pages stay bounded");
 	pagedSession.appendMessage({ role: "user", content: "new provider record ".repeat(50), timestamp: 2 });
 	paged.ctx.model = { ...paged.ctx.model, provider: "fixture-b" };
 	await paged.emit("before_agent_start", { prompt: "next" });
-	assert.equal(paged.providersSeen.at(-1), "fixture-b", "future nodes use the newly selected Pi provider");
+	assert.equal(paged.modelsSeen.at(-1), core.DEFAULT_COMPRESSOR, "agent provider switching must not switch the compressor");
+	const previousNodes = core.collectNodes(pagedSession.getBranch(), core.latestConfig(pagedSession.getBranch()).epoch);
+	await paged.command("model fixture-b/fixture");
+	pagedSession.appendMessage({ role: "user", content: "custom compressor record ".repeat(50), timestamp: 3 });
+	await paged.emit("before_agent_start", { prompt: "another" });
+	assert.equal(paged.modelsSeen.at(-1), "fixture-b/fixture");
+	assert.equal(paged.authModelsSeen.at(-1), "fixture-b/fixture");
+	const changedNodes = core.collectNodes(pagedSession.getBranch(), core.latestConfig(pagedSession.getBranch()).epoch);
+	for (const [key, node] of previousNodes) assert.deepEqual(changedNodes.get(key), node, "changing compressor preserves existing summaries");
+	await paged.command("model missing/model");
+	assert.equal(core.latestConfig(pagedSession.getBranch()).compressor, "fixture-b/fixture", "reject unknown compressor without changing selection");
+
+	const unavailableSession = SessionManager.inMemory(root);
+	unavailableSession.appendMessage({ role: "user", content: "x".repeat(700), timestamp: 1 });
+	const unavailable = harness(extension, unavailableSession);
+	await unavailable.emit("session_start", { reason: "startup" });
+	await unavailable.command("enable --backfill");
+	unavailable.ctx.modelRegistry.find = () => undefined;
+	await unavailable.emit("before_agent_start", { prompt: "current" });
+	assert.equal(core.latestConfig(unavailableSession.getBranch()).phase, "error");
+	assert.equal(unavailable.providerCalls, 0, "missing compressor never falls back to paid main model");
+	assert.equal(await unavailable.emit("context", { messages: [] }), undefined);
+	assert.equal(await unavailable.emit("session_before_compact", {}), undefined);
+	assert.match(unavailable.notifications.at(-1)[0], /compressor.*unavailable/);
 
 	// A failed paid summary never replaces history and never blocks native compaction.
 	const failedSession = SessionManager.inMemory(root);

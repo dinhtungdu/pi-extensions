@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import {
 	CONFIG_ENTRY,
+	DEFAULT_COMPRESSOR,
 	NODE_BYTES,
 	NODE_ENTRY,
 	bytePage,
@@ -45,7 +46,7 @@ function status(state: RuntimeState, ctx: ExtensionContext) {
 		messages: evidence.length,
 		nodes: nodes.size,
 		viewBytes: state.view ? utf8Bytes(renderView(state.view)) : 0,
-		compressor: "currently selected Pi model; calls use its provider and quota",
+		compressor: state.config?.compressor ?? DEFAULT_COMPRESSOR,
 	};
 }
 
@@ -76,36 +77,45 @@ function compressorMessages(source: string, id: number, n: number, correction: s
 	];
 }
 
-async function summarize(source: string, id: number, n: number, ctx: ExtensionContext): Promise<{ text: string; usage: unknown[] }> {
+function compressorModel(ctx: ExtensionContext, selector: string) {
+	const separator = selector.indexOf("/");
+	if (separator <= 0 || separator === selector.length - 1) throw new Error("Compressor must be provider/model");
+	const model = ctx.modelRegistry.find(selector.slice(0, separator), selector.slice(separator + 1));
+	if (!model) throw new Error(`Tree compressor ${selector} is unavailable; select one with /tree-memory model provider/model`);
+	return model;
+}
+
+async function summarize(source: string, id: number, n: number, ctx: ExtensionContext, selector: string): Promise<{ text: string; usage: unknown[] }> {
 	if (utf8Bytes(source) <= NODE_BYTES) return { text: source, usage: [] };
 	if (utf8Bytes(source) > COMPRESS_PAGE_BYTES) {
 		const summaries: string[] = [];
 		const usage: unknown[] = [];
 		for (let offset = 0; ;) {
 			const page = bytePage(source, offset, COMPRESS_PAGE_BYTES);
-			const result = await summarize(page.text, id, n, ctx);
+			const result = await summarize(page.text, id, n, ctx, selector);
 			summaries.push(result.text);
 			usage.push(...result.usage);
 			if (page.nextOffset === null) break;
 			offset = page.nextOffset;
 		}
-		const result = await summarize(summaries.join("\n"), id, n, ctx);
+		const result = await summarize(summaries.join("\n"), id, n, ctx, selector);
 		return { text: result.text, usage: [...usage, ...result.usage] };
 	}
-	if (!ctx.model) throw new Error("Tree compressor requires a selected Pi model");
+	const model = compressorModel(ctx, selector);
 	const usage: unknown[] = [];
 	let correction = "";
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const messages = compressorMessages(source, id, n, correction);
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok) throw new Error(auth.error);
-		const provider = ctx.modelRegistry.getProvider(ctx.model.provider);
-		if (!provider) throw new Error(`Tree compressor provider ${ctx.model.provider} is unavailable`);
-		const stream = provider.streamSimple(ctx.model, { messages }, {
+		const provider = ctx.modelRegistry.getProvider(model.provider);
+		if (!provider) throw new Error(`Tree compressor provider ${model.provider} is unavailable`);
+		const stream = provider.streamSimple(model, { messages }, {
 			apiKey: auth.apiKey,
 			headers: auth.headers,
 			env: auth.env,
 			maxTokens: 1024,
+			reasoning: "minimal",
 			signal: ctx.signal,
 			cacheRetention: "none",
 			sessionId: `tree-memory:${ctx.sessionManager.getSessionId()}`,
@@ -123,7 +133,7 @@ async function summarize(source: string, id: number, n: number, ctx: ExtensionCo
 		if (text && utf8Bytes(text) <= NODE_BYTES) return { text, usage };
 		correction = `\nYour previous reply was ${utf8Bytes(text)} bytes or unusable. Rewrite the same source as one complete summary under ${NODE_BYTES} bytes; do not truncate or add facts.`;
 	}
-	throw new Error(`Tree compressor ${ctx.model.provider}/${ctx.model.id} failed to return a complete summary under ${NODE_BYTES} bytes after three paid attempts`);
+	throw new Error(`Tree compressor ${selector} failed to return a complete summary under ${NODE_BYTES} bytes after three paid attempts`);
 }
 
 async function prepare(pi: ExtensionAPI, state: RuntimeState, ctx: ExtensionContext): Promise<void> {
@@ -133,12 +143,13 @@ async function prepare(pi: ExtensionAPI, state: RuntimeState, ctx: ExtensionCont
 		const entries = ctx.sessionManager.getBranch();
 		const evidence = collectEvidence(entries, false);
 		const nodes = collectNodes(entries, state.config.epoch);
+		const selector = state.config.compressor ?? DEFAULT_COMPRESSOR;
 		for (const item of evidence) {
 			const key = nodeKey(item.id, 1);
 			const existing = nodes.get(key);
 			if (existing?.sourceEntryId === item.entryId) continue;
 			if (existing) throw new Error(`Tree leaf ${key} no longer matches this branch; disable and re-enable memory`);
-			const built = await summarize(item.text, item.id, 1, ctx);
+			const built = await summarize(item.text, item.id, 1, ctx, selector);
 			const node: TreeNode = { epoch: state.config.epoch, id: item.id, n: 1, text: built.text, sourceEntryId: item.entryId, date: item.date, usage: built.usage };
 			pi.appendEntry(NODE_ENTRY, node);
 			nodes.set(key, node);
@@ -150,7 +161,7 @@ async function prepare(pi: ExtensionAPI, state: RuntimeState, ctx: ExtensionCont
 				const left = nodes.get(nodeKey(id, n / 2));
 				const right = nodes.get(nodeKey(id + n / 2, n / 2));
 				if (!left || !right) throw new Error(`Tree children missing for ${key}`);
-				const built = await summarize(`${left.text}\n${right.text}`, id, n, ctx);
+				const built = await summarize(`${left.text}\n${right.text}`, id, n, ctx, selector);
 				const node: TreeNode = { epoch: state.config.epoch, id, n, text: built.text, usage: built.usage };
 				pi.appendEntry(NODE_ENTRY, node);
 				nodes.set(key, node);
@@ -178,14 +189,27 @@ export default function treeMemory(pi: ExtensionAPI): void {
 	const state: RuntimeState = { building: false };
 
 	pi.registerCommand("tree-memory", {
-		description: "Enable, disable, inspect, retry, or view branch-local tree memory",
+		description: "Enable, disable, inspect, select compressor, retry, or view branch-local tree memory",
 		handler: async (args, ctx) => {
 			const [action = "status", flag, ...extra] = args.trim().split(/\s+/).filter(Boolean);
-			if (extra.length || (flag && flag !== "--backfill") || !["enable", "disable", "status", "retry", "view"].includes(action)) {
-				ctx.ui.notify("Usage: /tree-memory [status|enable [--backfill]|disable|retry|view]", "warning");
+			if (extra.length || !["enable", "disable", "status", "retry", "view", "model"].includes(action) ||
+				(action === "model" ? !flag : flag !== undefined && (action !== "enable" || flag !== "--backfill"))) {
+				ctx.ui.notify("Usage: /tree-memory [status|enable [--backfill]|disable|retry|view|model provider/model]", "warning");
 				return;
 			}
 			restore(state, ctx);
+			if (action === "model") {
+				try { compressorModel(ctx, flag!); } catch (error) {
+					ctx.ui.notify(String(error), "warning");
+					return;
+				}
+				const config = state.config ?? {
+					epoch: crypto.randomUUID(), enabled: false, phase: "disabled" as const, backfill: false, createdAt: new Date().toISOString(),
+				};
+				persistConfig(pi, state, { ...config, compressor: flag });
+				ctx.ui.notify(`Tree compressor set to ${flag} for this branch. Existing summaries stay unchanged; enabling/backfill remains separate.`, "info");
+				return;
+			}
 			if (action === "status") {
 				ctx.ui.notify(JSON.stringify(status(state, ctx), null, 2), "info");
 				return;
@@ -217,18 +241,19 @@ export default function treeMemory(pi: ExtensionAPI): void {
 			}
 			const config: TreeConfig = {
 				epoch: crypto.randomUUID(), enabled: true, phase: "ready", backfill: flag === "--backfill", createdAt: new Date().toISOString(),
+				compressor: state.config?.compressor ?? DEFAULT_COMPRESSOR,
 			};
 			persistConfig(pi, state, config);
 			state.view = [];
 			state.frozen = renderView([]);
-			ctx.ui.notify("Tree memory enabled for this Pi session branch. Summaries use the selected model/provider and may consume paid quota.", "info");
+			ctx.ui.notify(`Tree memory enabled for this Pi session branch. Summaries use ${config.compressor} and may consume paid quota, independently of the agent model.`, "info");
 		},
 	});
 
 	pi.registerTool({
 		name: "tree_memory", label: "Tree Memory Status", description: "Return tree-memory status for this Pi session branch. Enabling/backfill requires the user's explicit /tree-memory command.",
 		parameters: Type.Object({ action: Type.Literal("status") }, { additionalProperties: false }),
-		async execute(_id, _params, _signal, _update, ctx) { restore(state, ctx); return textResult(status(state, ctx)); },
+		async execute(_id, _params, _signal, _update, ctx) { return textResult(status(state, ctx)); },
 	});
 	pi.registerTool({
 		name: "tree_zoom", label: "Tree Memory Zoom", description: "Open id+n into two summary children, or n=1 into paginated exact original visible evidence from this session branch.",
