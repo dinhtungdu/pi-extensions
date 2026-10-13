@@ -56,6 +56,8 @@
 		"test:tool-visibility": "node ./scripts/test-tool-visibility.mjs",
 		"test:tree-memory": "node ./scripts/test-tree-memory.mjs",
 		"test:tree-memory:pi": "node ./scripts/test-tree-memory-pi.mjs",
+		"check:optchat": "node ./scripts/check-optchat.mjs",
+		"test:optchat": "node ./scripts/test-optchat.mjs",
 		"setup:voice": "node ./scripts/setup-voice.mjs",
 		"uninstall:voice": "node ./scripts/uninstall-voice.mjs",
 		"test:voice": "node ./scripts/test-voice.mjs",

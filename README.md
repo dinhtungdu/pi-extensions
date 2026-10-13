@@ -9,6 +9,8 @@ Pi extensions:
 - `voice` — local hands-free STT/TTS for Apple Silicon with streaming speech and deterministic keyboard interruption
 - `tree-memory` — opt-in, branch-local binary summary memory with exact Pi-session recall
 
+An optional [OptChat session fork](packages/optchat/README.md) is available as a separate package in `packages/optchat`. It starts off, keeps an explicit profile picker and persistent memory, supports `/optchat on` / `/optchat off`, and excludes OptChat's subagent runtime. It preserves existing upstream RPC profile bindings. Install it separately instead of upstream `pi-optchat`.
+
 ## Install
 
 All extensions from GitHub:

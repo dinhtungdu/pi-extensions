@@ -1,0 +1,10 @@
+{
+  "name": "@dinhtungdu/pi-optchat-session",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Opt-in OptChat memory for Pi sessions, with optional persistent profiles and no subagent runtime.",
+  "license": "MIT",
+  "pi": { "extensions": ["./src/index.ts"] },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": ">=1.1.0 <2.0.0" },
+  "files": ["src", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "UPSTREAM.json"]
+}

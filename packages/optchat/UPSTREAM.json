@@ -1,0 +1,30 @@
+{
+  "repository": "https://github.com/jonaslsaa/pi-optchat",
+  "version": "0.8.4",
+  "gitHead": "d8e7653ed5f875747335a326229ae287679d5c96",
+  "files": {
+    "memory.ts": "d8791f5a6f662ab0f67e9ce4b01da1e11628534142e89b895f49347d0c841777",
+    "store.ts": "8e3742b145d817830040b4884edc842c7714b5efcb1462571227ad211ba4259e",
+    "compactor.ts": "354bb6361f9466cdcc6ff75a045f8ade752197628b2b23c35eeca0118f83fe00",
+    "profiles.ts": "1ae8886c951c4b3f3623fc391246ec9e1117129423821702d072445f09e65767",
+    "prompts.ts": "93ecc2e87139b6c5cf67b621c9252e3845fbecb87026aafcdcb3b0dd70393a5c",
+    "cache.ts": "b062f521300fd25007bfb50981e0c639df19705cb8fd5b419cc4fa4bc234f690",
+    "transcript.ts": "88f410c7c39a4ae0c968ae5d3fc27b8b534db708e19923eb9c4c878d61faf61b",
+    "images.ts": "bee9a816e96c8e8775c8df8378e65d559a1a28f4f9562912a74729add619c499",
+    "settings.ts": "6b7a092550de1833dee324c4aed9b89ed562691877338c888d34c703b7991905",
+    "usage.ts": "1775b68a222dbcf5296a343c0056cf3b0c00d373b258e5d83867078c69ff6785",
+    "inbox.ts": "2b0a93fb1dda5fdc19f80f19d1f8a7da6ab2fc3801824b412b843bc44ea13ee3",
+    "browser.ts": "f3374a888e2a65335bcdf55e576698e90c82f254390d9b68c727a4b357f651d1",
+    "checkpoint.ts": "8720272057b57ce8ff5c29f4dcec81d2bca23aa3334a5235f9a4a2780b81f19d",
+    "import/job.ts": "bc30b69851b3a882f5cbc85552c3a42e029421c5ca486aeb1ea8db892f83a250",
+    "import/sources.ts": "aff36bcf008bab8b317c83a1a4ecf7a489ce5c40b5f1e333766733eaa169b57b",
+    "import/ui.ts": "ff39435228a393cc6f0d15b7a9b0d04ba5b1320ca171a8081f690cc8d73caa05",
+    "import/multi-select.ts": "408dff794ba65799ffcbc1366b09436010cd5aa87b7e8248c62775eefaad00bf",
+    "tools.ts": "9325609103ceb88b3c5592194024160961199619f0b4cf0d475eb7a9caac2b79"
+  },
+  "adapted": {
+    "settings-page.ts": "e5db0f04b581f5e0de32dd314acf417d179e8639c02768f175acaf6d1e4b4f7b",
+    "menu.ts": "847ec098c11cb37f85fa751d25f4f4893b43136bf40e9109aa35c4ef8281a225",
+    "inspector.ts": "e1bac58e0eb0b7b1f44df63d3dfd6778377b904f5735a7ab94a52efb9ef06adb"
+  }
+}
