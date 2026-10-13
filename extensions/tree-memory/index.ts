@@ -28,7 +28,8 @@ interface RuntimeState {
 	config?: TreeConfig;
 	view?: TreeNode[];
 	frozen?: string;
-	build?: { controller: AbortController; completed: number; total: number; range?: string };
+	prepareOnStart?: boolean;
+	build?: { controller: AbortController; completed: number; total: number; range?: string; finished: Promise<void> };
 }
 
 function textResult(value: unknown, isError = false) {
@@ -165,7 +166,9 @@ async function prepare(pi: ExtensionAPI, state: RuntimeState, ctx: ExtensionCont
 } = {}): Promise<"ready" | "error" | "cancelled"> {
 	const config = state.config;
 	if (!config?.enabled || state.build) return "cancelled";
-	const build = { controller: new AbortController(), completed: 0, total: 0, range: undefined as string | undefined };
+	let finish!: () => void;
+	const finished = new Promise<void>(resolve => { finish = resolve; });
+	const build = { controller: new AbortController(), completed: 0, total: 0, range: undefined as string | undefined, finished };
 	state.build = build;
 	const parentSignal = options.signal ?? ctx.signal;
 	const signal = parentSignal ? AbortSignal.any([build.controller.signal, parentSignal]) : build.controller.signal;
@@ -227,6 +230,7 @@ async function prepare(pi: ExtensionAPI, state: RuntimeState, ctx: ExtensionCont
 		ctx.ui.notify(`Tree memory failed; native context retained: ${message}`, "error");
 		return "error";
 	} finally {
+		finish();
 		if (state.build === build) {
 			state.build = undefined;
 			ctx.ui.setStatus("tree-memory", undefined);
@@ -387,9 +391,19 @@ export default function treeMemory(pi: ExtensionAPI): void {
 		restore(state, ctx);
 		state.frozen = undefined;
 	});
-	pi.on("before_agent_start", async (_event, ctx) => {
+	pi.on("before_agent_start", () => { state.prepareOnStart = true; });
+	// Pi acknowledges startup before this awaited hook; inference still waits for compression.
+	pi.on("agent_start", async (_event, ctx) => {
+		if (!state.prepareOnStart) return;
+		state.prepareOnStart = false;
+		state.frozen = undefined;
+		const active = state.build;
+		if (active) {
+			await active.finished;
+			if (active.controller.signal.aborted) return;
+		}
 		restore(state, ctx);
-		if (state.config?.phase !== "error") await prepare(pi, state, ctx);
+		if (state.config?.phase !== "error" && await prepare(pi, state, ctx) === "cancelled") return;
 		state.frozen = state.view ? renderView(state.view) : undefined;
 	});
 	pi.on("context", (event) => {

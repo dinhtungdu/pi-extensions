@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -35,7 +36,7 @@ try {
 		"-e", join(root, "scripts/fixtures/tree-memory-provider.ts"),
 		"-e", join(root, "extensions/tree-memory/index.ts"),
 		"--session", session, "--model", "tree-fixture/tree-fixture", "--print", "What did we decide?",
-	], { cwd: root, encoding: "utf8", env: { ...process.env, PI_OFFLINE: "1", TREE_SMOKE_LOG: requests, TREE_FAUX_MODULE: process.env.TREE_FAUX_MODULE ?? fauxModule } });
+	], { cwd: root, encoding: "utf8", env: { ...process.env, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: join(temp, "agent"), TREE_SMOKE_LOG: requests, TREE_FAUX_MODULE: process.env.TREE_FAUX_MODULE ?? fauxModule } });
 	assert.equal(run.status, 0, run.stderr || run.stdout);
 	assert.match(run.stdout, /RECALL_OK/);
 	const calls = (await readFile(requests, "utf8")).trim().split("\n");
@@ -121,6 +122,60 @@ try {
 		assert.equal(await client.getLastAssistantText(), "RETRY_OK");
 		assert.equal((await client.getState()).isStreaming, false);
 		console.log("[tree-memory real Pi RPC retry tool smoke] passed: started ack before compression, native progress, ready, agent_settled");
+
+		// Acknowledge startup before compression, but await it before every inference.
+		const automaticSession = join(temp, "automatic.jsonl");
+		const automaticEntries = structuredClone(backgroundEntries);
+		automaticEntries[4].data.phase = "ready";
+		delete automaticEntries[4].data.error;
+		await writeFile(automaticSession, `${automaticEntries.map(JSON.stringify).join("\n")}\n`);
+		const automaticLog = join(temp, "automatic-requests.jsonl");
+		gateResponse = undefined;
+		started = new Promise(resolve => { requestStarted = resolve; });
+		const automatic = new RpcClient({
+			cliPath: await realpath(process.env.PI_BIN ?? globalPi), cwd: root,
+			args: ["-ne", "-ns", "-np", "--no-themes", "--no-mcp", "-nc", "-e", join(root, "scripts/fixtures/tree-memory-provider.ts"), "-e", join(root, "extensions/tree-memory/index.ts"), "--session", automaticSession, "--model", "tree-fixture/tree-fixture"],
+			env: { PI_OFFLINE: "1", PI_CODING_AGENT_DIR: join(temp, "agent"), TREE_FAUX_MODULE: process.env.TREE_FAUX_MODULE ?? fauxModule, TREE_SMOKE_GATE_URL: `http://127.0.0.1:${gate.address().port}`, TREE_SMOKE_STARTUP: "1", TREE_SMOKE_LOG: automaticLog },
+		});
+		let settleAutomatic;
+		let automaticSettled = new Promise(resolve => { settleAutomatic = resolve; });
+		const removeAutomaticListener = automatic.onEvent(event => {
+			if (event.type === "agent_settled") settleAutomatic();
+		});
+		try {
+			await automatic.start();
+			const began = Date.now();
+			assert.equal(await Promise.race([automatic.prompt("Continue normally."), deadline]), "started");
+			const startupMs = Date.now() - began;
+			await Promise.race([started, deadline]);
+			assert.equal(gateResponse.writableEnded, false, "startup acknowledged before compressor release");
+			await new Promise(resolve => setTimeout(resolve, 100));
+			assert.equal(existsSync(automaticLog), false, "inference must wait for successful compression");
+			assert.equal((await automatic.getState()).isStreaming, true, "accepted turn stays active during compression");
+			gateResponse.end("release");
+			await Promise.race([automaticSettled, deadline]);
+			assert.equal(await automatic.getLastAssistantText(), "STARTUP_OK");
+			const inference = await readFile(automaticLog, "utf8");
+			assert.match(inference, /Historical memory/);
+			assert.match(inference, /1\+1\|Decision: launch Friday/, "first inference uses the completed summary");
+			assert.ok(!inference.includes("long record"), "uncompressed historical tail cannot reach inference after success");
+			assert.match(inference, /Continue normally/);
+			automaticSettled = new Promise(resolve => { settleAutomatic = resolve; });
+			assert.equal(await Promise.race([automatic.prompt("Next message."), deadline]), "started");
+			await Promise.race([automaticSettled, deadline]);
+			const contexts = (await readFile(automaticLog, "utf8")).trim().split("\n").map(JSON.parse);
+			assert.equal(contexts.length, 2);
+			const [firstView, secondView] = contexts.map(context => {
+				const content = context.messages.find(message => message.role === "user").content;
+				return typeof content === "string" ? content : content[0].text;
+			});
+			assert.deepEqual(secondView.split("\n").slice(0, 4), firstView.split("\n").slice(0, 4), "unchanged summary prefix remains identical next turn");
+			assert.match(secondView, /2\+1\|user: Continue normally/, "previous turn is summarized before the next inference");
+			console.log(`[tree-memory real Pi RPC automatic startup] passed: ${startupMs}ms started ack, inference waits for compression, stable summary prefix across two turns`);
+		} finally {
+			removeAutomaticListener();
+			await automatic.stop();
+		}
 	} finally {
 		clearTimeout(timeout);
 		gateResponse?.end();

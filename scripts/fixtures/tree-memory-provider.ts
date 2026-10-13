@@ -10,7 +10,12 @@ export default function treeMemoryFixtureProvider(pi: ExtensionAPI): void {
 		provider: "tree-fixture",
 		models: [{ id: "tree-fixture", name: "Tree Fixture", contextWindow: 100_000, maxTokens: 4_096 }],
 	});
-	faux.setResponses(process.env.TREE_SMOKE_RETRY_TOOL ? [
+	faux.setResponses(process.env.TREE_SMOKE_STARTUP ? Array.from({ length: 2 }, () =>
+		(context: unknown) => {
+			appendFileSync(process.env.TREE_SMOKE_LOG!, `${JSON.stringify(context)}\n`);
+			return fauxAssistantMessage("STARTUP_OK");
+		},
+	) : process.env.TREE_SMOKE_RETRY_TOOL ? [
 		() => fauxAssistantMessage(fauxToolCall("tree_memory", { action: "retry" }), { stopReason: "toolUse" }),
 		(context) => {
 			const result = context.messages.findLast((message) => message.role === "toolResult" && message.toolName === "tree_memory");

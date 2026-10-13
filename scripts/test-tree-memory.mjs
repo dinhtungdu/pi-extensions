@@ -72,6 +72,7 @@ function harness(extension, session, providerReply = { stopReason: "stop", conte
 			}
 			return result;
 		},
+		async start() { await this.emit("before_agent_start"); return this.emit("agent_start"); },
 		async command(args) { await commands.get("tree-memory").handler(args, ctx); },
 		async tool(name, params, signal, onUpdate) { return tools.get(name).execute("test", params, signal, onUpdate, ctx); },
 	};
@@ -81,6 +82,45 @@ try {
 	compile();
 	const extension = (await import(pathToFileURL(join(output, "extensions/tree-memory/index.js")))).default;
 	const core = await import(pathToFileURL(join(output, "extensions/tree-memory/core.js")));
+
+	// Preflight is immediate; every mode awaits the same completed view before inference.
+	for (const mode of ["interactive", "rpc", "print"]) {
+		const startupSession = SessionManager.inMemory(root);
+		const startupOriginal = { role: "user", content: "saved fact", timestamp: 1 };
+		const startupId = startupSession.appendMessage(startupOriginal);
+		const pendingMessage = { role: "user", content: "pending fact ".repeat(100), timestamp: 2 };
+		startupSession.appendMessage(pendingMessage);
+		startupSession.appendCustomEntry(core.CONFIG_ENTRY, { epoch: "startup", enabled: true, phase: "ready", backfill: true, createdAt: new Date().toISOString() });
+		startupSession.appendCustomEntry(core.NODE_ENTRY, { epoch: "startup", id: 0, n: 1, text: "saved fact", sourceEntryId: startupId });
+		let releaseStartup;
+		const startupGate = new Promise(resolve => { releaseStartup = resolve; });
+		const startup = harness(extension, startupSession, () => startupGate);
+		startup.ctx.mode = mode;
+		await startup.emit("session_start", { reason: "resume" });
+		await startup.emit("before_agent_start", { prompt: "current" });
+		assert.equal(startup.providerCalls, 0, "compression must start after preflight");
+		let prepared = false;
+		const startupRun = startup.emit("agent_start").then(() => { prepared = true; });
+		try {
+			await new Promise(resolve => setImmediate(resolve));
+			assert.equal(prepared, false, `${mode} inference must wait for compression`);
+			assert.equal(startup.providerCalls, 1);
+			releaseStartup({ stopReason: "stop", content: [{ type: "text", text: "pending summary" }] });
+			await startupRun;
+			const native = [startupOriginal, pendingMessage, { role: "user", content: "current", timestamp: 3 }];
+			const frozen = await startup.emit("context", { messages: native });
+			assert.match(JSON.stringify(frozen.messages[0]), /1\+1\|pending summary/);
+			assert.deepEqual(frozen.messages.slice(1), native.slice(2), "first inference uses completed summaries and the current prompt");
+			assert.deepEqual(await startup.emit("context", { messages: native }), frozen, "view stays identical throughout the tool loop");
+			startupSession.appendMessage(native.at(-1));
+			await startup.emit("agent_start");
+			assert.deepEqual(await startup.emit("context", { messages: native }), frozen, "continuation/retry cannot rebuild the frozen view");
+			assert.equal(core.collectNodes(startupSession.getBranch(), "startup").has("2+1"), false, "only a new submitted prompt starts automatic preparation");
+		} finally {
+			releaseStartup({ stopReason: "stop", content: [{ type: "text", text: "cleanup" }] });
+			await startupRun;
+		}
+	}
 
 	// Bounded views cover every leaf exactly once; exact pages are UTF-8 byte bounded.
 	const manyNodes = new Map();
@@ -114,7 +154,7 @@ try {
 	assert.equal(core.latestConfig(session.getBranch()), undefined);
 	await app.command("enable --backfill");
 	assert.equal(core.latestConfig(session.getBranch()).enabled, true);
-	await app.emit("before_agent_start", { prompt: "What did we decide?" });
+	await app.start();
 	const saved = core.snapshot(session.getBranch(), false);
 	assert.equal(saved.evidence.length, 2);
 	assert.ok(saved.view);
@@ -151,7 +191,7 @@ try {
 	await restartApp.command("model fixture-b/fixture");
 	assert.equal(core.latestConfig(persisted.getBranch()).enabled, false, "selecting a compressor does not enable or backfill memory");
 	await restartApp.command("enable --backfill");
-	await restartApp.emit("before_agent_start", { prompt: "current" });
+	await restartApp.start();
 	persisted.appendMessage({ role: "user", content: "current", timestamp: 2 });
 	persisted.appendMessage({ role: "assistant", content: [{ type: "text", text: "done" }], provider: "fixture", model: "fixture", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 3 });
 	assert.equal(core.latestConfig(persisted.getBranch()).phase, "ready");
@@ -170,7 +210,7 @@ try {
 	const paged = harness(extension, pagedSession);
 	await paged.emit("session_start", { reason: "startup" });
 	await paged.command("enable --backfill");
-	await paged.emit("before_agent_start", { prompt: "current" });
+	await paged.start();
 	assert.equal(core.latestConfig(pagedSession.getBranch()).phase, "ready");
 	assert.equal(paged.providerCalls, 3);
 	assert.ok(paged.modelsSeen.every(model => model === core.DEFAULT_COMPRESSOR), "default cheap compressor, not main agent model");
@@ -178,12 +218,12 @@ try {
 	assert.ok(paged.maxPromptBytes < 30_000, "compressor source pages stay bounded");
 	pagedSession.appendMessage({ role: "user", content: "new provider record ".repeat(50), timestamp: 2 });
 	paged.ctx.model = { ...paged.ctx.model, provider: "fixture-b" };
-	await paged.emit("before_agent_start", { prompt: "next" });
+	await paged.start();
 	assert.equal(paged.modelsSeen.at(-1), core.DEFAULT_COMPRESSOR, "agent provider switching must not switch the compressor");
 	const previousNodes = core.collectNodes(pagedSession.getBranch(), core.latestConfig(pagedSession.getBranch()).epoch);
 	await paged.command("model fixture-b/fixture");
 	pagedSession.appendMessage({ role: "user", content: "custom compressor record ".repeat(50), timestamp: 3 });
-	await paged.emit("before_agent_start", { prompt: "another" });
+	await paged.start();
 	assert.equal(paged.modelsSeen.at(-1), "fixture-b/fixture");
 	assert.equal(paged.authModelsSeen.at(-1), "fixture-b/fixture");
 	const changedNodes = core.collectNodes(pagedSession.getBranch(), core.latestConfig(pagedSession.getBranch()).epoch);
@@ -197,7 +237,7 @@ try {
 	await unavailable.emit("session_start", { reason: "startup" });
 	await unavailable.command("enable --backfill");
 	unavailable.ctx.modelRegistry.find = () => undefined;
-	await unavailable.emit("before_agent_start", { prompt: "current" });
+	await unavailable.start();
 	assert.equal(core.latestConfig(unavailableSession.getBranch()).phase, "error");
 	assert.equal(unavailable.providerCalls, 0, "missing compressor never falls back to paid main model");
 	assert.equal(await unavailable.emit("context", { messages: [] }), undefined);
@@ -219,7 +259,7 @@ try {
 	});
 	await corrected.emit("session_start", { reason: "startup" });
 	await corrected.command("enable --backfill");
-	await corrected.emit("before_agent_start", { prompt: "current" });
+	await corrected.start();
 	assert.equal(corrected.providerCalls, 2);
 	assert.equal(core.latestConfig(correctedSession.getBranch()).phase, "ready");
 
@@ -229,18 +269,18 @@ try {
 	const failed = harness(extension, failedSession, { stopReason: "stop", content: [{ type: "text", text: "y".repeat(core.NODE_BYTES + 1) }], usage: undefined });
 	await failed.emit("session_start", { reason: "startup" });
 	await failed.command("enable --backfill");
-	await failed.emit("before_agent_start", { prompt: "current" });
+	await failed.start();
 	assert.equal(core.latestConfig(failedSession.getBranch()).phase, "error");
 	assert.equal(await failed.emit("context", { messages: [{ role: "user", content: "original native", timestamp: 1 }] }), undefined);
 	assert.equal(await failed.emit("session_before_compact", { reason: "threshold" }), undefined);
 	assert.match(failed.notifications.at(-1)[0], /native context retained/);
 	assert.equal(failed.providerCalls, 3, "oversized compressor output gets two corrective retries, then fails visibly");
 	assert.match(core.latestConfig(failedSession.getBranch()).error, /0\+1.*shortest=513 bytes, last=513 bytes.*paused/);
-	await failed.emit("before_agent_start", { prompt: "another message" });
+	await failed.start();
 	assert.equal(failed.providerCalls, 3, "ordinary messages must not restart paid compression after failure");
 	const paused = harness(extension, failedSession);
 	await paused.emit("session_start", { reason: "resume" });
-	await paused.emit("before_agent_start", { prompt: "resumed message" });
+	await paused.start();
 	assert.equal(paused.providerCalls, 0, "pause survives extension reload/resume");
 	await paused.command("retry");
 	assert.equal(paused.providerCalls, 1, "explicit retry resumes compression");
@@ -265,6 +305,7 @@ try {
 		new Promise(resolve => { deadline = setTimeout(() => resolve(false), 500); }),
 	]);
 	clearTimeout(deadline);
+	let acceptedRun;
 	try {
 		assert.equal(acknowledged, true, "RPC retry must return before the compressor finishes");
 		const running = (await background.tool("tree_memory", { action: "status" })).details;
@@ -274,10 +315,14 @@ try {
 		await background.command("retry");
 		assert.equal(background.providerCalls, 1, "a second retry cannot launch a competing build");
 		await background.emit("before_agent_start", { prompt: "current" });
+		acceptedRun = background.start();
+		await new Promise(resolve => setImmediate(resolve));
+		assert.equal(background.providerCalls, 1, "accepted run joins the existing build");
 		assert.equal(await background.emit("context", { messages: [] }), undefined, "no partial history replacement");
 	} finally {
 		release({ stopReason: "stop", content: [{ type: "text", text: "background summary" }] });
 		await retry;
+		await acceptedRun;
 	}
 	for (let attempts = 0; (await background.tool("tree_memory", { action: "status" })).details.phase === "building"; attempts++) {
 		assert.ok(attempts < 100, "background build did not settle");
@@ -285,20 +330,20 @@ try {
 	}
 	assert.equal(core.latestConfig(backgroundSession.getBranch()).phase, "ready");
 	assert.deepEqual(core.collectNodes(backgroundSession.getBranch(), "background").get("0+1"), originalNode);
-	assert.equal(await background.emit("context", { messages: [] }), undefined, "background completion cannot change the current turn's context");
-	await background.emit("before_agent_start", { prompt: "next" });
+	assert.match(JSON.stringify(await background.emit("context", { messages: [] })), /background summary/, "accepted run freezes the completed retry before inference");
+	await background.start();
 	const nextView = await background.emit("context", { messages: [{ role: "user", content: "next", timestamp: 3 }] });
 	assert.match(JSON.stringify(nextView.messages[0]), /Historical memory/);
 	assert.ok(background.statuses.some(([, text]) => /1\/3/.test(text)), "report live node progress");
 	await background.command("status");
 	assert.deepEqual(await background.emit("context", { messages: [{ role: "user", content: "next", timestamp: 3 }] }), nextView, "status command must preserve the frozen turn");
 	backgroundSession.appendMessage({ role: "user", content: "new incremental record ".repeat(100), timestamp: 3 });
-	await background.emit("before_agent_start", { prompt: "later" });
+	await background.start();
 	const caughtUp = await background.emit("context", { messages: [{ role: "user", content: "later", timestamp: 4 }] });
 	assert.match(JSON.stringify(caughtUp.messages[0]), /2\+1\|background summary/, "ordinary turn preparation must catch up, not leave memory perpetually one turn behind");
 	assert.equal(background.providerCalls, 2);
 
-	// Cancelled background replies cannot write into a disabled session or another branch.
+	// Cancelled automatic builds cannot write into a disabled session or another branch.
 	for (const action of ["disable", "session_tree", "session_shutdown"]) {
 		const cancelSession = SessionManager.inMemory(root);
 		cancelSession.appendMessage({ role: "user", content: "shared fact", timestamp: 1 });
@@ -310,11 +355,9 @@ try {
 		await cancellable.command("enable --backfill");
 		const branchPoint = cancelSession.getLeafId();
 		cancelSession.appendMessage({ role: "user", content: "pending record ".repeat(100), timestamp: 2 });
-		await cancellable.command("retry");
-		const start = cancellable.emit("before_agent_start", { prompt: "current" });
-		let cancelDeadline;
+		const start = cancellable.start();
 		try {
-			await Promise.race([start, new Promise((_resolve, reject) => { cancelDeadline = setTimeout(() => reject(new Error("agent preflight blocked on an already-running background retry")), 500); })]);
+			await cancellable.emit("before_agent_start", { prompt: "current" });
 			await new Promise(resolve => setImmediate(resolve));
 			assert.equal(cancellable.providerCalls, 1);
 			if (action === "disable") await cancellable.command("disable");
@@ -329,7 +372,6 @@ try {
 			assert.deepEqual(cancelSession.getBranch(), cancelledEntries, `no late writes after ${action}`);
 			assert.equal(cancellable.statuses.at(-1)[1], undefined);
 		} finally {
-			clearTimeout(cancelDeadline);
 			unblock({ stopReason: "stop", content: [{ type: "text", text: "cleanup" }] });
 			await start;
 		}
@@ -385,7 +427,7 @@ try {
 		assert.match(errorResult.details.error, abort ? /cancelled/ : /WebSocket closed 1000/);
 		assert.deepEqual(errorResult.usage, newUsage, "report paid failed/aborted response usage too");
 		assert.equal(core.collectNodes(errorSession.getBranch(), "tool-error").size, 0, "do not save a failed or cancelled summary");
-		await errorTool.emit("before_agent_start", { prompt: "next" });
+		await errorTool.start();
 		assert.equal(errorTool.providerCalls, 1, "failed tool retry stays paused");
 	}
 
@@ -395,7 +437,7 @@ try {
 	const branchApp = harness(extension, branched);
 	await branchApp.emit("session_start", { reason: "startup" });
 	await branchApp.command("enable --backfill");
-	await branchApp.emit("before_agent_start", { prompt: "first current" });
+	await branchApp.start();
 	const branchPoint = branched.getLeafId();
 	branched.appendMessage({ role: "assistant", content: [{ type: "text", text: "FOREIGN_BRANCH_SECRET" }], provider: "fixture", model: "fixture", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 3 });
 	branched.branch(branchPoint);
