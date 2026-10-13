@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -44,6 +45,90 @@ try {
 	assert.match(calls[1], /"toolName":"tree_seek"/);
 	assert.match(calls[2], /"toolName":"tree_zoom"/);
 	console.log("[tree-memory real Pi smoke] passed");
+
+	// Real RPC preflight must return while a compressor request is still pending.
+	const backgroundSession = join(temp, "background.jsonl");
+	const backgroundEntries = structuredClone(entries.slice(0, 6));
+	backgroundEntries[3].message.content = text("long record ".repeat(100));
+	backgroundEntries[4].data.phase = "error";
+	backgroundEntries[4].data.error = "old error";
+	backgroundEntries[4].data.compressor = "tree-compressor/compressor";
+	await writeFile(backgroundSession, `${backgroundEntries.map(JSON.stringify).join("\n")}\n`);
+	let gateResponse;
+	let requestStarted;
+	let started = new Promise(resolve => { requestStarted = resolve; });
+	const gate = createServer((_request, response) => {
+		gateResponse = response;
+		requestStarted();
+	});
+	await new Promise(resolve => gate.listen(0, "127.0.0.1", resolve));
+	const { RpcClient } = await import(pathToFileURL(join(globalPrefix, "lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js")));
+	const client = new RpcClient({
+		cliPath: await realpath(process.env.PI_BIN ?? globalPi), cwd: root,
+		args: ["-ne", "-ns", "-np", "--no-themes", "--no-mcp", "-nc", "-e", join(root, "scripts/fixtures/tree-memory-provider.ts"), "-e", join(root, "extensions/tree-memory/index.ts"), "--session", backgroundSession, "--model", "tree-fixture/tree-fixture"],
+		env: { PI_OFFLINE: "1", PI_CODING_AGENT_DIR: join(temp, "agent"), TREE_FAUX_MODULE: process.env.TREE_FAUX_MODULE ?? fauxModule, TREE_SMOKE_GATE_URL: `http://127.0.0.1:${gate.address().port}`, TREE_SMOKE_RETRY_TOOL: "1" },
+	});
+	const events = [];
+	let markReady;
+	let markSettled;
+	const ready = new Promise(resolve => { markReady = resolve; });
+	const unsubscribe = client.onEvent(event => {
+		events.push(event);
+		if (event.type === "agent_settled") markSettled?.();
+		if (event.type === "extension_ui_request" && event.method === "notify" && event.message?.startsWith("Tree memory ready:")) markReady();
+	});
+	let timeout;
+	const deadline = new Promise((_resolve, reject) => { timeout = setTimeout(() => reject(new Error("RPC background smoke timed out")), 15_000); });
+	try {
+		await client.start();
+		assert.equal(await Promise.race([client.prompt("/tree-memory retry"), deadline]), "handled");
+		await Promise.race([started, deadline]);
+		assert.equal((await client.getState()).isStreaming, false, "retry cannot monopolize the agent run");
+		await client.prompt("/tree-memory status");
+		const running = JSON.parse(events.filter(event => event.type === "extension_ui_request" && event.method === "notify").at(-1).message);
+		assert.equal(running.phase, "building");
+		assert.equal(running.error, null);
+		assert.deepEqual(running.progress, { completed: 1, total: 3, range: "1+1" });
+		assert.ok(events.some(event => event.method === "setStatus" && /1\/3/.test(event.statusText)), "RPC must forward live progress");
+		gateResponse.end("release");
+		await Promise.race([ready, deadline]);
+		await client.prompt("/tree-memory status");
+		const complete = JSON.parse(events.filter(event => event.type === "extension_ui_request" && event.method === "notify").at(-1).message);
+		assert.equal(complete.phase, "ready");
+		assert.equal(complete.nodes, 3);
+		assert.equal(complete.error, null);
+		console.log("[tree-memory real Pi RPC background smoke] passed: immediate handled ack, 1/3 progress, 3/3 ready");
+
+		// Normal chat -> retry tool -> native updates -> agent settlement (no command-only path).
+		const toolSession = join(temp, "tool.jsonl");
+		await writeFile(toolSession, `${backgroundEntries.map(JSON.stringify).join("\n")}\n`);
+		await client.switchSession(toolSession);
+		events.length = 0;
+		started = new Promise(resolve => { requestStarted = resolve; });
+		const settled = new Promise(resolve => { markSettled = resolve; });
+		assert.equal(await Promise.race([client.prompt("Retry tree memory."), deadline]), "started");
+		await Promise.race([started, deadline]);
+		assert.equal((await client.getState()).isStreaming, true, "tool work runs inside an accepted agent turn");
+		assert.ok(events.some(event => event.type === "tool_execution_update" && event.toolName === "tree_memory" && event.partialResult.details.progress.range === "1+1"), "progress must use native tool updates, not ignored extension UI");
+		assert.ok(!events.some(event => event.type === "agent_settled"), "turn cannot settle before the compressor finishes");
+		gateResponse.end("release");
+		await Promise.race([settled, deadline]);
+		const toolEnd = events.find(event => event.type === "tool_execution_end" && event.toolName === "tree_memory");
+		assert.equal(toolEnd.isError, false);
+		assert.equal(toolEnd.result.details.phase, "ready");
+		assert.equal(toolEnd.result.details.nodes, 7);
+		assert.ok(toolEnd.result.usage, "tool must report nested compressor usage");
+		assert.equal(await client.getLastAssistantText(), "RETRY_OK");
+		assert.equal((await client.getState()).isStreaming, false);
+		console.log("[tree-memory real Pi RPC retry tool smoke] passed: started ack before compression, native progress, ready, agent_settled");
+	} finally {
+		clearTimeout(timeout);
+		gateResponse?.end();
+		unsubscribe();
+		await client.stop();
+		gate.closeAllConnections();
+		await new Promise(resolve => gate.close(resolve));
+	}
 } finally {
 	await rm(temp, { recursive: true, force: true });
 }

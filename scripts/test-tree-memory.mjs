@@ -19,6 +19,8 @@ function harness(extension, session, providerReply = { stopReason: "stop", conte
 	const commands = new Map();
 	const tools = new Map();
 	const notifications = [];
+	const statuses = [];
+	const streamOptions = [];
 	let providerCalls = 0;
 	let maxPromptBytes = 0;
 	const modelsSeen = [];
@@ -30,13 +32,14 @@ function harness(extension, session, providerReply = { stopReason: "stop", conte
 		appendEntry(type, data) { session.appendCustomEntry(type, structuredClone(data)); },
 	};
 	const provider = {
-		streamSimple(model, context) {
+		streamSimple(model, context, options) {
+			streamOptions.push(options);
 			providerCalls++;
 			modelsSeen.push(`${model.provider}/${model.id}`);
 			maxPromptBytes = Math.max(maxPromptBytes, Buffer.byteLength(JSON.stringify(context), "utf8"));
 			return {
 				async *[Symbol.asyncIterator]() {},
-				async result() { return providerReply; },
+				async result() { return typeof providerReply === "function" ? providerReply(context, providerCalls) : providerReply; },
 			};
 		},
 	};
@@ -52,12 +55,12 @@ function harness(extension, session, providerReply = { stopReason: "stop", conte
 			async getApiKeyAndHeaders(model) { authModelsSeen.push(`${model.provider}/${model.id}`); return { ok: true, apiKey: "fixture" }; },
 			getProvider() { return provider; },
 		},
-		ui: { notify(...args) { notifications.push(args); } },
+		ui: { notify(...args) { notifications.push(args); }, setStatus(...args) { statuses.push(args); } },
 		signal: undefined,
 	};
 	extension(pi);
 	return {
-		commands, tools, notifications, ctx,
+		commands, tools, notifications, statuses, streamOptions, ctx,
 		get providerCalls() { return providerCalls; },
 		get maxPromptBytes() { return maxPromptBytes; },
 		modelsSeen, authModelsSeen,
@@ -70,7 +73,7 @@ function harness(extension, session, providerReply = { stopReason: "stop", conte
 			return result;
 		},
 		async command(args) { await commands.get("tree-memory").handler(args, ctx); },
-		async tool(name, params) { return tools.get(name).execute("test", params, undefined, undefined, ctx); },
+		async tool(name, params, signal, onUpdate) { return tools.get(name).execute("test", params, signal, onUpdate, ctx); },
 	};
 }
 
@@ -102,6 +105,10 @@ try {
 	});
 	const app = harness(extension, session);
 	await app.emit("session_start", { reason: "startup" });
+	const disabledEntries = structuredClone(session.getBranch());
+	assert.equal((await app.tool("tree_memory", { action: "retry" })).isError, true, "retry tool must reject disabled memory");
+	assert.deepEqual(session.getBranch(), disabledEntries, "retry never enables or backfills a disabled session");
+	assert.equal(app.providerCalls, 0);
 	await app.command("enable");
 	assert.match(app.notifications.at(-1)[0], /--backfill/, "existing history requires explicit consent");
 	assert.equal(core.latestConfig(session.getBranch()), undefined);
@@ -197,6 +204,25 @@ try {
 	assert.equal(await unavailable.emit("session_before_compact", {}), undefined);
 	assert.match(unavailable.notifications.at(-1)[0], /compressor.*unavailable/);
 
+	// Oversized replies need the actual draft plus a smaller target, not another copy of the same source request.
+	const correctedSession = SessionManager.inMemory(root);
+	correctedSession.appendMessage({ role: "user", content: "detailed request ".repeat(100), timestamp: 1 });
+	const draft = "oversized summary ".repeat(40).trim();
+	const corrected = harness(extension, correctedSession, (context, call) => {
+		if (call === 1) return { stopReason: "stop", content: [{ type: "text", text: draft }] };
+		assert.equal(context.messages.length, 2, "length correction must be a distinct follow-up instruction");
+		const correction = context.messages[1].content[0].text;
+		assert.ok(correction.includes(draft), "show the previous summary for rewriting");
+		assert.match(correction, /at most 256 UTF-8 bytes/);
+		assert.match(correction, /Length wins over completeness/);
+		return { stopReason: "stop", content: [{ type: "text", text: "User requests implementation; preserve originals." }] };
+	});
+	await corrected.emit("session_start", { reason: "startup" });
+	await corrected.command("enable --backfill");
+	await corrected.emit("before_agent_start", { prompt: "current" });
+	assert.equal(corrected.providerCalls, 2);
+	assert.equal(core.latestConfig(correctedSession.getBranch()).phase, "ready");
+
 	// A failed paid summary never replaces history and never blocks native compaction.
 	const failedSession = SessionManager.inMemory(root);
 	failedSession.appendMessage({ role: "user", content: "x".repeat(700), timestamp: 1 });
@@ -209,6 +235,159 @@ try {
 	assert.equal(await failed.emit("session_before_compact", { reason: "threshold" }), undefined);
 	assert.match(failed.notifications.at(-1)[0], /native context retained/);
 	assert.equal(failed.providerCalls, 3, "oversized compressor output gets two corrective retries, then fails visibly");
+	assert.match(core.latestConfig(failedSession.getBranch()).error, /0\+1.*shortest=513 bytes, last=513 bytes.*paused/);
+	await failed.emit("before_agent_start", { prompt: "another message" });
+	assert.equal(failed.providerCalls, 3, "ordinary messages must not restart paid compression after failure");
+	const paused = harness(extension, failedSession);
+	await paused.emit("session_start", { reason: "resume" });
+	await paused.emit("before_agent_start", { prompt: "resumed message" });
+	assert.equal(paused.providerCalls, 0, "pause survives extension reload/resume");
+	await paused.command("retry");
+	assert.equal(paused.providerCalls, 1, "explicit retry resumes compression");
+	assert.equal(core.latestConfig(failedSession.getBranch()).phase, "ready");
+
+	// RPC retry must acknowledge while the compressor is still blocked, preserving prior nodes.
+	const backgroundSession = SessionManager.inMemory(root);
+	const originalId = backgroundSession.appendMessage({ role: "user", content: "already summarized", timestamp: 1 });
+	backgroundSession.appendMessage({ role: "user", content: "background record ".repeat(100), timestamp: 2 });
+	backgroundSession.appendCustomEntry(core.CONFIG_ENTRY, { epoch: "background", enabled: true, phase: "error", error: "old failure", backfill: true, createdAt: new Date().toISOString() });
+	const originalNode = { epoch: "background", id: 0, n: 1, text: "already summarized", sourceEntryId: originalId };
+	backgroundSession.appendCustomEntry(core.NODE_ENTRY, originalNode);
+	let release;
+	const blockedReply = new Promise(resolve => { release = resolve; });
+	const background = harness(extension, backgroundSession, () => blockedReply);
+	background.ctx.mode = "rpc";
+	await background.emit("session_start", { reason: "resume" });
+	const retry = background.command("retry");
+	let deadline;
+	const acknowledged = await Promise.race([
+		retry.then(() => true),
+		new Promise(resolve => { deadline = setTimeout(() => resolve(false), 500); }),
+	]);
+	clearTimeout(deadline);
+	try {
+		assert.equal(acknowledged, true, "RPC retry must return before the compressor finishes");
+		const running = (await background.tool("tree_memory", { action: "status" })).details;
+		assert.equal(running.phase, "building");
+		assert.equal(running.error, null, "do not show the old error as an active failure");
+		assert.deepEqual(running.progress, { completed: 1, total: 3, range: "1+1" });
+		await background.command("retry");
+		assert.equal(background.providerCalls, 1, "a second retry cannot launch a competing build");
+		await background.emit("before_agent_start", { prompt: "current" });
+		assert.equal(await background.emit("context", { messages: [] }), undefined, "no partial history replacement");
+	} finally {
+		release({ stopReason: "stop", content: [{ type: "text", text: "background summary" }] });
+		await retry;
+	}
+	for (let attempts = 0; (await background.tool("tree_memory", { action: "status" })).details.phase === "building"; attempts++) {
+		assert.ok(attempts < 100, "background build did not settle");
+		await new Promise(resolve => setImmediate(resolve));
+	}
+	assert.equal(core.latestConfig(backgroundSession.getBranch()).phase, "ready");
+	assert.deepEqual(core.collectNodes(backgroundSession.getBranch(), "background").get("0+1"), originalNode);
+	assert.equal(await background.emit("context", { messages: [] }), undefined, "background completion cannot change the current turn's context");
+	await background.emit("before_agent_start", { prompt: "next" });
+	const nextView = await background.emit("context", { messages: [{ role: "user", content: "next", timestamp: 3 }] });
+	assert.match(JSON.stringify(nextView.messages[0]), /Historical memory/);
+	assert.ok(background.statuses.some(([, text]) => /1\/3/.test(text)), "report live node progress");
+	await background.command("status");
+	assert.deepEqual(await background.emit("context", { messages: [{ role: "user", content: "next", timestamp: 3 }] }), nextView, "status command must preserve the frozen turn");
+	backgroundSession.appendMessage({ role: "user", content: "new incremental record ".repeat(100), timestamp: 3 });
+	await background.emit("before_agent_start", { prompt: "later" });
+	const caughtUp = await background.emit("context", { messages: [{ role: "user", content: "later", timestamp: 4 }] });
+	assert.match(JSON.stringify(caughtUp.messages[0]), /2\+1\|background summary/, "ordinary turn preparation must catch up, not leave memory perpetually one turn behind");
+	assert.equal(background.providerCalls, 2);
+
+	// Cancelled background replies cannot write into a disabled session or another branch.
+	for (const action of ["disable", "session_tree", "session_shutdown"]) {
+		const cancelSession = SessionManager.inMemory(root);
+		cancelSession.appendMessage({ role: "user", content: "shared fact", timestamp: 1 });
+		let unblock;
+		const reply = new Promise(resolve => { unblock = resolve; });
+		const cancellable = harness(extension, cancelSession, () => reply);
+		cancellable.ctx.mode = "rpc";
+		await cancellable.emit("session_start", { reason: "startup" });
+		await cancellable.command("enable --backfill");
+		const branchPoint = cancelSession.getLeafId();
+		cancelSession.appendMessage({ role: "user", content: "pending record ".repeat(100), timestamp: 2 });
+		await cancellable.command("retry");
+		const start = cancellable.emit("before_agent_start", { prompt: "current" });
+		let cancelDeadline;
+		try {
+			await Promise.race([start, new Promise((_resolve, reject) => { cancelDeadline = setTimeout(() => reject(new Error("agent preflight blocked on an already-running background retry")), 500); })]);
+			await new Promise(resolve => setImmediate(resolve));
+			assert.equal(cancellable.providerCalls, 1);
+			if (action === "disable") await cancellable.command("disable");
+			else {
+				if (action === "session_tree") cancelSession.branch(branchPoint);
+				await cancellable.emit(action);
+			}
+			assert.equal(cancellable.streamOptions[0].signal.aborted, true);
+			const cancelledEntries = structuredClone(cancelSession.getBranch());
+			unblock({ stopReason: "stop", content: [{ type: "text", text: "late reply must not be saved" }] });
+			await new Promise(resolve => setImmediate(resolve));
+			assert.deepEqual(cancelSession.getBranch(), cancelledEntries, `no late writes after ${action}`);
+			assert.equal(cancellable.statuses.at(-1)[1], undefined);
+		} finally {
+			clearTimeout(cancelDeadline);
+			unblock({ stopReason: "stop", content: [{ type: "text", text: "cleanup" }] });
+			await start;
+		}
+	}
+
+	// Retry as a normal tool waits for completion, streams updates and accounts only new usage.
+	const toolSession = SessionManager.inMemory(root);
+	const toolOriginalId = toolSession.appendMessage({ role: "user", content: "saved original", timestamp: 1 });
+	toolSession.appendMessage({ role: "user", content: "tool retry record ".repeat(100), timestamp: 2 });
+	toolSession.appendCustomEntry(core.CONFIG_ENTRY, { epoch: "tool", enabled: true, phase: "error", error: "old failure", backfill: true, createdAt: new Date().toISOString() });
+	const toolNode = { epoch: "tool", id: 0, n: 1, text: "saved original", sourceEntryId: toolOriginalId };
+	toolSession.appendCustomEntry(core.NODE_ENTRY, toolNode);
+	let releaseTool;
+	const toolGate = new Promise(resolve => { releaseTool = resolve; });
+	const retryTool = harness(extension, toolSession, () => toolGate);
+	await retryTool.emit("session_start", { reason: "resume" });
+	const updates = [];
+	const toolRun = retryTool.tool("tree_memory", { action: "retry" }, undefined, update => updates.push(update));
+	await new Promise(resolve => setImmediate(resolve));
+	const duringTool = structuredClone(toolSession.getBranch());
+	const runningToolStatus = await retryTool.tool("tree_memory", { action: "status" });
+	assert.equal(runningToolStatus.details.phase, "building");
+	assert.deepEqual(toolSession.getBranch(), duringTool, "status stays read-only during retry");
+	assert.ok(updates.some(update => update.details.progress.range === "1+1" && update.details.progress.completed === 1));
+	assert.equal((await retryTool.tool("tree_memory", { action: "retry" })).isError, true, "no competing retry tool");
+	assert.equal(retryTool.providerCalls, 1);
+	const newUsage = { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 120, cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 } };
+	releaseTool({ stopReason: "stop", content: [{ type: "text", text: "retried summary" }], usage: newUsage });
+	const toolResult = await toolRun;
+	assert.equal(toolResult.isError, false);
+	assert.equal(toolResult.details.phase, "ready");
+	assert.equal(toolResult.details.nodes, 3);
+	assert.deepEqual(toolResult.usage, newUsage);
+	assert.equal(updates.at(-1).details.progress.completed, 3);
+	assert.deepEqual(core.collectNodes(toolSession.getBranch(), "tool").get("0+1"), toolNode);
+
+	// Tool cancellation and compressor failures return errors, without silently enabling or restarting.
+	for (const abort of [true, false]) {
+		const errorSession = SessionManager.inMemory(root);
+		errorSession.appendMessage({ role: "user", content: "error record ".repeat(100), timestamp: 1 });
+		errorSession.appendCustomEntry(core.CONFIG_ENTRY, { epoch: "tool-error", enabled: true, phase: "error", error: "prior error", backfill: true, createdAt: new Date().toISOString() });
+		let finish;
+		const errorGate = new Promise(resolve => { finish = resolve; });
+		const errorTool = harness(extension, errorSession, () => errorGate);
+		await errorTool.emit("session_start", { reason: "resume" });
+		const controller = new AbortController();
+		const pendingTool = errorTool.tool("tree_memory", { action: "retry" }, controller.signal);
+		await new Promise(resolve => setImmediate(resolve));
+		if (abort) controller.abort();
+		finish({ stopReason: "error", errorMessage: "WebSocket closed 1000", content: [], usage: newUsage });
+		const errorResult = await pendingTool;
+		assert.equal(errorResult.isError, true);
+		assert.match(errorResult.details.error, abort ? /cancelled/ : /WebSocket closed 1000/);
+		assert.deepEqual(errorResult.usage, newUsage, "report paid failed/aborted response usage too");
+		assert.equal(core.collectNodes(errorSession.getBranch(), "tool-error").size, 0, "do not save a failed or cancelled summary");
+		await errorTool.emit("before_agent_start", { prompt: "next" });
+		assert.equal(errorTool.providerCalls, 1, "failed tool retry stays paused");
+	}
 
 	// Native in-file branching reconstructs only the selected path.
 	const branched = SessionManager.inMemory(root);
